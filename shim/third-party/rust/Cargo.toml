@@ -274,6 +274,7 @@ winver = "1"
 
 [patch.crates-io]
 darwin-libproc = { git = "https://github.com/fbsource/darwin-libproc", rev = "f73ddb1002d51ae74c1b41670fae56bd5896b7a3" }
+notify = { git = "https://github.com/daandemeyer/notify.git", rev = "570ebf5473006c3a994324f078f3372fad2cbd6d" }
 perf-event = { version = "0.4", git = "https://github.com/Nero5023/perf-event.git", rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4" }
 perf-event-open-sys = { version = "5.0", git = "https://github.com/Nero5023/perf-event.git", rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4" }
 
