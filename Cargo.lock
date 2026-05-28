@@ -7624,9 +7624,8 @@ dependencies = [
 
 [[package]]
 name = "notify"
-version = "9.0.0-rc.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb94cf3583e1483c23ceb47a5f7d56b3e8d7309b3e3727698a8c52a96993355e"
+version = "9.0.0-rc.7"
+source = "git+https://github.com/daandemeyer/notify.git?rev=2273c03cb8bfe3e348bfcd1e5f523d8a65b1f725#2273c03cb8bfe3e348bfcd1e5f523d8a65b1f725"
 dependencies = [
  "bitflags 2.13.2",
  "inotify",
@@ -7644,9 +7643,8 @@ dependencies = [
 
 [[package]]
 name = "notify-types"
-version = "2.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42b8cfee0e339a0337359f3c88165702ac6e600dc01c0cc9579a92d62b08477a"
+version = "2.2.0"
+source = "git+https://github.com/daandemeyer/notify.git?rev=2273c03cb8bfe3e348bfcd1e5f523d8a65b1f725#2273c03cb8bfe3e348bfcd1e5f523d8a65b1f725"
 dependencies = [
  "bitflags 2.13.2",
 ]
