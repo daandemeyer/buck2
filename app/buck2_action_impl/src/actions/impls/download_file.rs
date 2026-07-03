@@ -35,7 +35,9 @@ use buck2_error::ErrorTag;
 use buck2_error::conversion::from_any_with_tag;
 use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::digest_config::DigestConfig;
+use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
+use buck2_execute::materialize::download_cache::DownloadCache;
 use buck2_execute::materialize::http::Checksum;
 use buck2_execute::materialize::http::http_download;
 use buck2_execute::materialize::http::http_head;
@@ -141,6 +143,8 @@ impl DownloadFileAction {
         &self,
         client: &HttpClient,
         digest_config: DigestConfig,
+        download_cache: Option<&Arc<DownloadCache>>,
+        io: &dyn BlockingExecutor,
     ) -> buck2_error::Result<Option<FileMetadata>> {
         let digest = if digest_config.cas_digest_config().allows_sha1() {
             self.inner
@@ -161,7 +165,14 @@ impl DownloadFileAction {
             None => return Ok(None),
         };
 
-        let size = match self.inner.size_bytes {
+        let cached_size = match download_cache.filter(|cache| cache.skip_head_request()) {
+            Some(cache) if self.inner.size_bytes.is_none() => {
+                cache.verified_size(&self.inner.checksum, io).await
+            }
+            _ => None,
+        };
+
+        let size = match self.inner.size_bytes.or(cached_size) {
             Some(s) => Some(s),
             None => {
                 let url = self.url(client);
@@ -274,9 +285,18 @@ impl Action for DownloadFileAction {
 
         let client = ctx.http_client();
         let url = self.url(&client);
+        let download_cache = ctx.run_action_knobs().download_cache.dupe();
 
         let (value, execution_kind) = {
-            match self.declared_metadata(&client, ctx.digest_config()).await? {
+            match self
+                .declared_metadata(
+                    &client,
+                    ctx.digest_config(),
+                    download_cache.as_ref(),
+                    ctx.blocking_executor(),
+                )
+                .await?
+            {
                 Some(metadata) => {
                     let artifact_fs = ctx.fs();
                     let value = ArtifactValue::file(metadata.dupe());
@@ -326,18 +346,57 @@ impl Action for DownloadFileAction {
                     let project_fs = artifact_fs.fs();
 
                     let rel_path = artifact_fs.resolve_build(self.output().get_path(), None)?;
+                    let abs_path = project_fs.resolve(&rel_path);
+
+                    let digest_config = ctx.digest_config();
+                    // The store writes to, and reads from, the output path, so
+                    // it must not be left running against an output the next
+                    // attempt is already rewriting.
+                    let cancellations = ctx.cancellation_context();
+                    let io = ctx.blocking_executor();
+
+                    let cached = match &download_cache {
+                        Some(cache) => {
+                            cancellations
+                                .critical_section(|| {
+                                    cache.get(
+                                        &self.inner.checksum,
+                                        self.inner.size_bytes,
+                                        &abs_path,
+                                        self.inner.is_executable,
+                                        digest_config,
+                                        io,
+                                    )
+                                })
+                                .await
+                        }
+                        None => None,
+                    };
 
                     // Slow path: download now.
-                    let digest = http_download(
-                        &client,
-                        project_fs,
-                        ctx.digest_config(),
-                        &rel_path,
-                        url,
-                        &self.inner.checksum,
-                        self.inner.is_executable,
-                    )
-                    .await?;
+                    let digest = match cached {
+                        Some(digest) => digest,
+                        None => {
+                            let digest = http_download(
+                                &client,
+                                project_fs,
+                                digest_config,
+                                &rel_path,
+                                url,
+                                &self.inner.checksum,
+                                self.inner.is_executable,
+                            )
+                            .await?;
+                            if let Some(cache) = &download_cache {
+                                cancellations
+                                    .critical_section(|| {
+                                        cache.put(&self.inner.checksum, &abs_path, io)
+                                    })
+                                    .await;
+                            }
+                            digest
+                        }
+                    };
 
                     let metadata = FileMetadata {
                         digest,
