@@ -173,7 +173,7 @@ impl WriteAction {
             .map(|macro_files| {
                 macro_files
                     .iter()
-                    .map(|a| a.resolve_path(fs.fs(), artifact_path_mapping.get(a)))
+                    .map(|a| a.resolve_path_for_execution(fs.fs(), artifact_path_mapping.get(a)))
                     .collect::<buck2_error::Result<Vec<_>>>()
             })
             .transpose()?;

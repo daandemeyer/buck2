@@ -304,15 +304,14 @@ impl Action for AssembledDirAction {
                     internal_error!("Input did not dereference to exactly one artifact")
                 })?;
 
-            let src = src_artifact.resolve_path(
-                ctx.fs(),
-                if src_artifact.path_resolution_requires_artifact_value() {
-                    Some(value.content_based_path_hash())
-                } else {
-                    None
-                }
-                .as_ref(),
-            )?;
+            let content_hash = if src_artifact.path_resolution_requires_artifact_value() {
+                Some(value.content_based_path_hash())
+            } else {
+                None
+            };
+            let src_execution =
+                src_artifact.resolve_path_for_execution(ctx.fs(), content_hash.as_ref())?;
+            let src_physical = src_artifact.resolve_path(ctx.fs(), content_hash.as_ref())?;
             let temp_dest = temp_output.join(relative_dest);
 
             match copy {
@@ -321,19 +320,19 @@ impl Action for AssembledDirAction {
                 } => {
                     let dest_entry = builder.add_copied(
                         value,
-                        src.as_ref(),
+                        src_execution.as_ref(),
                         temp_dest.as_ref(),
                         *executable_bit_override,
                     )?;
                     srcs.push((
-                        src,
+                        src_physical,
                         relative_dest,
                         dest_entry.map_dir(|d| d.as_immutable()),
                         *executable_bit_override,
                     ));
                 }
                 CopyMode::Symlink => {
-                    builder.add_symlinked(value, src, temp_dest.as_ref())?;
+                    builder.add_symlinked(value, src_execution, temp_dest.as_ref())?;
                 }
             };
         }

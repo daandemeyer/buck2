@@ -14,7 +14,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use buck2_build_api::actions::artifact::get_artifact_fs::GetArtifactFs;
+use buck2_build_api::context::HasBuildContextData;
+use buck2_common::dice::data::HasIoProvider;
 use buck2_common::file_ops::delegate::FileOpsDelegate;
 use buck2_common::file_ops::metadata::FileMetadata;
 use buck2_common::file_ops::metadata::FileType;
@@ -27,6 +28,7 @@ use buck2_core::cells::name::CellName;
 use buck2_core::cells::paths::CellRelativePath;
 use buck2_core::cells::paths::CellRelativePathBuf;
 use buck2_core::directory_digest::DirectoryDigest;
+use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_directory::directory::builder::DirectoryBuilder;
 use buck2_directory::directory::directory::Directory;
@@ -391,8 +393,23 @@ async fn declare_all_source_artifacts(
     ops: &BundledFileOpsDelegate,
 ) -> buck2_error::Result<()> {
     let mut requests = Vec::new();
-    let artifact_fs = ctx.get_artifact_fs().await?;
-    let buck_out_resolver = artifact_fs.buck_out_path_resolver();
+    // Deliberately not `get_artifact_fs`: an external cell's physical root is a pure Buck-out
+    // path, so nothing needed here depends on cell execution names, and depending on them would
+    // put this delegate downstream of a computation that resolves cell configs.
+    let buck_out_resolver = ctx.get_buck_out_path().await?;
+    let cell_source_path_mode = ctx.get_cell_source_path_mode().await?;
+
+    if cell_source_path_mode == CellSourcePathMode::CanonicalV1 {
+        // Bundled files stay lazily declared, but the execution view has to point a directory link
+        // at the physical root before any individual file is materialized.
+        let physical_root = buck_out_resolver.resolve_external_cell_source(
+            CellRelativePath::empty(),
+            ExternalCellOrigin::Bundled(cell_name),
+        );
+        let project_root = ctx.global_data().get_io_provider().project_root().dupe();
+        fs_util::create_dir_all(project_root.resolve(&physical_root))
+            .buck_error_context("Failed to create bundled external cell storage root")?;
+    }
 
     for (path, entry) in ops.dir.unordered_walk_leaves().with_paths() {
         let path = buck_out_resolver.resolve_external_cell_source(
@@ -465,8 +482,8 @@ pub(crate) async fn materialize_all(
     ctx: &mut DiceComputations<'_>,
     cell: CellName,
 ) -> buck2_error::Result<ProjectRelativePathBuf> {
-    let artifact_fs = ctx.get_artifact_fs().await?;
-    let buck_out_resolver = artifact_fs.buck_out_path_resolver();
+    // See `declare_all_source_artifacts` for why this is not `get_artifact_fs`.
+    let buck_out_resolver = ctx.get_buck_out_path().await?;
 
     let ops = get_file_ops_delegate(ctx, cell).await?;
     let materializer = ctx.per_transaction_data().get_materializer();

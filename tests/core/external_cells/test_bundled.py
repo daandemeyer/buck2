@@ -50,6 +50,20 @@ async def test_build_local(buck: Buck) -> None:
     assert p.read_text().strip() == "\n".join(["value", "6", "foobar", "foobar2"])
 
 
+@buck_test(extra_buck_config={"buck2": {"cell_execution_paths": "canonical_v1"}})
+async def test_canonical_paths_build_local(buck: Buck) -> None:
+    """Bundled external cells must translate into the canonical execution view."""
+    result = await buck.build_without_report(
+        "--show-full-simple-output", "--local-only", "other//:other_alias"
+    )
+    p = Path(result.stdout.strip())
+    assert p.read_text().strip() == "\n".join(["value", "6", "foobar", "foobar2"])
+    # Local execution of an action consuming bundled-cell sources must publish a
+    # canonical cell-sources view under buck-out.
+    views = list(buck.cwd.glob("buck-out/*/cell_sources/v1/c_*"))
+    assert views, "expected a canonical cell-sources view to be published under buck-out"
+
+
 @buck_test()
 async def test_build_remote(buck: Buck) -> None:
     result = await buck.build_without_report(

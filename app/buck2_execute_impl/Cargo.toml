@@ -55,6 +55,7 @@ zstd.workspace = true
 
 [dev-dependencies]
 assert_matches.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 buck2_forkserver.workspace = true
@@ -63,6 +64,9 @@ buck2_forkserver_proto.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 buck2_forkserver.workspace = true
 buck2_forkserver_proto.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+junction.workspace = true
 
 [lints]
 workspace = true

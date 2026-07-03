@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use allocative::Allocative;
 use async_trait::async_trait;
+use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
 use buck2_core::fs::buck_out_path::BuckOutPathResolver;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use derive_more::Display;
@@ -29,18 +30,29 @@ use pagable::pagable_typetag;
 #[async_trait]
 pub trait HasBuildContextData {
     async fn get_buck_out_path(&mut self) -> buck2_error::Result<BuckOutPathResolver>;
+
+    async fn get_cell_source_path_mode(&mut self) -> buck2_error::Result<CellSourcePathMode>;
 }
 
 pub trait SetBuildContextData {
     fn set_buck_out_path(
         &mut self,
         path: Option<ProjectRelativePathBuf>,
+    ) -> buck2_error::Result<()> {
+        self.set_build_context_data(path, CellSourcePathMode::Physical)
+    }
+
+    fn set_build_context_data(
+        &mut self,
+        path: Option<ProjectRelativePathBuf>,
+        cell_source_path_mode: CellSourcePathMode,
     ) -> buck2_error::Result<()>;
 }
 
 #[derive(PartialEq, Eq, Allocative, Pagable)]
 pub struct BuildData {
     buck_out_path: ProjectRelativePathBuf,
+    cell_source_path_mode: CellSourcePathMode,
 }
 
 #[derive(Clone, Dupe, Display, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
@@ -66,12 +78,18 @@ impl HasBuildContextData for DiceComputations<'_> {
         let data = self.compute(&BuildDataKey).await?;
         Ok(BuckOutPathResolver::new(data.buck_out_path.to_buf()))
     }
+
+    async fn get_cell_source_path_mode(&mut self) -> buck2_error::Result<CellSourcePathMode> {
+        let data = self.compute(&BuildDataKey).await?;
+        Ok(data.cell_source_path_mode)
+    }
 }
 
 impl SetBuildContextData for DiceTransactionUpdater {
-    fn set_buck_out_path(
+    fn set_build_context_data(
         &mut self,
         path: Option<ProjectRelativePathBuf>,
+        cell_source_path_mode: CellSourcePathMode,
     ) -> buck2_error::Result<()> {
         Ok(self.changed_to(vec![(
             BuildDataKey,
@@ -79,6 +97,7 @@ impl SetBuildContextData for DiceTransactionUpdater {
                 buck_out_path: path.unwrap_or_else(|| {
                     ProjectRelativePathBuf::unchecked_new("buck-out/v2".to_owned())
                 }),
+                cell_source_path_mode,
             }),
         )])?)
     }

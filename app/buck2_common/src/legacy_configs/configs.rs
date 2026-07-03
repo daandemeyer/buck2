@@ -97,7 +97,9 @@ pub(crate) enum ConfigArgumentParseError {
     #[error("Contains whitespace in key-value pair `{0}`")]
     WhitespaceInKeyOrValue(String),
 
-    #[error("Specifying cells via cli config overrides is banned (`{0}.key=value`)")]
+    #[error(
+        "Specifying cells or their execution names via cli config overrides is banned (`{0}.key=value`)"
+    )]
     CellOverrideViaCliConfig(&'static str),
 }
 

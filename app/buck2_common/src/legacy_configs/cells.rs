@@ -429,6 +429,25 @@ impl BuckConfigBasedCells {
         Ok(aliases.into_iter())
     }
 
+    /// The root cell's `[cell_execution_names]`; cells absent from it keep their own name.
+    ///
+    /// Keys are root cell aliases, matching `[external_cells]` and `[cell_aliases]`; a section
+    /// keyed by canonical name only would reject the alias spellings those sections accept.
+    pub(crate) fn get_cell_execution_names_from_config(
+        config: &LegacyBuckConfig,
+    ) -> buck2_error::Result<Vec<(NonEmptyCellAlias, String)>> {
+        let mut names = Vec::new();
+        if let Some(section) = config.get_section("cell_execution_names") {
+            for (alias, execution_name) in section.iter() {
+                names.push((
+                    NonEmptyCellAlias::new(alias.to_owned())?,
+                    execution_name.as_str().to_owned(),
+                ));
+            }
+        }
+        Ok(names)
+    }
+
     pub(crate) async fn parse_single_cell_with_dice(
         ctx: &mut DiceComputations<'_>,
         cell_path: &CellRootPath,
@@ -640,6 +659,7 @@ mod tests {
     use std::sync::Arc;
 
     use buck2_cli_proto::ConfigOverride;
+    use buck2_core::cells::alias::NonEmptyCellAlias;
     use buck2_core::cells::cell_root_path::CellRootPath;
     use buck2_core::cells::cell_root_path::CellRootPathBuf;
     use buck2_core::cells::external::ExternalCellOrigin;
@@ -1345,6 +1365,79 @@ mod tests {
         let e = format!("{e:?}");
         assert!(e.contains("not a valid SHA1 digest"), "error: {e}");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cell_execution_names() -> buck2_error::Result<()> {
+        let mut file_ops = TestConfigParserFileOps::new(&[(
+            ".buckconfig",
+            indoc!(
+                r#"
+                    [cells]
+                        root = .
+                        sample_v2 = third_party/sample/
+                    [cell_execution_names]
+                        sample_v2 = sample
+                "#
+            ),
+        )])?;
+
+        let cells = BuckConfigBasedCells::testing_parse_with_file_ops(&mut file_ops, &[]).await?;
+        assert_eq!(
+            BuckConfigBasedCells::get_cell_execution_names_from_config(&cells.root_config)?,
+            vec![(
+                NonEmptyCellAlias::new("sample_v2".to_owned())?,
+                "sample".to_owned()
+            )]
+        );
+        Ok(())
+    }
+
+    /// Overriding an execution name relocates a cell's sources, so it is banned from the command
+    /// line alongside `[cells]` for the same reason.
+    #[tokio::test]
+    async fn test_cell_execution_names_cannot_be_set_on_the_cli() -> buck2_error::Result<()> {
+        let mut file_ops = TestConfigParserFileOps::new(&[(
+            ".buckconfig",
+            indoc!(
+                r#"
+                    [cells]
+                        root = .
+                "#
+            ),
+        )])?;
+        let e = BuckConfigBasedCells::testing_parse_with_file_ops(
+            &mut file_ops,
+            &[ConfigOverride::flag_no_cell(
+                "cell_execution_names.sample_v2=sample",
+            )],
+        )
+        .await
+        .err()
+        .unwrap();
+        let e = format!("{e:?}");
+        assert!(e.contains("is banned"), "error: {e}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_no_cell_execution_names() -> buck2_error::Result<()> {
+        let mut file_ops = TestConfigParserFileOps::new(&[(
+            ".buckconfig",
+            indoc!(
+                r#"
+                    [cells]
+                        root = .
+                "#
+            ),
+        )])?;
+
+        let cells = BuckConfigBasedCells::testing_parse_with_file_ops(&mut file_ops, &[]).await?;
+        assert!(
+            BuckConfigBasedCells::get_cell_execution_names_from_config(&cells.root_config)?
+                .is_empty()
+        );
         Ok(())
     }
 }

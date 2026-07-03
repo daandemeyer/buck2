@@ -136,7 +136,9 @@ impl LegacyConfigParser {
         config_pair: &ResolvedConfigFlag,
         current_cell: &CellRootPath,
     ) -> buck2_error::Result<()> {
-        for banned_section in ["repositories", "cells"] {
+        // `cell_execution_names` names cells' execution paths, so overriding it relocates sources
+        // and invalidates their action cache entries, for the same reason `cells` is banned.
+        for banned_section in ["repositories", "cells", "cell_execution_names"] {
             if config_pair.section == banned_section {
                 return Err(
                     ConfigArgumentParseError::CellOverrideViaCliConfig(banned_section).into(),
