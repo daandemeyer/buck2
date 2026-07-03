@@ -33,6 +33,9 @@ pub struct CacheUploadInfo<'a> {
     /// Whether locally produced results may be published. Results that came from RE
     /// (remote executions and action-cache hits) are already published.
     pub allow_cache_upload: bool,
+    /// When this is true and `allow_cache_upload` is false, a locally produced result is
+    /// published as a digests-only entry.
+    pub publish_digests_only: bool,
 }
 
 #[async_trait]

@@ -8,6 +8,10 @@ inputs:
     # Composite workflows do not have access to secrets so they have to be passed in
     description: "GitHub Token"
     required: true
+  draft:
+    description: "leave the release a draft, so that later steps can add assets before publishing it"
+    required: false
+    default: "false"
 
 runs:
   using: "composite"
@@ -26,8 +30,27 @@ runs:
       shell: bash
       run: |
         ls -R artifacts
+    # The pyTooling releaser always publishes the release. A repository with immutable
+    # releases rejects uploads to a published release. This step therefore creates a draft
+    # release with gh and uploads the artifacts to it.
+    - name: Upload the artifacts to a draft release
+      if: inputs.draft == 'true'
+      shell: bash
+      env:
+        GH_REPO: ${{ github.repository }}
+        GH_TOKEN: ${{ inputs.github_token }}
+        TAG: ${{ inputs.tag }}
+      run: |
+        # When a failed release is rerun, the draft from the earlier attempt already exists.
+        if ! gh release view "$TAG" > /dev/null; then
+          gh release create "$TAG" --draft --prerelease --target "$GITHUB_SHA" --title "$TAG" --notes ""
+        fi
+        mapfile -t files < <(find artifacts -type f)
+        # The upload sometimes fails, and a second attempt usually succeeds.
+        gh release upload "$TAG" --clobber "${files[@]}" || gh release upload "$TAG" --clobber "${files[@]}"
     - uses: pyTooling/Actions/releaser@adef08d3bdef092282614f3b683897cefae82ee3 # v0.4.6
       id: upload_attempt_1
+      if: inputs.draft != 'true'
       with:
         token: ${{ inputs.github_token }}
         tag: '${{ inputs.tag }}'

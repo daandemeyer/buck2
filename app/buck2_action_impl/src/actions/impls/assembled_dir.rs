@@ -26,12 +26,16 @@ use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_api::interpreter::rule_defs::artifact::associated::AssociatedArtifacts;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactView;
 use buck2_build_signals::env::WaitingData;
+use buck2_common::file_ops::metadata::FileMetadata;
 use buck2_core::category::CategoryRef;
 use buck2_core::content_hash::ContentBasedPathHash;
+use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_error::BuckErrorContext;
 use buck2_error::internal_error;
 use buck2_execute::artifact_utils::ArtifactValueBuilder;
 use buck2_execute::artifact_value::ArtifactValue;
+use buck2_execute::directory::ActionDirectoryEntry;
+use buck2_execute::directory::ActionImmutableDirectory;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
 use buck2_execute::materialize::materializer::CopiedArtifact;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
@@ -260,40 +264,25 @@ impl AssembledDirAction {
             .next()
             .expect("a single artifact by construction")
     }
-}
 
-#[pagable_typetag]
-#[async_trait]
-impl Action for AssembledDirAction {
-    fn kind(&self) -> buck2_data::ActionKind {
-        buck2_data::ActionKind::SymlinkedDir
-    }
-
-    fn inputs(&self) -> buck2_error::Result<Cow<'_, [ArtifactGroup]>> {
-        Ok(Cow::Owned(self.args.iter().map(|x| x.0.dupe()).collect()))
-    }
-
-    fn outputs(&self) -> Cow<'_, [BuildArtifact]> {
-        Cow::Borrowed(self.outputs.as_slice())
-    }
-
-    fn first_output(&self) -> &BuildArtifact {
-        self.output()
-    }
-
-    fn category(&self) -> CategoryRef<'_> {
-        CategoryRef::unchecked_new(self.category.as_str())
-    }
-
-    fn identifier(&self) -> Option<&str> {
-        Some(self.output().get_path().path().as_str())
-    }
-
-    async fn execute(
+    fn dir_value(
         &self,
-        ctx: &mut dyn ActionExecutionCtx,
-        waiting_data: WaitingData,
-    ) -> Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError> {
+        ctx: &dyn ActionExecutionCtx,
+    ) -> buck2_error::Result<(
+        ArtifactValue,
+        Vec<(
+            ProjectRelativePathBuf,
+            &Box<ForwardRelativePath>,
+            ActionDirectoryEntry<ActionImmutableDirectory>,
+            Option<bool>,
+        )>,
+        Vec<(
+            ProjectRelativePathBuf,
+            ForwardRelativePathBuf,
+            FileMetadata,
+            Option<bool>,
+        )>,
+    )> {
         let fs = ctx.fs().fs();
         let temp_output = ctx.fs().resolve_build(
             self.output().get_path(),
@@ -359,6 +348,43 @@ impl Action for AssembledDirAction {
         // The action defines the whole of the output directory, which is what lets the
         // materializer clear what a previous run left under it.
         let value = builder.build_exhaustive(temp_output.as_ref())?;
+        Ok((value, srcs, source_files))
+    }
+}
+
+#[pagable_typetag]
+#[async_trait]
+impl Action for AssembledDirAction {
+    fn kind(&self) -> buck2_data::ActionKind {
+        buck2_data::ActionKind::SymlinkedDir
+    }
+
+    fn inputs(&self) -> buck2_error::Result<Cow<'_, [ArtifactGroup]>> {
+        Ok(Cow::Owned(self.args.iter().map(|x| x.0.dupe()).collect()))
+    }
+
+    fn outputs(&self) -> Cow<'_, [BuildArtifact]> {
+        Cow::Borrowed(self.outputs.as_slice())
+    }
+
+    fn first_output(&self) -> &BuildArtifact {
+        self.output()
+    }
+
+    fn category(&self) -> CategoryRef<'_> {
+        CategoryRef::unchecked_new(self.category.as_str())
+    }
+
+    fn identifier(&self) -> Option<&str> {
+        Some(self.output().get_path().path().as_str())
+    }
+
+    async fn execute(
+        &self,
+        ctx: &mut dyn ActionExecutionCtx,
+        waiting_data: WaitingData,
+    ) -> Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError> {
+        let (value, srcs, source_files) = self.dir_value(ctx)?;
         let actual_output = ctx.fs().resolve_build(
             self.output().get_path(),
             if self.output().get_path().is_content_based_path() {
@@ -441,6 +467,21 @@ impl Action for AssembledDirAction {
                 waiting_data,
             },
         ))
+    }
+
+    fn output_values(
+        &self,
+        ctx: &dyn ActionExecutionCtx,
+    ) -> buck2_error::Result<Option<ActionOutputs>> {
+        let (value, _, _) = self.dir_value(ctx)?;
+        Ok(Some(ActionOutputs::from_single(
+            self.output().get_path().dupe(),
+            value,
+        )))
+    }
+
+    fn supports_output_values(&self) -> bool {
+        true
     }
 }
 

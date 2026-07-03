@@ -11,6 +11,7 @@ rust_unittest(
         "fbsource//third-party/rust:ctor",
         "fbsource//third-party/rust:derivative",
         "fbsource//third-party/rust:derive_more",
+        "fbsource//third-party/rust:httptest",
         "fbsource//third-party/rust:indoc",
         "fbsource//third-party/rust:itertools",
         "fbsource//third-party/rust:maplit",

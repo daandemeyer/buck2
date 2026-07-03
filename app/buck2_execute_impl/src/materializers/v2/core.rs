@@ -54,7 +54,6 @@ use async_trait::async_trait;
 use buck2_common::file_ops::metadata::FileDigest;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_common::init::DaemonStartupOptions;
-use buck2_common::io::fs::is_executable;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
@@ -489,6 +488,7 @@ impl<T: IoHandler + Allocative> DiskStateMaterializer<T> {
                     root.path.clone(),
                     root.entry.dupe(),
                     exclusions,
+                    self.readonly_outputs,
                     info.dupe(),
                     dispatcher.dupe(),
                 ),
@@ -906,6 +906,8 @@ impl<T: IoHandler + Allocative> Materializer for DiskStateMaterializer<T> {
         }
         // The download of a content root with nothing excluded and no report at its end: what is
         // there goes, and the content comes from a tracked path, the store or the CAS.
+        // No report follows the fill, so its files keep their write bits. The incremental run
+        // writes them in place and reports them itself.
         download_task(
             self.io.dupe(),
             self.blocking_executor.dupe(),
@@ -915,6 +917,7 @@ impl<T: IoHandler + Allocative> Materializer for DiskStateMaterializer<T> {
             path,
             entry,
             Vec::new(),
+            false,
             Arc::new(CasDownloadInfo::new_tracked(re_use_case)),
             get_dispatcher(),
         )(cancellations)
@@ -1292,6 +1295,9 @@ impl RequestPlan {
 /// file from a tracked path holding the same content, then from the store, then from the CAS.
 /// The tracked path comes first because it is read under a hold the processor grants, which
 /// nothing can take the file out from under; the store's files are the collector's to remove.
+/// `read_only` says whether reporting the root removes the write bits of its files, as it does
+/// under `buck2.readonly_outputs`. A file from a tracked path or the store gets its final mode
+/// right away, so that a tracked file or a stash file without write bits can be hardlinked.
 fn download_task<T: IoHandler>(
     io: Arc<T>,
     blocking_executor: Arc<dyn BlockingExecutor>,
@@ -1301,6 +1307,7 @@ fn download_task<T: IoHandler>(
     root: ProjectRelativePathBuf,
     entry: ArtifactMetadata,
     exclusions: Vec<ProjectRelativePathBuf>,
+    read_only: bool,
     info: Arc<CasDownloadInfo>,
     dispatcher: EventDispatcher,
 ) -> impl for<'a> FnOnce(&'a CancellationContext) -> BoxFuture<'a, Result<(), SharedMaterializingError>>
@@ -1351,8 +1358,13 @@ fn download_task<T: IoHandler>(
                         .execute_io_inline(move || {
                             let (mut copied, mut missed) = (Vec::new(), Vec::new());
                             for (wanted, source, guard) in copies {
-                                match copy_from_disk(&fs, &source, &wanted.path, wanted.executable)
-                                {
+                                match copy_from_disk(
+                                    &fs,
+                                    &source,
+                                    &wanted.path,
+                                    wanted.executable,
+                                    read_only,
+                                ) {
                                     Ok(()) => copied.push(wanted.path),
                                     // A miss: the store is asked, then the CAS.
                                     Err(e) => {
@@ -1393,6 +1405,7 @@ fn download_task<T: IoHandler>(
                             .map(|wanted| FileToLink {
                                 digest: wanted.digest.dupe(),
                                 executable: wanted.executable,
+                                read_only,
                                 dest: io.fs().resolve(&wanted.path),
                             })
                             .collect(),
@@ -1470,25 +1483,26 @@ fn copy_from_disk(
     source: &ProjectRelativePath,
     dest: &ProjectRelativePath,
     executable: bool,
+    read_only: bool,
 ) -> buck2_error::Result<()> {
     let (source, dest) = (fs.resolve(source), fs.resolve(dest));
     let copied = (|| {
         if let Some(parent) = dest.parent() {
             fs_util::create_dir_all(parent)?;
         }
-        // A hardlink has its source's mode, so only a source with the mode asked for is linked.
-        // Windows keeps no executable bit to differ in.
-        let source_executable = is_executable(&fs_util::metadata(&source).categorize_internal()?);
-        let made_a_file = if source_executable == executable || cfg!(windows) {
-            fs_util::reflink_or_hardlink_or_copy(&source, &dest).categorize_internal()?
-                != Linked::Hardlinked
+        // A hardlink has its source's mode, so only a source with exactly the mode asked for is
+        // linked.
+        let metadata = fs_util::metadata(&source).categorize_internal()?;
+        if fs_util::has_canonical_mode(&metadata, executable, read_only) {
+            if fs_util::reflink_or_hardlink_or_copy(&source, &dest).categorize_internal()?
+                == Linked::Hardlinked
+            {
+                return buck2_error::Ok(());
+            }
         } else {
             fs_util::reflink_or_copy(&source, &dest).categorize_internal()?;
-            true
-        };
-        if made_a_file {
-            fs_util::set_executable(&dest, executable).categorize_internal()?;
         }
+        fs_util::set_canonical_mode(&dest, executable, read_only).categorize_internal()?;
         buck2_error::Ok(())
     })();
     if copied.is_err() {

@@ -36,6 +36,7 @@ use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineBuilder;
 use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineSink;
 use buck2_build_api::interpreter::rule_defs::cmd_args::InputProperties;
 use buck2_build_signals::env::WaitingData;
+use buck2_common::file_ops::metadata::FileMetadata;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_core::buck2_env;
 use buck2_core::category::CategoryRef;
@@ -476,6 +477,28 @@ impl Action for WriteAction {
                 waiting_data,
             },
         ))
+    }
+
+    fn output_values(
+        &self,
+        ctx: &dyn ActionExecutionCtx,
+    ) -> buck2_error::Result<Option<ActionOutputs>> {
+        let request = self.write_request(ctx)?;
+        let digest = TrackedFileDigest::from_content(
+            &request.content,
+            ctx.digest_config().cas_digest_config(),
+        );
+        Ok(Some(ActionOutputs::from_single(
+            self.output.get_path().dupe(),
+            ArtifactValue::file(FileMetadata {
+                digest,
+                is_executable: request.is_executable,
+            }),
+        )))
+    }
+
+    fn supports_output_values(&self) -> bool {
+        true
     }
 }
 

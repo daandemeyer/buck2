@@ -91,6 +91,7 @@ use buck2_execute::execute::kind::CommandExecutionKind;
 use buck2_execute::execute::low_pass_filter::LowPassFilter;
 use buck2_execute::execute::output::CommandStdStreams;
 use buck2_execute::execute::prepared::NoOpCommandOptionalExecutor;
+use buck2_execute::execute::prepared::PreparedCommandOptionalExecutor;
 use buck2_execute::execute::request::CommandExecutionOutput;
 use buck2_execute::execute::result::CommandExecutionMetadata;
 use buck2_execute::execute::result::CommandExecutionReport;
@@ -119,7 +120,7 @@ use maplit::btreemap;
 
 use crate::actions::testings::SimpleAction;
 
-fn create_test_configured_target_label() -> ConfiguredTargetLabel {
+pub(crate) fn create_test_configured_target_label() -> ConfiguredTargetLabel {
     TargetLabel::testing_parse("cell//pkg:foo").configure(ConfigurationData::testing_new())
 }
 
@@ -196,6 +197,23 @@ async fn make_default_dice_state(
     temp_fs: &ProjectRootTemp,
     mocks: Vec<Box<dyn FnOnce(DiceBuilder) -> DiceBuilder>>,
 ) -> buck2_error::Result<DiceTransaction> {
+    make_dice_state(
+        dry_run_tracker,
+        temp_fs,
+        Arc::new(NoOpCommandOptionalExecutor {}),
+        RunActionKnobs::default(),
+        mocks,
+    )
+    .await
+}
+
+pub(crate) async fn make_dice_state(
+    dry_run_tracker: Arc<Mutex<Vec<DryRunEntry>>>,
+    temp_fs: &ProjectRootTemp,
+    action_cache_checker: Arc<dyn PreparedCommandOptionalExecutor>,
+    run_action_knobs: RunActionKnobs,
+    mocks: Vec<Box<dyn FnOnce(DiceBuilder) -> DiceBuilder>>,
+) -> buck2_error::Result<DiceTransaction> {
     let fs = temp_fs.path().dupe();
 
     let cell_resolver = CellResolver::testing_with_name_and_path(
@@ -220,6 +238,7 @@ async fn make_default_dice_state(
     extra.set_keep_going(true);
     struct CommandExecutorProvider {
         dry_run_tracker: Arc<Mutex<Vec<DryRunEntry>>>,
+        action_cache_checker: Arc<dyn PreparedCommandOptionalExecutor>,
     }
     impl HasCommandExecutor for CommandExecutorProvider {
         fn get_command_executor(
@@ -233,7 +252,7 @@ async fn make_default_dice_state(
             ));
             Ok(CommandExecutorResponse {
                 executor,
-                action_cache_checker: Arc::new(NoOpCommandOptionalExecutor {}),
+                action_cache_checker: self.action_cache_checker.dupe(),
                 remote_dep_file_cache_checker: Arc::new(NoOpCommandOptionalExecutor {}),
                 platform: Default::default(),
                 cache_uploader: Arc::new(NoOpCacheUploader {}),
@@ -247,7 +266,10 @@ async fn make_default_dice_state(
     }
 
     set_fallback_executor_config(&mut extra.data, CommandExecutorConfig::testing_local());
-    extra.set_command_executor(Box::new(CommandExecutorProvider { dry_run_tracker }));
+    extra.set_command_executor(Box::new(CommandExecutorProvider {
+        dry_run_tracker,
+        action_cache_checker,
+    }));
     extra.set_detailed_aggregated_metrics_events_holder();
     extra.set_blocking_executor(Arc::new(DummyBlockingExecutor { fs: fs.dupe() }));
     extra.set_materializer(Arc::new(NoDiskDeferredMaterializer::testing_new_no_disk(
@@ -258,12 +280,13 @@ async fn make_default_dice_state(
         use_case: RemoteExecutorUseCase::buck2_default(),
         cas_configured: false,
         may_probe_cas: false,
+        skip_cache_read: false,
     });
     extra.set_http_client(HttpClientBuilder::https_with_system_roots().await?.build());
     extra.set_dep_file_cache(create_dep_file_cache());
     extra.set_mergebase(Default::default());
     extra.data.set(EventDispatcher::null());
-    extra.data.set(RunActionKnobs::default());
+    extra.data.set(run_action_knobs);
     extra.set_low_pass_filter(Arc::new(LowPassFilter::new(1)));
     extra.spawner = Arc::new(BuckSpawner::current_runtime().unwrap());
 

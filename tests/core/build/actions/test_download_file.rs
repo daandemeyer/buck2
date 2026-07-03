@@ -938,7 +938,8 @@ async fn test_content_the_cas_holds_needs_no_url(buck: &Buck) -> anyhow::Result<
     assert_eq!(server.count("GET", "/file"), 1);
 
     // A new daemon and a URL nothing answers on: the declaration names content the CAS
-    // holds, so a remote consumer and a local one both get it without the URL.
+    // holds, so a remote consumer and a local one both get it without the URL. The
+    // `--no-remote-cache` flag would prevent reuse of the CAS copy.
     buck.kill().await?;
     let broken = configs(
         "http://localhost:1/file",
@@ -946,11 +947,8 @@ async fn test_content_the_cas_holds_needs_no_url(buck: &Buck) -> anyhow::Result<
         None,
         Some(content.len()),
     );
-    buck.build(&with(
-        &["//:copy", "--remote-only", "--no-remote-cache"],
-        &[&broken],
-    ))
-    .await?;
+    buck.build(&with(&["//:copy", "--remote-only"], &[&broken]))
+        .await?;
     assert_eq!(
         build_and_read(buck, "//:copy_again", &with(&["--local-only"], &[&broken])).await?,
         content
@@ -1035,6 +1033,48 @@ async fn test_a_wrong_size_is_a_miss_in_the_cas(buck: &Buck) -> anyhow::Result<(
         content.len() + 1
     ));
     assert_eq!(server.count("GET", "/file"), 2);
+    Ok(())
+}
+
+#[buck_test(data_dir = "download", write_invocation_record = true)]
+async fn test_no_remote_cache_downloads_without_asking_the_cas(buck: &Buck) -> anyhow::Result<()> {
+    // A remote consumer uploads downloaded content to the CAS. A later download with
+    // `--no-remote-cache` must fetch the URL again without issuing CAS presence checks.
+    let content = random_string().into_bytes();
+    let server = StaticHttpServer::start([("/file", content.clone())]).await?;
+    let declared = configs(&server.url("/file"), Some(&sha1_hex(&content)), None, None);
+    buck.build(&with(
+        &["//:copy", "--remote-only", "--no-remote-cache"],
+        &[&declared],
+    ))
+    .await?;
+    assert_eq!(server.count("GET", "/file"), 1);
+
+    // The invocation record must show that the second download did not query the CAS.
+    let result = buck
+        .build(&with(
+            &["//:download_again", "--no-remote-cache"],
+            &[&declared],
+        ))
+        .await?;
+    assert_eq!(
+        std::fs::read(
+            result
+                .build_report()?
+                .output_for_target("//:download_again")?
+        )?,
+        content
+    );
+    assert_eq!(server.count("GET", "/file"), 2);
+    let record = result.invocation_record()?;
+    let snapshot = record["last_snapshot"]
+        .as_object()
+        .expect("an invocation snapshot");
+    let count = snapshot.get("re_presence_check_rpcs");
+    assert!(
+        count.is_none_or(|count| count.as_u64() == Some(0) || count.as_str() == Some("0")),
+        "{count:?}"
+    );
     Ok(())
 }
 

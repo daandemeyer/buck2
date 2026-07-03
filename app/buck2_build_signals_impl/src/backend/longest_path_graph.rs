@@ -182,6 +182,7 @@ impl BuildListenerBackend for LongestPathGraphBackend {
                         // We only traverse edges to things that produce artifacts here.
                         match keys[i] {
                             NodeKey::BuildKey(..)
+                            | NodeKey::OutputValuesKey(..)
                             | NodeKey::EnsureTransitiveSetProjectionKey(..)
                             | NodeKey::EnsureProjectedArtifactKey(..) => {}
                             _ => {
