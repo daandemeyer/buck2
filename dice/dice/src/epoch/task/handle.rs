@@ -61,6 +61,14 @@ impl Drop for DiceTaskHandle<'_> {
             Some(Err(token)) => {
                 completion_handle.cancelled(token);
             }
+            // A panic in the key's computation unwinds through here with no result. Reporting that
+            // as a worker cancellation would be a lie that costs the daemon dearly: cancellations
+            // are retried by starting a new generation, so the key would be recomputed, panic
+            // again, and spin forever. Terminate the task with a real result instead, so every
+            // waiter sees an error rather than the build appearing to hang.
+            None if std::thread::panicking() => {
+                completion_handle.completed(TransactionResult::make_panicked());
+            }
             None => {
                 completion_handle.cancelled(WorkerCancelled);
             }
