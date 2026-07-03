@@ -195,6 +195,8 @@ pub(crate) struct SourceCopy {
     pub(crate) dest: ProjectRelativePathBuf,
     pub(crate) value: ArtifactValue,
     pub(crate) executable_bit_override: Option<bool>,
+    /// Carry the modification times of `src` over to `dest`.
+    pub(crate) preserve_mtimes: bool,
 }
 
 /// Copies of sources the CAS lacks, under the disk-state core: each made here under a permit
@@ -252,6 +254,7 @@ async fn copy_here(
         dest,
         value,
         executable_bit_override,
+        preserve_mtimes,
     } = copy;
     let (fs, entry, config) = (
         ctx.fs().fs().dupe(),
@@ -264,7 +267,17 @@ async fn copy_here(
         ctx.blocking_executor(),
         dest,
         value,
-        move || copy_entry(&fs, &src, &make_at, &entry, executable_bit_override, config),
+        move || {
+            copy_entry(
+                &fs,
+                &src,
+                &make_at,
+                &entry,
+                executable_bit_override,
+                preserve_mtimes,
+                config,
+            )
+        },
     )
     .await
 }
@@ -278,10 +291,18 @@ fn copy_entry(
     dest: &ProjectRelativePath,
     entry: &ActionDirectoryEntry<ActionSharedDirectory>,
     executable_bit_override: Option<bool>,
+    preserve_mtimes: bool,
     config: CasDigestConfig,
 ) -> buck2_error::Result<()> {
     cleanup_path(fs, dest)?;
     let (src, dest) = (fs.resolve(src), fs.resolve(dest));
+    let mut dirs = Vec::new();
+    // `unordered_entry_walk` yields the entries inside a directory but not the directory itself.
+    // The mtime of the root directory has to be copied separately.
+    if preserve_mtimes && matches!(entry, DirectoryEntry::Dir(_)) {
+        fs_util::create_dir_all(&dest)?;
+        dirs.push((0, src.clone(), dest.clone()));
+    }
     let mut walk = unordered_entry_walk(entry.as_ref().map_dir(Directory::as_ref));
     while let Some((path, entry)) = walk.next() {
         let path = path.get();
@@ -290,7 +311,13 @@ fn copy_entry(
             fs_util::create_dir_all(parent)?;
         }
         match entry {
-            DirectoryEntry::Dir(_) => fs_util::create_dir_all(&to)?,
+            DirectoryEntry::Dir(_) => {
+                fs_util::create_dir_all(&to)?;
+                if preserve_mtimes {
+                    dirs.push((path.iter().count(), from, to));
+                }
+                continue;
+            }
             DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) => {
                 fs_util::reflink_or_copy(&from, &to).categorize_internal()?;
                 let found = FileDigest::from_file(&to, FileDigestConfig::source(config))?;
@@ -317,6 +344,15 @@ fn copy_entry(
                 fs_util::symlink(symlink.target(), &to).categorize_internal()?;
             }
         }
+        if preserve_mtimes {
+            fs_util::copy_mtime(&from, &to).categorize_internal()?;
+        }
+    }
+    // Creating an entry in a directory changes the mtime of the directory. Set the mtimes of
+    // directories after all their entries exist, deepest first.
+    dirs.sort_by_key(|(depth, ..)| std::cmp::Reverse(*depth));
+    for (_, from, to) in dirs {
+        fs_util::copy_mtime(&from, &to).categorize_internal()?;
     }
     Ok(())
 }
@@ -363,5 +399,123 @@ async fn upload_sources(ctx: &dyn ActionExecutionCtx, files: Vec<SourceFile>) ->
             );
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::fs::FileTimes;
+    use std::time::Duration;
+    use std::time::SystemTime;
+
+    use buck2_common::file_ops::metadata::Symlink;
+    use buck2_core::fs::project::ProjectRootTemp;
+    use buck2_execute::digest_config::DigestConfig;
+    use buck2_execute::directory::INTERNER;
+    use buck2_execute::directory::insert_entry;
+    use buck2_execute::directory::insert_file;
+    use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
+
+    use super::*;
+
+    fn time(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn set_mtime(path: &AbsNormPathBuf, mtime: SystemTime) -> buck2_error::Result<()> {
+        File::open(path.as_path())?.set_times(FileTimes::new().set_modified(mtime))?;
+        Ok(())
+    }
+
+    fn mtime(path: &AbsNormPathBuf) -> buck2_error::Result<SystemTime> {
+        Ok(std::fs::symlink_metadata(path.as_path())?.modified()?)
+    }
+
+    fn file(content: &str, config: DigestConfig) -> FileMetadata {
+        FileMetadata {
+            digest: TrackedFileDigest::from_content(content.as_bytes(), config.cas_digest_config()),
+            is_executable: false,
+        }
+    }
+
+    #[test]
+    fn copy_entry_preserves_mtimes() -> buck2_error::Result<()> {
+        let temp = ProjectRootTemp::new()?;
+        let fs = temp.path();
+        let config = DigestConfig::testing_default();
+        let path = |p: &str| fs.resolve(ProjectRelativePath::unchecked_new(p));
+
+        fs_util::create_dir_all(path("src/sub"))?;
+        std::fs::write(path("src/file").as_path(), "a")?;
+        std::fs::write(path("src/sub/file").as_path(), "b")?;
+        fs_util::symlink("file", path("src/sub/link")).categorize_internal()?;
+        // `File::set_times` follows symlinks and sets the mtime of the link target. `copy_mtime`
+        // does not follow symlinks, so it copies the mtime of a stamp file onto the link itself.
+        std::fs::write(path("stamp").as_path(), "")?;
+        set_mtime(&path("stamp"), time(1_000_000_002))?;
+        fs_util::copy_mtime(path("stamp"), path("src/sub/link")).categorize_internal()?;
+        set_mtime(&path("src/file"), time(1_000_000_000))?;
+        set_mtime(&path("src/sub/file"), time(1_000_000_001))?;
+        set_mtime(&path("src/sub"), time(1_000_000_003))?;
+        set_mtime(&path("src"), time(1_000_000_004))?;
+
+        let mut builder = ActionDirectoryBuilder::empty_exhaustive();
+        insert_file(
+            &mut builder,
+            ProjectRelativePathBuf::unchecked_new("file".to_owned()),
+            file("a", config),
+        )?;
+        insert_file(
+            &mut builder,
+            ProjectRelativePathBuf::unchecked_new("sub/file".to_owned()),
+            file("b", config),
+        )?;
+        insert_entry(
+            &mut builder,
+            ProjectRelativePathBuf::unchecked_new("sub/link".to_owned()),
+            DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(Arc::new(Symlink::new(
+                "file".into(),
+            )))),
+        )?;
+        builder.mark_uniformly_exhaustive();
+        let entry = DirectoryEntry::Dir(
+            builder
+                .fingerprint(config.as_directory_serializer())
+                .shared(&*INTERNER),
+        );
+        let src = ProjectRelativePath::unchecked_new("src");
+
+        copy_entry(
+            fs,
+            src,
+            ProjectRelativePath::unchecked_new("out/kept"),
+            &entry,
+            None,
+            true,
+            config.cas_digest_config(),
+        )?;
+        assert_eq!(mtime(&path("out/kept"))?, time(1_000_000_004));
+        assert_eq!(mtime(&path("out/kept/file"))?, time(1_000_000_000));
+        assert_eq!(mtime(&path("out/kept/sub"))?, time(1_000_000_003));
+        assert_eq!(mtime(&path("out/kept/sub/file"))?, time(1_000_000_001));
+        assert_eq!(mtime(&path("out/kept/sub/link"))?, time(1_000_000_002));
+        assert_eq!(
+            std::fs::read_link(path("out/kept/sub/link").as_path())?,
+            std::path::Path::new("file")
+        );
+
+        copy_entry(
+            fs,
+            src,
+            ProjectRelativePath::unchecked_new("out/fresh"),
+            &entry,
+            None,
+            false,
+            config.cas_digest_config(),
+        )?;
+        assert_ne!(mtime(&path("out/fresh/file"))?, time(1_000_000_000));
+        assert_ne!(mtime(&path("out/fresh/sub"))?, time(1_000_000_003));
+        Ok(())
     }
 }

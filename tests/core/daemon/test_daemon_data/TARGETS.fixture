@@ -1,4 +1,4 @@
-load(":defs.bzl", "generation", "long_running", "nested_run", "pwd_run", "tenant_value")
+load(":defs.bzl", "generation", "long_running", "nested_buck", "nested_run", "pwd_run", "tenant_value")
 
 trivial_build(name = "rule")
 
@@ -26,3 +26,5 @@ nested_run(
     buck2_path = read_root_config("nested", "buck2_path", ""),
     isolation_dir = read_root_config("nested", "isolation_dir", ""),
 )
+
+nested_buck(name = "nested_buck")
