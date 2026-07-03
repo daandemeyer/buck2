@@ -235,6 +235,14 @@ impl ArtifactDyn for Artifact {
         self.get_path().resolve(fs, content_hash)
     }
 
+    fn resolve_path_for_execution(
+        &self,
+        fs: &ArtifactFs,
+        content_hash: Option<&ContentBasedPathHash>,
+    ) -> buck2_error::Result<ProjectRelativePathBuf> {
+        self.get_path().resolve_for_execution(fs, content_hash)
+    }
+
     fn resolve_configuration_hash_path(
         &self,
         fs: &ArtifactFs,
@@ -715,6 +723,7 @@ mod tests {
     use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
     use buck2_core::package::source_path::SourcePath;
     use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
+    use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
     use buck2_execute::execute::request::OutputType;
     use buck2_fs::fs_util::uncategorized as fs_util;
     use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
@@ -799,9 +808,15 @@ mod tests {
             project_fs,
         );
 
+        let artifact = Artifact::from(source);
+        let expected = ProjectRelativePath::unchecked_new("cell_path/pkg/src.cpp").to_buf();
+
+        assert_eq!(expected, artifact.resolve_path(&fs, None)?);
+        assert_eq!(expected, artifact.resolve_path_for_execution(&fs, None)?);
+        assert_eq!(expected, artifact.get_path().resolve(&fs, None)?);
         assert_eq!(
-            &*Artifact::from(source).get_path().resolve(&fs, None)?,
-            ProjectRelativePath::unchecked_new("cell_path/pkg/src.cpp")
+            expected,
+            artifact.get_path().resolve_for_execution(&fs, None)?
         );
 
         Ok(())

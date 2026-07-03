@@ -33,6 +33,7 @@ use buck2_build_api::build::detailed_aggregated_metrics::types::ArtifactPathSket
 use buck2_build_api::build::detailed_aggregated_metrics::types::DetailedAggregatedMetrics;
 use buck2_build_api::build::graph_properties::GraphPropertiesOptions;
 use buck2_build_api::materialize::MaterializationAndUploadContext;
+use buck2_build_api::materialize::prepare_materialized_artifact_group_values_for_local_consumption;
 use buck2_cli_proto::CommonBuildOptions;
 use buck2_cli_proto::build_request::BuildProviders;
 use buck2_cli_proto::build_request::Materializations;
@@ -686,6 +687,24 @@ async fn process_build_result(
 
     let cell_resolver = ctx.ctx().get_cell_resolver().await?;
     let artifact_fs = ctx.ctx().get_artifact_fs().await?;
+
+    // `run_args` are for a process the client launches on the host, so canonical source paths need
+    // a physical backing before those arguments are published.
+    if response_options.return_run_args {
+        for configured in build_result.configured.values().flatten() {
+            for output in &configured.outputs {
+                if let Ok(output) = &output.inner
+                    && output.provider_type == BuildProviderType::Run
+                {
+                    prepare_materialized_artifact_group_values_for_local_consumption(
+                        &mut ctx.ctx(),
+                        &output.values,
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
 
     let result_reports = ResultReporter::convert(
         &artifact_fs,

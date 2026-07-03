@@ -24,6 +24,7 @@ rust_library(
     },
     test_deps = [
         "fbsource//third-party/rust:assert_matches",
+        "fbsource//third-party/rust:tempfile",
     ],
     deps = [
         "fbsource//third-party/rust:async-condvar-fair",
@@ -81,6 +82,9 @@ rust_library(
         "ovr_config//os:macos": [
             "//buck2/app/buck2_forkserver:buck2_forkserver",
             "//buck2/app/buck2_forkserver_proto:buck2_forkserver_proto",
+        ],
+        "ovr_config//os:windows": [
+            "fbsource//third-party/rust:junction",
         ],
     }),
 )

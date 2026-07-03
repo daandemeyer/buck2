@@ -239,6 +239,59 @@ pub struct BuckOutTestPath {
     path: ForwardRelativePathBuf,
 }
 
+/// First-level namespaces owned by Buck beneath the configured Buck-out root.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum BuckOutNamespace {
+    Art,
+    ArtAnon,
+    ArtBxl,
+    Gen,
+    GenAnon,
+    Tmp,
+    Test,
+    OfflineCache,
+    ExternalCells,
+    CellSources,
+}
+
+impl BuckOutNamespace {
+    pub const ALL: [Self; 10] = [
+        Self::Art,
+        Self::ArtAnon,
+        Self::ArtBxl,
+        Self::Gen,
+        Self::GenAnon,
+        Self::Tmp,
+        Self::Test,
+        Self::OfflineCache,
+        Self::ExternalCells,
+        Self::CellSources,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Art => "art",
+            Self::ArtAnon => "art-anon",
+            Self::ArtBxl => "art-bxl",
+            Self::Gen => "gen",
+            Self::GenAnon => "gen-anon",
+            Self::Tmp => "tmp",
+            Self::Test => "test",
+            Self::OfflineCache => "offline-cache",
+            Self::ExternalCells => "external_cells",
+            Self::CellSources => "cell_sources",
+        }
+    }
+
+    pub const fn is_generated(self) -> bool {
+        !matches!(self, Self::ExternalCells | Self::CellSources)
+    }
+
+    pub const fn is_content_hash_capable(self) -> bool {
+        matches!(self, Self::Art | Self::ArtAnon | Self::ArtBxl | Self::Tmp)
+    }
+}
+
 impl BuckOutTestPath {
     pub fn new(base: ForwardRelativePathBuf, path: ForwardRelativePathBuf) -> Self {
         BuckOutTestPath { base, path }
@@ -264,6 +317,28 @@ impl BuckOutPathResolver {
     /// Returns the buck-out root.
     pub fn root(&self) -> &ProjectRelativePath {
         &self.buck_out_v2
+    }
+
+    pub fn namespace_path(&self, namespace: BuckOutNamespace) -> ProjectRelativePathBuf {
+        self.buck_out_v2
+            .join(ForwardRelativePath::unchecked_new(namespace.as_str()))
+    }
+
+    pub fn classify_namespace(&self, path: &ProjectRelativePath) -> Option<BuckOutNamespace> {
+        // Share the canonical source classifier's host case policy, so a cased alias of the
+        // Buck-out namespace cannot classify differently between the two.
+        use crate::fs::artifact_path_resolver::source_component_eq;
+        let mut path_iter = path.iter();
+        for root_component in self.buck_out_v2.iter() {
+            let candidate = path_iter.next()?;
+            if !source_component_eq(candidate.as_str(), root_component.as_str()) {
+                return None;
+            }
+        }
+        let component = path_iter.next()?;
+        BuckOutNamespace::ALL
+            .into_iter()
+            .find(|namespace| source_component_eq(namespace.as_str(), component.as_str()))
     }
 
     /// Resolves a 'BuckOutPath' into a 'ProjectRelativePath' based on the base
