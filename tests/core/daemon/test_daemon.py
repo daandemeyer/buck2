@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional, Tuple
 from uuid import uuid4
 
 from buck2.tests.e2e_util.api.buck import Buck
@@ -298,6 +299,101 @@ class DaemonTest(BuckTestCase):
             buck, "Event", "data", "SpanEnd", "data", "FileWatcher"
         )
         assert spans, "an explicitly configured watcher must still run"
+
+    @buck_test()
+    async def test_no_buckd_invocations_serialize(
+        self, buck: Buck, tmp_path: Path
+    ) -> None:
+        event_log = tmp_path / "first.json-lines"
+        first = await buck.build(
+            ":long_running",
+            "--no-buckd",
+            "--local-only",
+            "--no-remote-cache",
+            "--event-log",
+            str(event_log),
+        ).start()
+        # Only once its action executes does the first invocation certainly hold the slot.
+        for _ in range(600):
+            assert first.returncode is None, (
+                "the first build died before its action ran"
+            )
+            with contextlib.suppress(FileNotFoundError):
+                if '"ActionExecution"' in event_log.read_text():
+                    break
+            await asyncio.sleep(0.1)
+        else:
+            raise AssertionError("the first build never started its action")
+
+        async def second_build() -> Tuple[Optional[int], str]:
+            result = await buck.build(
+                ":rule", "--no-buckd", "--local-only", "--no-remote-cache"
+            )
+            return (result.process.returncode, result.stderr)
+
+        second = asyncio.create_task(second_build())
+        # The second invocation queues on the slot instead of killing the first's daemon.
+        done, _pending = await asyncio.wait({second}, timeout=10)
+        assert not done, f"the second build did not queue: {second.result()}"
+        assert first.returncode is None, "the second build killed the first"
+        # The slot frees when its holder dies, however it dies.
+        first.kill()
+        await first.wait()
+        exit_code, stderr = await asyncio.wait_for(second, timeout=120)
+        assert exit_code == 0
+        assert "waiting for it to finish" in stderr
+
+    # On Windows `buck2 run` keeps the client - and its in-process daemon - alive while the
+    # target runs, so there the slot is correctly still owned.
+    @buck_test(skip_for_os=["windows"])
+    async def test_no_buckd_run_frees_the_slot_for_the_target(self, buck: Buck) -> None:
+        # `buck2 run` execs the target after the in-process daemon is gone, which must release
+        # the slot: the target itself runs a nested daemon-less build of root//:rule.
+        result = await buck.run(
+            ":nested_run",
+            "--no-buckd",
+            "-c",
+            f"nested.buck2_path={buck.path_to_executable}",
+            "-c",
+            f"nested.isolation_dir={buck.isolation_prefix}",
+        )
+        assert "waiting for it to finish" not in result.stderr
+
+    @buck_test()
+    async def test_no_buckd_startup_is_quiet(self, buck: Buck) -> None:
+        # The in-process daemon starts up on the user's terminal, not in a buckd.stderr
+        # that a tailing client would need to catch up on.
+        result = await buck.targets(":", "--no-buckd")
+        assert "daemon_listener" not in result.stderr
+
+    @buck_test()
+    async def test_no_buckd_leaves_no_daemon_record(self, buck: Buck) -> None:
+        await buck.targets(":", "--no-buckd")
+        daemon_dir = await buck.get_daemon_dir()
+        assert not (daemon_dir / "buckd.info").exists()
+        # The next command starts a fresh daemon instead of chasing the dead record.
+        result = await buck.targets(":")
+        assert "Could not connect" not in result.stderr
+
+    @buck_test()
+    async def test_no_buckd_run_nested_buck_is_its_own_invocation(
+        self, buck: Buck
+    ) -> None:
+        result = await buck.run(
+            ":nested_buck",
+            "--no-buckd",
+            env={
+                "NESTED_BUCK2": str(Path(buck.path_to_executable).absolute()),
+                "NESTED_ISOLATION_DIR": str(buck.isolation_prefix or "v2"),
+            },
+        )
+        # `run` execs the target onto the client's pid after the daemon record is gone, so
+        # the nested invocation starts its own daemon instead of chasing a record that by
+        # now names the target itself, and killing it.
+        assert "root//:rule" in result.stdout
+        assert "killing daemon" not in result.stderr
+        daemon_dir = await buck.get_daemon_dir()
+        assert not (daemon_dir / "buckd.info").exists()
 
     @buck_test()
     async def test_buck_out_is_cache_dir(self, buck: Buck) -> None:
