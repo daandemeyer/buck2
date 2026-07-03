@@ -67,13 +67,9 @@ def _unarchive_args():
             providers = [HttpArchiveExecDeps],
             default = "prelude//http_archive/tools:exec_deps",
             doc = """
-            When using http_archive as an anon target, the rule invoking the
-            anon target needs to mirror this attribute into its own
-            attributes, and forward the provider into the anon target
-            invocation.
-
-            When using http_archive normally not as an anon target, the
-            default value is always fine.
+            Unused. Buck2 extracts the archive itself and does not need to
+            know the execution platform's OS. The attribute remains so that
+            rules which forward it into an anon target keep working.
         """,
         ),
         "out": attrs.option(

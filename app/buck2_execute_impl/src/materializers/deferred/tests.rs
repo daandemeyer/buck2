@@ -95,6 +95,37 @@ async fn test_background_cleanup_wait_is_cancel_safe() {
     assert!(gate.try_start_cleanup().is_some());
 }
 
+#[tokio::test]
+async fn test_background_cleanup_gate_startup_cleanup() {
+    let gate = Arc::new(BackgroundCleanupGate::default());
+    assert!(gate.try_start_startup_cleanup().is_none());
+
+    let gate = Arc::new(BackgroundCleanupGate::new(true));
+    let command_guard = gate.register_prevention();
+    let startup_guard = gate.try_start_startup_cleanup().unwrap();
+    assert!(gate.try_start_startup_cleanup().is_none());
+    assert!(gate.try_start_cleanup().is_none());
+
+    let waiter = tokio::spawn({
+        let gate = gate.dupe();
+        async move {
+            let command_guard = gate.register_prevention();
+            command_guard.wait_for_cleanup().await;
+        }
+    });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+
+    drop(startup_guard);
+    tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(gate.try_start_startup_cleanup().is_none());
+    drop(command_guard);
+    assert!(gate.try_start_startup_cleanup().is_none());
+}
+
 #[test]
 fn test_find_artifacts() -> buck2_error::Result<()> {
     let artifact1 = ProjectRelativePathBuf::unchecked_new("foo/bar/baz".to_owned());
@@ -506,6 +537,20 @@ pub(crate) mod state_machine {
         )
     }
 
+    #[test]
+    fn test_send_without_interrupting_clean() {
+        let (sender, _receiver) = channel();
+        let (observer, guard) = LivelinessGuard::create_sync();
+        *sender.clean_guard.write() = Some(guard);
+        let noop = || MaterializerCommand::DeclareExisting(vec![], None, None);
+
+        sender.send_without_interrupting_clean(noop()).unwrap();
+        assert!(observer.is_alive_sync());
+
+        sender.send(noop()).unwrap();
+        assert!(!observer.is_alive_sync());
+    }
+
     fn make_path(p: &str) -> ProjectRelativePathBuf {
         ProjectRelativePath::new(p).unwrap().to_owned()
     }
@@ -662,6 +707,8 @@ pub(crate) mod state_machine {
             background_cleanup_gate,
         ) = make_processor_for_io(io.dupe());
         processor.clean_stale_config = clean_stale_config.unwrap_or_default();
+        background_cleanup_gate.state.lock().startup_cleanup_pending =
+            processor.clean_stale_config.on_startup;
         let stats = processor.stats.dupe();
 
         let command_thread = thread_spawn("buck2-dm", {
@@ -773,6 +820,31 @@ pub(crate) mod state_machine {
             );
 
             dm.abort();
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_file_contents_path_after_materialization_before_finished()
+    -> buck2_error::Result<()> {
+        ignore_stack_overflow_checks_for_future(async {
+            let (mut dm, _) = make_processor(Default::default());
+            let digest_config = dm.io.digest_config();
+
+            let path = make_path("foo/bar");
+            dm.testing_declare(&path, ArtifactValue::file(digest_config.empty_file()));
+            dm.materialize_artifact(&path, EventDispatcher::null())
+                .internal_error("Expected a future")?
+                .await
+                .map_err(|e| buck2_error::buck2_error!(buck2_error::ErrorTag::Tier0, "{e:?}"))?;
+
+            // `MaterializationFinished` has not been processed, so the artifact is still
+            // `Declared`. Its content is on disk at `path` already.
+            assert_eq!(
+                dm.tree.file_contents_path(path.clone(), digest_config).ok(),
+                Some(path)
+            );
             Ok(())
         })
         .await
@@ -1709,6 +1781,69 @@ pub(crate) mod state_machine {
         .await
     }
 
+    // `StubIoHandler` blocks a runtime worker thread on the clean barriers. The test task needs
+    // a second worker thread to keep running meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_startup_clean_is_not_interrupted_by_other_commands() -> buck2_error::Result<()> {
+        ignore_stack_overflow_checks_for_future(async {
+            let path = make_path(SAMPLE_BUCK_OUT_PATH);
+            let project_root = temp_root();
+            let io = Arc::new(StubIoHandler::new(project_root.clone()));
+            let (dm, _) = make_materializer(io, None).await;
+            materialize_write(&path, b"contents", &dm).await?;
+            dm.abort();
+
+            let clean_barriers = Arc::new((Barrier::new(2), Barrier::new(2)));
+            let io = Arc::new(
+                StubIoHandler::new(project_root.clone()).with_clean_barriers(clean_barriers.dupe()),
+            );
+            let config = CleanStaleConfig {
+                on_startup: true,
+                artifact_ttl: std::time::Duration::ZERO,
+                ..Default::default()
+            };
+            let (dm, mut events) = make_materializer(io, Some(config)).await;
+            let dm = Arc::new(dm);
+
+            let first = tokio::spawn({
+                let dm = dm.dupe();
+                async move { dm.prevent_background_cleanup(true).await }
+            });
+            let barriers = clean_barriers.dupe();
+            tokio::task::spawn_blocking(move || barriers.0.wait())
+                .await
+                .unwrap();
+
+            let second = tokio::spawn({
+                let dm = dm.dupe();
+                async move { dm.prevent_background_cleanup(true).await }
+            });
+            dm.command_sender
+                .send(MaterializerCommand::DeclareExisting(vec![], None, None))?;
+            sleep(TokioDuration::from_millis(100)).await;
+            assert!(!first.is_finished());
+            assert!(!second.is_finished());
+
+            let barriers = clean_barriers.dupe();
+            tokio::task::spawn_blocking(move || barriers.1.wait())
+                .await
+                .unwrap();
+            let _first_guard = first.await.unwrap();
+            let _second_guard = second.await.unwrap();
+
+            let res = receive_clean_result(&mut events);
+            assert_eq!(
+                res.trigger,
+                buck2_data::clean_stale_result::Trigger::Startup as i32
+            );
+            assert_eq!(res.kind, buck2_data::CleanStaleResultKind::Finished as i32);
+            assert_eq!(res.stats.unwrap().cleaned_artifact_count, 1);
+            assert!(!fs_util::try_exists(project_root.resolve(&path))?);
+            Ok(())
+        })
+        .await
+    }
+
     #[tokio::test]
     async fn test_clean_stale_records_sizes_after_cleanup_finishes() -> buck2_error::Result<()> {
         ignore_stack_overflow_checks_for_future(async {
@@ -1957,9 +2092,19 @@ pub(crate) mod state_machine {
         .await
     }
 
+    /// The tests remove the owner permissions of `path`. If the clean under test fails to
+    /// delete `path`, the temp dir can't be deleted until the permissions are restored.
+    #[cfg(unix)]
+    fn restore_permissions_if_exists(path: &AbsNormPathBuf) -> buck2_error::Result<()> {
+        if fs_util::try_exists(path)? {
+            fs_util::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_clean_stale_skips_unreadable() -> buck2_error::Result<()> {
+    async fn test_clean_stale_deletes_unreadable() -> buck2_error::Result<()> {
         ignore_stack_overflow_checks_for_future(async {
             let path = make_path(SAMPLE_BUCK_OUT_PATH);
             let project_root = temp_root();
@@ -2002,9 +2147,8 @@ pub(crate) mod state_machine {
                 })
                 .await;
 
-            // Restore permissions so the temp dir can be deleted.
-            fs_util::set_permissions(&unreadable_dir, std::fs::Permissions::from_mode(0o755))?;
-            fs_util::set_permissions(&listable_dir, std::fs::Permissions::from_mode(0o755))?;
+            restore_permissions_if_exists(&unreadable_dir)?;
+            restore_permissions_if_exists(&listable_dir)?;
 
             let res = res?;
             let &buck2_data::CleanStaleStats {
@@ -2019,6 +2163,8 @@ pub(crate) mod state_machine {
                 .stats
                 .as_ref()
                 .unwrap_or_else(|| panic!("{}", res.message.unwrap()));
+            assert!(!fs_util::try_exists(&untracked_dir)?);
+            assert!(!fs_util::try_exists(&listable_dir)?);
             assert_eq!(
                 (
                     stale_artifact_count,
@@ -2028,12 +2174,10 @@ pub(crate) mod state_machine {
                     scan_unreadable_count,
                     delete_permission_denied_artifact_count,
                 ),
-                (1, 1, 2, 4, 2, 2),
-                "clean should finish despite the unreadable entries: the stale artifact is \
-                 cleaned; neither untracked root can be fully deleted, so both are skipped \
-                 rather than failing the clean — four skips total: the scan reading the \
-                 unreadable dir, the scan statting the file in the non-traversable dir, and \
-                 the two failed deletions"
+                (1, 3, 2, 2, 2, 0),
+                "the scan skips reading the unreadable dir and statting the file in the \
+                 non-traversable dir, and the clean still deletes both untracked roots \
+                 because it adds owner permissions to the directories it deletes"
             );
             Ok(())
         })
@@ -2054,7 +2198,8 @@ pub(crate) mod state_machine {
             fs_util::create_dir_all(&dead)?;
             fs_util::write(&dead_file, b"xxxx")?;
 
-            // Unknown-age scratch (permission denied) is skipped, never deleted.
+            // The scan can't read `unreadable` or traverse `listable`. The sweep still deletes
+            // `unreadable` and `listable`.
             let unreadable = project_root.resolve(make_path("buck-out/v2/tmp/unreadable"));
             let unreadable_file =
                 project_root.resolve(make_path("buck-out/v2/tmp/unreadable/junk"));
@@ -2083,9 +2228,8 @@ pub(crate) mod state_machine {
             let dispatcher = EventDispatcher::new(TraceId::null(), DaemonId::new(), sink);
             let res = with_dispatcher_async(dispatcher, dm.clean_scratch()).await;
 
-            // Restore permissions so the temp dir can be deleted.
-            fs_util::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755))?;
-            fs_util::set_permissions(&listable, std::fs::Permissions::from_mode(0o755))?;
+            restore_permissions_if_exists(&unreadable)?;
+            restore_permissions_if_exists(&listable)?;
 
             let res = res?;
             let &buck2_data::CleanStaleStats {
@@ -2100,8 +2244,8 @@ pub(crate) mod state_machine {
                 .as_ref()
                 .unwrap_or_else(|| panic!("{}", res.message.unwrap()));
             assert!(!fs_util::try_exists(&dead)?);
-            assert!(fs_util::try_exists(&unreadable_file)?);
-            assert!(fs_util::try_exists(&listable_file)?);
+            assert!(!fs_util::try_exists(&unreadable)?);
+            assert!(!fs_util::try_exists(&listable)?);
             #[cfg(not(target_os = "macos"))]
             assert!(fs_util::try_exists(&invalid_name)?);
             let expected_invalid_filename_count = if cfg!(target_os = "macos") { 0 } else { 1 };
@@ -2113,9 +2257,9 @@ pub(crate) mod state_machine {
                     skipped_unreadable_count,
                     scan_invalid_filename_count,
                 ),
-                (3, 1, 4, 4, expected_invalid_filename_count,),
-                "the sweep deletes dead scratch and records permission-denied and invalid-name \
-                 operations separately"
+                (3, 3, 4, 2, expected_invalid_filename_count,),
+                "the sweep deletes all scratch with a valid name and records the entries the \
+                 scan can't read and the invalid names separately"
             );
             assert!(
                 events.try_receive().is_none(),
@@ -2246,6 +2390,7 @@ pub(crate) mod state_machine {
                     clean_period: std::time::Duration::from_secs(1),
                     start_offset: std::time::Duration::from_secs(0),
                 }),
+                on_startup: false,
                 artifact_ttl: std::time::Duration::from_secs(0),
                 low_disk: None,
                 unmaterialize_upload: None,

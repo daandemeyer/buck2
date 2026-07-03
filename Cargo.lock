@@ -1063,20 +1063,24 @@ dependencies = [
  "buck2_http",
  "buck2_interpreter",
  "buck2_util",
+ "bzip2",
  "derive_more 2.1.1",
  "dice",
  "dice_futures",
  "dupe",
  "either",
+ "flate2",
  "hex",
  "hmap",
  "host_sharing",
  "http",
  "itertools 0.15.0",
  "jiff",
+ "lzma-rust2",
  "mini_vec",
  "pagable",
  "parking_lot 0.12.5",
+ "regex",
  "remote_execution",
  "serde_json",
  "sha1 0.11.0",
@@ -1084,7 +1088,11 @@ dependencies = [
  "starlark",
  "starlark_map",
  "strong_hash",
+ "tar",
+ "tempfile",
  "tracing",
+ "zip",
+ "zstd",
 ]
 
 [[package]]
@@ -2533,6 +2541,7 @@ dependencies = [
  "buck2_artifact",
  "buck2_build_info",
  "buck2_build_signals",
+ "buck2_certs",
  "buck2_cli_proto",
  "buck2_common",
  "buck2_core",
@@ -2563,6 +2572,7 @@ dependencies = [
  "hex",
  "host_sharing",
  "http",
+ "httptest",
  "hyper",
  "itertools 0.15.0",
  "jiff",
@@ -4563,6 +4573,12 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "deflate64"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac6b926516df9c60bfa16e107b21086399f8285a44ca9711344b9e553c5146e2"
 
 [[package]]
 name = "defmt"
@@ -7252,6 +7268,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lzma-rust2"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7277c9742229dc25243236d578b6471a798c554512c6f6a04365ec2e87c2a3bb"
+dependencies = [
+ "sha2 0.11.1",
+]
+
+[[package]]
 name = "mac_address"
 version = "1.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7608,8 +7633,7 @@ dependencies = [
 [[package]]
 name = "notify"
 version = "9.0.0-rc.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb94cf3583e1483c23ceb47a5f7d56b3e8d7309b3e3727698a8c52a96993355e"
+source = "git+https://github.com/daandemeyer/notify.git?rev=570ebf5473006c3a994324f078f3372fad2cbd6d#570ebf5473006c3a994324f078f3372fad2cbd6d"
 dependencies = [
  "bitflags 2.13.2",
  "inotify",
@@ -7627,9 +7651,8 @@ dependencies = [
 
 [[package]]
 name = "notify-types"
-version = "2.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42b8cfee0e339a0337359f3c88165702ac6e600dc01c0cc9579a92d62b08477a"
+version = "2.2.0"
+source = "git+https://github.com/daandemeyer/notify.git?rev=570ebf5473006c3a994324f078f3372fad2cbd6d#570ebf5473006c3a994324f078f3372fad2cbd6d"
 dependencies = [
  "bitflags 2.13.2",
 ]
@@ -13281,7 +13304,10 @@ version = "8.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
 dependencies = [
+ "bzip2",
  "crc32fast",
+ "deflate64",
+ "flate2",
  "indexmap",
  "memchr",
  "typed-path",

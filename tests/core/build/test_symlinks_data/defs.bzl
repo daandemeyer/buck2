@@ -77,3 +77,82 @@ stat_path = rule(
         "project": attrs.option(attrs.string(), default = None),
     },
 )
+
+def _copy_tree_impl(ctx: AnalysisContext):
+    # `copy_dir` lays the directory out from its recorded digest, so a symlink only survives this
+    # if the digest recorded it as a symlink.
+    copied = ctx.actions.copy_dir("copied", ctx.attrs.src, has_content_based_path = False)
+    out = ctx.actions.declare_output("out", dir = True, has_content_based_path = False)
+    ctx.actions.run(
+        cmd_args(
+            "fbpython",
+            "-c",
+            "import shutil, sys; shutil.copytree(sys.argv[1], sys.argv[2], symlinks = True)",
+            copied,
+            out.as_output(),
+        ),
+        category = "copy_tree",
+    )
+    return [
+        DefaultInfo(default_output = out),
+    ]
+
+copy_tree = rule(
+    impl = _copy_tree_impl,
+    attrs = {
+        "src": attrs.source(allow_directory = True),
+    },
+)
+
+def _copy_source_dir_impl(ctx: AnalysisContext):
+    # Exercise the defaults by omitting the options entirely.
+    kwargs = {}
+    if ctx.attrs.relative_symlinks:
+        kwargs["relative_symlinks"] = True
+    if ctx.attrs.preserve_mtimes:
+        kwargs["preserve_mtimes"] = True
+    copied = ctx.actions.copy_dir(
+        ctx.label.name,
+        ctx.attrs.src,
+        has_content_based_path = False,
+        **kwargs
+    )
+    return [DefaultInfo(default_output = copied)]
+
+copy_source_dir = rule(
+    impl = _copy_source_dir_impl,
+    attrs = {
+        "preserve_mtimes": attrs.bool(default = False),
+        "relative_symlinks": attrs.bool(default = False),
+        "src": attrs.source(allow_directory = True),
+    },
+)
+
+_SYMLINK_DIR = """
+import os
+import sys
+
+root = sys.argv[1]
+os.makedirs(os.path.join(root, "d"))
+with open(os.path.join(root, "x"), "w") as f:
+    f.write("x")
+os.symlink(".", os.path.join(root, "here"))
+os.symlink("./", os.path.join(root, "dotslash"))
+os.symlink("../x", os.path.join(root, "d", "here"))
+"""
+
+def _symlink_dir_impl(ctx: AnalysisContext):
+    out = ctx.actions.declare_output("out", dir = True, has_content_based_path = ctx.attrs.has_content_based_path)
+    ctx.actions.run(
+        cmd_args("fbpython", "-c", _SYMLINK_DIR, out.as_output()),
+        category = "symlink_dir",
+        local_only = True,
+    )
+    return [DefaultInfo(default_output = out)]
+
+symlink_dir = rule(
+    impl = _symlink_dir_impl,
+    attrs = {
+        "has_content_based_path": attrs.bool(default = True),
+    },
+)

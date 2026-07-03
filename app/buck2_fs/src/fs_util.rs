@@ -343,6 +343,66 @@ fn remove_file_impl(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Like `remove_file`, but if permission is denied, add read, write, and
+/// execute permission for the owner of the containing directory and try again.
+/// Unlinking a file requires write and execute permission on the containing
+/// directory, and action outputs can contain read-only directories (e.g. OS
+/// images, where distributions give their top level directories and
+/// directories in /etc restrictive permissions). Only use this when the
+/// containing directory is itself being removed, since the permission change
+/// is not reverted.
+pub fn remove_file_harder<P: AsRef<AbsPath>>(path: P) -> Result<(), IoError> {
+    let _guard = IoCounterKey::Remove.guard();
+    with_retries(|| remove_file_harder_impl(path.as_ref().as_maybe_relativized()))
+        .map_err(|e| IoError::new_with_path("remove_file_harder", path, e))
+}
+
+#[cfg(not(unix))]
+fn remove_file_harder_impl(path: &Path) -> io::Result<()> {
+    // On Windows removal is blocked by the readonly attribute of the file
+    // itself, not by the permissions of the containing directory, and
+    // remove_file_impl already clears that attribute and retries.
+    remove_file_impl(path)
+}
+
+#[cfg(unix)]
+fn remove_file_harder_impl(path: &Path) -> io::Result<()> {
+    remove_with_writable_parent(path, remove_file_impl)
+}
+
+#[cfg(unix)]
+fn remove_with_writable_parent(
+    path: &Path,
+    remove: impl Fn(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    match remove(path) {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+            match parent.map(add_owner_rwx) {
+                Some(Ok(true)) => remove(path),
+                // Adding permissions failed or they were already sufficient;
+                // report the original error.
+                _ => Err(e),
+            }
+        }
+        r => r,
+    }
+}
+
+/// Add read, write, and execute permission for the owner of `path`. Returns
+/// `false` if the permissions were already sufficient.
+#[cfg(unix)]
+fn add_owner_rwx(path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = fs::symlink_metadata(path)?.permissions().mode();
+    if mode & 0o700 == 0o700 {
+        return Ok(false);
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700))?;
+    Ok(true)
+}
+
 pub fn copy<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(from: P, to: Q) -> Result<u64, IoError> {
     let _guard = IoCounterKey::Copy.guard();
     let from_ref = from.as_ref();
@@ -761,10 +821,104 @@ pub fn set_executable<P: AsRef<AbsPath>>(path: P, executable: bool) -> Result<()
     Ok(())
 }
 
+/// Sets the modification time of `to` to that of `from`, without following symlinks.
+pub fn copy_mtime<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(from: P, to: Q) -> Result<(), IoError> {
+    let from = from.as_ref();
+    let to = to.as_ref();
+    let metadata = symlink_metadata(from)?;
+
+    let _guard = IoCounterKey::Chmod.guard();
+    with_retries(|| set_mtime_no_follow(to.as_maybe_relativized(), &metadata)).map_err(|e| {
+        IoError::new(e)
+            .context(format!(
+                "copy_mtime(from={}, to={})",
+                from.display(),
+                to.display()
+            ))
+            .check_eden(to)
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn set_mtime_no_follow(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    use nix::fcntl::AT_FDCWD;
+    use nix::sys::stat::UtimensatFlags;
+    use nix::sys::stat::utimensat;
+    use nix::sys::time::TimeSpec;
+
+    let mtime = TimeSpec::new(metadata.mtime() as _, metadata.mtime_nsec() as _);
+    utimensat(
+        AT_FDCWD,
+        path,
+        &TimeSpec::UTIME_OMIT,
+        &mtime,
+        UtimensatFlags::NoFollowSymlink,
+    )
+    .map_err(io::Error::from)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn set_mtime_no_follow(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+        // Needed to open directories, and to open symlinks rather than their targets.
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options
+        .open(path)?
+        .set_times(fs::FileTimes::new().set_modified(metadata.modified()?))
+}
+
 pub fn remove_dir_all<P: AsRef<AbsPath>>(path: P) -> Result<(), IoError> {
     let _guard = IoCounterKey::RmDirAll.guard();
-    with_retries(|| fs::remove_dir_all(path.as_ref().as_maybe_relativized()))
+    with_retries(|| remove_dir_all_impl(path.as_ref().as_maybe_relativized()))
         .map_err(|e| IoError::new_with_path("remove_dir_all", path, e))
+}
+
+#[cfg(not(unix))]
+fn remove_dir_all_impl(path: &Path) -> io::Result<()> {
+    fs::remove_dir_all(path)
+}
+
+#[cfg(unix)]
+fn remove_dir_all_impl(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            // Removing a directory tree requires read, write, and execute
+            // permission on every directory in it, regardless of the
+            // permissions of the files. Some actions leave read-only
+            // directories in buck-out, so grant ourselves u+rwx on every
+            // directory in the tree and retry.
+            add_owner_rwx_recursively(path);
+            fs::remove_dir_all(path)
+        }
+        r => r,
+    }
+}
+
+/// Best-effort `chmod u+rwx` on `path` and every directory below it. Symlinks
+/// are not followed. Errors are ignored: whatever couldn't be fixed will make
+/// the retried removal fail with a more useful error.
+#[cfg(unix)]
+fn add_owner_rwx_recursively(path: &Path) {
+    if !fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+        return;
+    }
+    drop(add_owner_rwx(path));
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            add_owner_rwx_recursively(&entry.path());
+        }
+    }
 }
 
 fn symlink_metadata_if_exists_impl<P: AsRef<AbsPath>>(
@@ -893,6 +1047,24 @@ pub fn remove_dir<P: AsRef<AbsPath>>(path: P) -> Result<(), IoError> {
     let _guard = IoCounterKey::RmDir.guard();
     with_retries(|| fs::remove_dir(path.as_ref().as_maybe_relativized()))
         .map_err(|e| IoError::new_with_path("remove_dir", path, e))
+}
+
+/// The parent directory must also be scheduled for removal because this function
+/// can add owner read, write, and execute permissions to it.
+pub fn remove_dir_harder<P: AsRef<AbsPath>>(path: P) -> Result<(), IoError> {
+    let _guard = IoCounterKey::RmDir.guard();
+    with_retries(|| remove_dir_harder_impl(path.as_ref().as_maybe_relativized()))
+        .map_err(|e| IoError::new_with_path("remove_dir_harder", path, e))
+}
+
+#[cfg(unix)]
+fn remove_dir_harder_impl(path: &Path) -> io::Result<()> {
+    remove_with_writable_parent(path, |path| fs::remove_dir(path))
+}
+
+#[cfg(not(unix))]
+fn remove_dir_harder_impl(path: &Path) -> io::Result<()> {
+    fs::remove_dir(path)
 }
 
 pub struct DiskSpaceStats {
@@ -1122,6 +1294,10 @@ pub mod uncategorized {
         super::remove_file(path).uncategorized()
     }
 
+    pub fn remove_file_harder<P: AsRef<AbsPath>>(path: P) -> buck2_error::Result<()> {
+        super::remove_file_harder(path).uncategorized()
+    }
+
     pub fn copy<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(from: P, to: Q) -> buck2_error::Result<u64> {
         super::copy(from, to).uncategorized()
     }
@@ -1189,6 +1365,13 @@ pub mod uncategorized {
         super::set_executable(path, executable).uncategorized()
     }
 
+    pub fn copy_mtime<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(
+        from: P,
+        to: Q,
+    ) -> buck2_error::Result<()> {
+        super::copy_mtime(from, to).uncategorized()
+    }
+
     pub fn remove_dir_all<P: AsRef<AbsPath>>(path: P) -> buck2_error::Result<()> {
         super::remove_dir_all(path).uncategorized()
     }
@@ -1211,6 +1394,10 @@ pub mod uncategorized {
 
     pub fn remove_dir<P: AsRef<AbsPath>>(path: P) -> buck2_error::Result<()> {
         super::remove_dir(path).uncategorized()
+    }
+
+    pub fn remove_dir_harder<P: AsRef<AbsPath>>(path: P) -> buck2_error::Result<()> {
+        super::remove_dir_harder(path).uncategorized()
     }
 
     pub fn create_file<P: AsRef<AbsPath>>(path: P) -> buck2_error::Result<FileWriteGuard> {
@@ -1390,6 +1577,43 @@ mod tests {
         fs_util::symlink(&target_path, &symlink_path)?;
         fs_util::write(&target_path, b"File content")?;
         assert_eq!(fs_util::read_to_string(&symlink_path)?, "File content");
+        Ok(())
+    }
+
+    // Other Unix platforms fall back to std, which follows symlinks.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn copy_mtime_does_not_follow_symlinks() -> buck2_error::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = AbsPath::new(tempdir.path())?;
+        let time = |secs| std::time::UNIX_EPOCH + std::time::Duration::new(secs, 123_456_789);
+        let set_mtime = |path: &AbsPath, mtime| {
+            File::open(path.as_path())?.set_times(fs::FileTimes::new().set_modified(mtime))
+        };
+
+        let old_file = root.join("old_file");
+        let old_dir = root.join("old_dir");
+        fs_util::write(&old_file, b"")?;
+        fs_util::create_dir_all(&old_dir)?;
+        set_mtime(&old_file, time(1_000_000_000))?;
+        set_mtime(&old_dir, time(1_000_000_001))?;
+
+        let file = root.join("file");
+        let link = root.join("link");
+        fs_util::write(&file, b"")?;
+        fs_util::symlink("file", &link)?;
+        set_mtime(&file, time(1_000_000_002))?;
+
+        fs_util::copy_mtime(&old_file, &link)?;
+        assert_eq!(
+            fs_util::symlink_metadata(&link)?.modified()?,
+            time(1_000_000_000)
+        );
+        assert_eq!(fs_util::metadata(&file)?.modified()?, time(1_000_000_002));
+
+        fs_util::copy_mtime(&old_dir, &file)?;
+        assert_eq!(fs_util::metadata(&file)?.modified()?, time(1_000_000_001));
+
         Ok(())
     }
 
@@ -1628,6 +1852,100 @@ mod tests {
         let root = AbsPath::new(tempdir.path())?;
         let file_path = root.join("file_doesnt_exist");
         assert_matches!(fs_util::remove_file(file_path), Err(..));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_file_harder_in_readonly_directory() -> buck2_error::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir()?;
+        let root = AbsPath::new(tempdir.path())?;
+        let dir = root.join("dir");
+        let file = dir.join("file");
+        fs::create_dir(&dir)?;
+        fs::write(&file, b"content")?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555))?;
+
+        fs_util::remove_file_harder(&file)?;
+        assert!(!file.try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn remove_dir_harder_does_not_remove_nonempty_directory() -> buck2_error::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = AbsPath::new(tempdir.path())?;
+        let dir = root.join("dir");
+        let file = dir.join("file");
+        fs::create_dir(&dir)?;
+        fs::write(&file, b"content")?;
+
+        assert_matches!(fs_util::remove_dir_harder(&dir), Err(..));
+        assert_eq!(fs::read(&file)?, b"content");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_dir_all_readonly_tree() -> buck2_error::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir()?;
+        let root = AbsPath::new(tempdir.path())?;
+        let dir = root.join("dir");
+        let subdir = dir.join("subdir");
+        fs::create_dir_all(&subdir)?;
+        fs::write(subdir.join("file"), b"content")?;
+        // No permissions at all on the inner directory, read-only on the outer.
+        fs::set_permissions(&subdir, fs::Permissions::from_mode(0o000))?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555))?;
+
+        fs_util::remove_dir_all(&dir)?;
+        assert!(!dir.try_exists()?);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_dir_all_does_not_modify_parent_permissions() -> buck2_error::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir()?;
+        let root = AbsPath::new(tempdir.path())?;
+        let parent = root.join("parent");
+        let dir = parent.join("dir");
+        fs::create_dir_all(&dir)?;
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555))?;
+
+        // Depending on capabilities (e.g. CAP_DAC_OVERRIDE) the removal may
+        // succeed or fail; either way the parent's permissions must be left
+        // untouched.
+        drop(fs_util::remove_dir_all(&dir));
+        let mode = fs::symlink_metadata(&parent)?.permissions().mode();
+        assert_eq!(mode & 0o777, 0o555);
+
+        // Restore write permission so the tempdir can clean up after itself.
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755))?;
+        Ok(())
+    }
+
+    #[test]
+    fn remove_dir_all_does_not_follow_symlinks() -> buck2_error::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = AbsPath::new(tempdir.path())?;
+        let target = root.join("target");
+        let target_file = target.join("file");
+        fs::create_dir(&target)?;
+        fs::write(&target_file, b"content")?;
+        let dir = root.join("dir");
+        fs::create_dir(&dir)?;
+        fs_util::symlink(&target, dir.join("symlink"))?;
+
+        fs_util::remove_dir_all(&dir)?;
+        assert!(!dir.try_exists()?);
+        assert!(target_file.try_exists()?);
         Ok(())
     }
 

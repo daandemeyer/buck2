@@ -28,7 +28,7 @@ from buck2.tests.e2e_util.buck_workspace import (
     env,
     parametrize,
 )
-from buck2.tests.e2e_util.helper.utils import daemon_is_alive
+from buck2.tests.e2e_util.helper.utils import daemon_is_alive, filter_events
 
 
 class DaemonTest(BuckTestCase):
@@ -257,6 +257,71 @@ class DaemonTest(BuckTestCase):
         assert "no buckd server running" not in result.stderr
 
     @buck_test()
+    async def test_no_buckd_runs_without_file_watcher(self, buck: Buck) -> None:
+        # The test harness pins a file_watcher for every test; drop that line to get the
+        # unconfigured default an ordinary --no-buckd invocation sees.
+        extra_config = Path(buck.get_env_var("BUCK2_TEST_EXTRA_EXTERNAL_CONFIG"))
+        extra_config.write_text(
+            "".join(
+                line
+                for line in extra_config.read_text().splitlines(keepends=True)
+                if "file_watcher" not in line
+            )
+        )
+        # The in-process daemon serves exactly one command, so there is nothing to invalidate
+        # between commands: it runs no file watcher and reads the tree as this command's own
+        # snapshot.
+        await buck.targets(":", "--no-buckd")
+        spans = await filter_events(
+            buck, "Event", "data", "SpanEnd", "data", "FileWatcher"
+        )
+        assert spans == []
+
+    @buck_test(extra_buck_config={"buck2": {"file_watcher": "notify"}})
+    async def test_no_buckd_explicit_file_watcher_wins(self, buck: Buck) -> None:
+        await buck.targets(":", "--no-buckd")
+        spans = await filter_events(
+            buck, "Event", "data", "SpanEnd", "data", "FileWatcher"
+        )
+        assert spans, "an explicitly configured watcher must still run"
+
+    @buck_test()
+    async def test_no_buckd_startup_is_quiet(self, buck: Buck) -> None:
+        # The in-process daemon starts up on the user's terminal, not in a buckd.stderr
+        # that a tailing client would need to catch up on.
+        result = await buck.targets(":", "--no-buckd")
+        assert "daemon_listener" not in result.stderr
+
+    @buck_test()
+    async def test_no_buckd_leaves_no_daemon_record(self, buck: Buck) -> None:
+        await buck.targets(":", "--no-buckd")
+        daemon_dir = await buck.get_daemon_dir()
+        assert not (daemon_dir / "buckd.info").exists()
+        # The next command starts a fresh daemon instead of chasing the dead record.
+        result = await buck.targets(":")
+        assert "Could not connect" not in result.stderr
+
+    @buck_test()
+    async def test_no_buckd_run_nested_buck_is_its_own_invocation(
+        self, buck: Buck
+    ) -> None:
+        result = await buck.run(
+            ":nested_buck",
+            "--no-buckd",
+            env={
+                "NESTED_BUCK2": str(Path(buck.path_to_executable).absolute()),
+                "NESTED_ISOLATION_DIR": str(buck.isolation_prefix or "v2"),
+            },
+        )
+        # `run` execs the target onto the client's pid after the daemon record is gone, so
+        # the nested invocation starts its own daemon instead of chasing a record that by
+        # now names the target itself, and killing it.
+        assert "root//:rule" in result.stdout
+        assert "killing daemon" not in result.stderr
+        daemon_dir = await buck.get_daemon_dir()
+        assert not (daemon_dir / "buckd.info").exists()
+
+    @buck_test()
     async def test_no_buckd_invocations_serialize(
         self, buck: Buck, tmp_path: Path
     ) -> None:
@@ -314,6 +379,13 @@ class DaemonTest(BuckTestCase):
             f"nested.isolation_dir={buck.isolation_prefix}",
         )
         assert "waiting for it to finish" not in result.stderr
+
+    @buck_test()
+    async def test_no_buckd_run_starts_in_the_invocation_dir(self, buck: Buck) -> None:
+        # The in-process daemon moves the client process into buck-out; the exec'd run target
+        # must still start where the user invoked `buck run`.
+        result = await buck.run(":pwd_run", "--no-buckd")
+        assert Path(result.stdout.strip()) == Path(buck.cwd)
 
     @buck_test()
     async def test_buck_out_is_cache_dir(self, buck: Buck) -> None:
