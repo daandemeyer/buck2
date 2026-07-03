@@ -38,8 +38,10 @@ use buck2_error::conversion::from_any_with_tag;
 use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::digest::CasDigestToReExt;
 use buck2_execute::digest_config::DigestConfig;
+use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::clean_output_paths::CleanOutputPaths;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
+use buck2_execute::materialize::download_cache::DownloadCache;
 use buck2_execute::materialize::http::Checksum;
 use buck2_execute::materialize::http::http_download;
 use buck2_execute::materialize::http::http_head;
@@ -166,6 +168,8 @@ impl DownloadFileAction {
         &self,
         client: &HttpClient,
         digest_config: DigestConfig,
+        download_cache: Option<&Arc<DownloadCache>>,
+        io: &dyn BlockingExecutor,
     ) -> DeclaredMetadata {
         let digest = if digest_config.cas_digest_config().allows_sha1() {
             self.inner
@@ -186,7 +190,14 @@ impl DownloadFileAction {
             None => return DeclaredMetadata::Unknown,
         };
 
-        let size = match self.inner.size_bytes {
+        let cached_size = match download_cache.filter(|cache| cache.skip_head_request()) {
+            Some(cache) if self.inner.size_bytes.is_none() => {
+                cache.verified_size(&self.inner.checksum, io).await
+            }
+            _ => None,
+        };
+
+        let size = match self.inner.size_bytes.or(cached_size) {
             Some(s) => Some(s),
             None => match self.head_content_length(client).await {
                 Ok(size) => size,
@@ -367,16 +378,54 @@ impl DownloadFileAction {
             )
             .await?;
 
-        let digest = http_download(
-            client,
-            ctx.fs().fs(),
-            ctx.digest_config(),
-            &path,
-            url,
-            &self.inner.checksum,
-            self.inner.is_executable,
-        )
-        .await?;
+        let download_cache = ctx.run_action_knobs().download_cache.dupe();
+        let abs_path = ctx.fs().fs().resolve(&path);
+        // The store writes to, and reads from, the output path, so it must not be left running
+        // against an output the next attempt is already rewriting.
+        let cancellations = ctx.cancellation_context();
+        let io = ctx.blocking_executor();
+
+        let cached = match &download_cache {
+            Some(cache) => {
+                cancellations
+                    .critical_section(|| {
+                        cache.get(
+                            &self.inner.checksum,
+                            metadata
+                                .map(|metadata| metadata.digest.size())
+                                .or(self.inner.size_bytes),
+                            &abs_path,
+                            self.inner.is_executable,
+                            ctx.digest_config(),
+                            io,
+                        )
+                    })
+                    .await
+            }
+            None => None,
+        };
+
+        let digest = match cached {
+            Some(digest) => digest,
+            None => {
+                let digest = http_download(
+                    client,
+                    ctx.fs().fs(),
+                    ctx.digest_config(),
+                    &path,
+                    url,
+                    &self.inner.checksum,
+                    self.inner.is_executable,
+                )
+                .await?;
+                if let Some(cache) = &download_cache {
+                    cancellations
+                        .critical_section(|| cache.put(&self.inner.checksum, &abs_path, io))
+                        .await;
+                }
+                digest
+            }
+        };
 
         // RE knows this file by the digest (checksum, size), where the size came from
         // `size_bytes` or the HEAD response rather than from the content. A wrong size would leave
@@ -485,7 +534,16 @@ impl Action for DownloadFileAction {
         let url = self.url(client);
         let is_content_based = self.output().get_path().is_content_based_path();
 
-        let metadata = match self.declared_metadata(client, ctx.digest_config()).await {
+        let download_cache = ctx.run_action_knobs().download_cache.dupe();
+        let metadata = match self
+            .declared_metadata(
+                client,
+                ctx.digest_config(),
+                download_cache.as_ref(),
+                ctx.blocking_executor(),
+            )
+            .await
+        {
             DeclaredMetadata::Known(metadata) => Some(metadata),
             DeclaredMetadata::Unknown => None,
             DeclaredMetadata::HeadFailed(e) => {

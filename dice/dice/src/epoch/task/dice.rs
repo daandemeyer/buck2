@@ -132,8 +132,9 @@ pub(crate) struct DiceTaskInternal {
     /// The computed value, ie the eventual output of the task.
     ///
     /// This is set effectively whenever the value is ready. After it is set, no new generations
-    /// will be started, though previously started ones may still be running.
-    maybe_value: OnceLock<DiceComputedValue>,
+    /// will be started, though previously started ones may still be running. It is set to `None`
+    /// when the computation panicked. Reading a `None` value panics.
+    maybe_value: OnceLock<Option<DiceComputedValue>>,
     /// The number of things waiting on the the task.
     ///
     /// When this is zero, the most recently started generation has been cancelled; incrementing
@@ -169,7 +170,7 @@ unsafe impl Send for DiceTaskInternal {}
 unsafe impl Sync for DiceTaskInternal {}
 
 enum ReadValueResult<'d> {
-    Finished(&'d DiceComputedValue),
+    Finished(&'d Option<DiceComputedValue>),
     Pending { terminated_generation: u32 },
 }
 
@@ -197,7 +198,7 @@ impl<'d> TaskWaiter<'d> {
 
         let check = || {
             if let Some(r) = internal.maybe_value.get() {
-                Poll::Ready(r)
+                Poll::Ready(unpoisoned(r))
             } else {
                 Poll::Pending
             }
@@ -225,7 +226,13 @@ impl<'d> TaskWaiter<'d> {
 
         let check = || {
             if internal.terminated_generation.load(Ordering::Acquire) >= generation {
-                Poll::Ready(internal.maybe_value.get().ok_or(WorkerCancelled))
+                Poll::Ready(
+                    internal
+                        .maybe_value
+                        .get()
+                        .map(unpoisoned)
+                        .ok_or(WorkerCancelled),
+                )
             } else {
                 Poll::Pending
             }
@@ -451,7 +458,7 @@ impl<'d> DiceTaskRef<'d> {
 
     pub(crate) fn get_finished_value(self) -> Option<&'d DiceComputedValue> {
         match self.internal.get().read_value() {
-            ReadValueResult::Finished(v) => Some(v),
+            ReadValueResult::Finished(v) => Some(unpoisoned(v)),
             ReadValueResult::Pending { .. } => None,
         }
     }
@@ -554,7 +561,13 @@ impl<'d> DiceTaskRef<'d> {
 
     /// Mark that a generation has terminated successfully.
     fn task_finished_result(&self, generation: u32, value: DiceComputedValue) {
-        drop(self.internal.maybe_value.set(value));
+        drop(self.internal.maybe_value.set(Some(value)));
+        self.task_finished(generation);
+    }
+
+    /// Mark that a generation has terminated because its computation panicked.
+    fn task_finished_poisoned(&self, generation: u32) {
+        drop(self.internal.maybe_value.set(None));
         self.task_finished(generation);
     }
 
@@ -588,6 +601,10 @@ impl<'d> DiceTaskRef<'d> {
         // We were the last dependent. Cancel the spawned task if needed.
         drop(guard.take());
     }
+}
+
+fn unpoisoned(value: &Option<DiceComputedValue>) -> &DiceComputedValue {
+    value.as_ref().expect("the key's computation panicked")
 }
 
 impl DiceTaskInternal {
@@ -676,6 +693,10 @@ impl DiceTaskCompletionHandle {
 
     pub(crate) fn completed(self, v: DiceComputedValue) {
         self.task.as_ref().task_finished_result(self.generation, v);
+    }
+
+    pub(crate) fn poisoned(self) {
+        self.task.as_ref().task_finished_poisoned(self.generation);
     }
 }
 

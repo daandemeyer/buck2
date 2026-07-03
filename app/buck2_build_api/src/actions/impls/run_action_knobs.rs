@@ -8,9 +8,12 @@
  * above-listed licenses.
  */
 
+use std::sync::Arc;
+
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_directory::directory::dashmap_directory_interner::DashMapDirectoryInterner;
 use buck2_execute::directory::ActionDirectoryMember;
+use buck2_execute::materialize::download_cache::DownloadCache;
 use dice::UserComputationData;
 use dupe::Dupe;
 
@@ -32,6 +35,9 @@ pub struct RunActionKnobs {
         Option<DashMapDirectoryInterner<ActionDirectoryMember, TrackedFileDigest>>,
 
     pub deduplicate_get_digests_ttl_calls: bool,
+
+    /// Machine-wide store of `download_file` bytes, shared between projects.
+    pub download_cache: Option<Arc<DownloadCache>>,
 }
 
 pub trait HasRunActionKnobs {

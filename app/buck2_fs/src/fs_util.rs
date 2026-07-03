@@ -348,7 +348,7 @@ pub fn copy<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(from: P, to: Q) -> Result<u64,
     let from_ref = from.as_ref();
     let to_ref = to.as_ref();
     with_retries(|| {
-        fs::copy(
+        copy_impl(
             from_ref.as_maybe_relativized(),
             to_ref.as_maybe_relativized(),
         )
@@ -363,6 +363,64 @@ pub fn copy<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(from: P, to: Q) -> Result<u64,
             .check_eden(from_ref)
             .check_eden(to_ref)
     })
+}
+
+/// `fs::copy` on Linux uses `copy_file_range`, which keeps holes only on a filesystem that can
+/// share extents (btrfs, XFS). Elsewhere (ext4, tmpfs) sparse files get inflated to their full
+/// size. Copy only the data ranges of a sparse file instead.
+#[cfg(target_os = "linux")]
+fn copy_impl(from: &Path, to: &Path) -> io::Result<u64> {
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    use nix::errno::Errno;
+    use nix::unistd::Whence;
+    use nix::unistd::lseek;
+
+    let src = File::open(from)?;
+    let metadata = src.metadata()?;
+    let len = metadata.len();
+    // `blocks()` counts 512 byte units, whatever the filesystem's block size.
+    if !metadata.is_file() || metadata.blocks() * 512 >= len {
+        return fs::copy(from, to);
+    }
+
+    let permissions = metadata.permissions();
+    let mut dst = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(permissions.mode())
+        .open(to)?;
+    let mut offset = 0;
+    while offset < len {
+        let data = match lseek(&src, offset as i64, Whence::SeekData) {
+            Ok(data) => data as u64,
+            // Nothing but a hole from `offset` on.
+            Err(Errno::ENXIO) => break,
+            Err(e) => return Err(e.into()),
+        };
+        let hole = lseek(&src, data as i64, Whence::SeekHole)? as u64;
+        (&src).seek(SeekFrom::Start(data))?;
+        dst.seek(SeekFrom::Start(data))?;
+        // Like `fs::copy`, this goes through `copy_file_range` where possible, which still shares
+        // the extents on a filesystem that can.
+        io::copy(&mut (&src).take(hole - data), &mut dst)?;
+        offset = hole;
+    }
+    // Covers a trailing hole, which no copy above reaches.
+    dst.set_len(len)?;
+    // As `fs::copy` does: the mode given to `open` only applies to a new file, minus the umask.
+    dst.set_permissions(permissions)?;
+    Ok(len)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn copy_impl(from: &Path, to: &Path) -> io::Result<u64> {
+    fs::copy(from, to)
 }
 
 pub fn hard_link<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(
@@ -450,6 +508,26 @@ pub fn symlink_metadata<P: AsRef<AbsPath>>(path: P) -> Result<fs::Metadata, IoEr
     let _guard = IoCounterKey::Stat.guard();
     with_retries(|| fs::symlink_metadata(path.as_ref().as_maybe_relativized()))
         .map_err(|e| IoError::new_with_path("symlink_metadata", path, e))
+}
+
+#[cfg(windows)]
+pub fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+pub fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+/// `metadata` must come from [`symlink_metadata`]: a followed stat reports a
+/// symlink-to-file as a plain file, silently defeating this check.
+pub fn is_plain_file(metadata: &fs::Metadata) -> bool {
+    metadata.is_file() && !is_reparse_point(metadata)
 }
 
 pub fn set_permissions<P: AsRef<AbsPath>>(path: P, perm: fs::Permissions) -> Result<(), IoError> {
@@ -1022,6 +1100,42 @@ mod tests {
         let not_existing_dir = existing_path.join(ForwardRelativePath::unchecked_new("dir"));
         let res = fs_util::read_dir_if_exists(not_existing_dir)?;
         assert!(res.is_none());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn copy_keeps_holes() -> buck2_error::Result<()> {
+        use std::io::Seek;
+        use std::io::SeekFrom;
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        const LEN: u64 = 64 << 20;
+        let tempdir = tempfile::tempdir()?;
+        let src = AbsPath::new(tempdir.path())?.join("src");
+        let dst = AbsPath::new(tempdir.path())?.join("dst");
+
+        // Data at the start and in the middle, and a trailing hole.
+        let mut file = File::create(&src)?;
+        file.write_all(b"head")?;
+        file.seek(SeekFrom::Start(LEN / 2))?;
+        file.write_all(b"middle")?;
+        file.set_len(LEN)?;
+        file.set_permissions(fs::Permissions::from_mode(0o751))?;
+        drop(file);
+        let src_blocks = fs::metadata(&src)?.blocks();
+        if src_blocks * 512 >= LEN {
+            // The temporary directory is on a filesystem without holes.
+            return Ok(());
+        }
+
+        assert_eq!(fs_util::copy(&src, &dst)?, LEN);
+        assert_eq!(fs::read(&src)?, fs::read(&dst)?);
+        let metadata = fs::metadata(&dst)?;
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o751);
+        assert!(metadata.blocks() * 512 < LEN / 2);
         Ok(())
     }
 

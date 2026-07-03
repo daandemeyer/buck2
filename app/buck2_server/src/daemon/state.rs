@@ -60,6 +60,8 @@ use buck2_execute::dep_file_state::DepFileStore;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::blocking::BlockingExecutorFactory;
+use buck2_execute::materialize::download_cache::DownloadCache;
+use buck2_execute::materialize::download_cache::DownloadCacheConfig;
 use buck2_execute::materialize::materializer::FinalArtifactMaterialization;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::re::manager::ReConnectionManager;
@@ -80,6 +82,7 @@ use buck2_file_watcher::file_watcher::FileWatcher;
 use buck2_fs::cwd::WorkingDirectory;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::file_name::FileNameBuf;
+use buck2_fs::paths::init_allow_backslashes_in_paths;
 use buck2_hash::StdBuckHashMap;
 use buck2_http::HttpClient;
 use buck2_http::HttpClientBuilder;
@@ -187,6 +190,9 @@ pub struct RepoState {
     /// it needs to be downloaded again).
     pub use_network_action_output_cache: bool,
 
+    /// Machine-wide store of `download_file` bytes, shared between projects.
+    pub download_cache: Option<Arc<DownloadCache>>,
+
     /// Whether a command selecting this repo should ask the client to restart the daemon after an
     /// error.
     pub restart_daemon_on_error: bool,
@@ -265,6 +271,7 @@ struct TenantStateInit<'a> {
 struct DaemonSharedServices<'a> {
     blocking_executor_factory: &'a BlockingExecutorFactory,
     scribe_sink: Option<&'a Arc<dyn EventSinkWithStats>>,
+    download_cache: Option<&'a Arc<DownloadCache>>,
     memory_tracker: Option<&'a MemoryTrackerHandle>,
     daemon_id: &'a DaemonId,
 }
@@ -688,6 +695,7 @@ impl TenantState {
             io,
             materializer,
             use_network_action_output_cache,
+            download_cache: shared.download_cache.cloned(),
             restart_daemon_on_error: root_config
                 .parse::<RolloutPercentage>(BuckconfigKeyRef {
                     section: "buck2",
@@ -944,6 +952,9 @@ pub struct DaemonStateData {
     /// Http client used for materializer and RunAction implementations.
     pub http_client: HttpClient,
 
+    /// Machine-wide store of `download_file` bytes, shared between repos.
+    pub download_cache: Option<Arc<DownloadCache>>,
+
     /// Spawner
     pub spawner: Arc<BuckSpawner>,
 
@@ -972,6 +983,7 @@ impl DaemonStateData {
         DaemonSharedServices {
             blocking_executor_factory: &self.blocking_executor_factory,
             scribe_sink: self.scribe_sink.as_ref(),
+            download_cache: self.download_cache.as_ref(),
             memory_tracker: self.memory_tracker.as_ref(),
             daemon_id: &self.daemon_id,
         }
@@ -1100,6 +1112,9 @@ impl DaemonState {
         // Owned, because tenant construction happens in the spawned initialization future.
         let tenant_state_rt = rt.clone();
         let init_fut = async move {
+            init_allow_backslashes_in_paths(
+                init_ctx.daemon_startup_config.allow_backslashes_in_paths,
+            )?;
             let invocation_paths = paths;
             let paths = invocation_paths.tenant_paths();
             let fs = paths.project_root().clone();
@@ -1158,6 +1173,11 @@ impl DaemonState {
                 .buck_error_context("Error creating HTTP client")?
                 .build();
 
+            let download_cache =
+                DownloadCacheConfig::new(&init_ctx.daemon_startup_config.download_cache)?
+                    .map(DownloadCache::new)
+                    .inspect(|cache| cache.spawn_gc());
+
             tracing::info!("Creating memory tracker...");
             let memory_tracker = memory_tracker::create_memory_tracker(
                 cgroup_tree,
@@ -1193,6 +1213,7 @@ impl DaemonState {
                     DaemonSharedServices {
                         blocking_executor_factory: &blocking_executor_factory,
                         scribe_sink: scribe_sink.as_ref(),
+                        download_cache: download_cache.as_ref(),
                         memory_tracker: memory_tracker.as_ref(),
                         daemon_id: &daemon_id,
                     },
@@ -1214,6 +1235,7 @@ impl DaemonState {
                 scribe_sink,
                 start_time: std::time::Instant::now(),
                 http_client,
+                download_cache,
                 spawner: Arc::new(BuckSpawner::new(daemon_state_data_rt)),
                 memory_tracker,
                 daemon_id: daemon_id.dupe(),
