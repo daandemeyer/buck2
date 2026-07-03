@@ -157,10 +157,21 @@ fn render_stmt(x: StarStmt, generics: &StarGenerics) -> syn::Result<syn::Stmt> {
 }
 
 fn render_const(x: StarConst) -> syn::Stmt {
-    let StarConst { name, ty, value } = x;
+    let StarConst {
+        name,
+        ty,
+        value,
+        representation,
+    } = x;
     let name_str = ident_string(&name);
-    syn::parse_quote! {
-        globals_builder.set::<#ty>(#name_str, #value);
+    if representation {
+        syn::parse_quote! {
+            globals_builder.set_representation::<#ty>(#name_str, #value);
+        }
+    } else {
+        syn::parse_quote! {
+            globals_builder.set::<#ty>(#name_str, #value);
+        }
     }
 }
 
@@ -251,7 +262,7 @@ fn render_attr(x: StarAttr, generics: &StarGenerics) -> syn::Stmt {
                 #name_str,
                 #speculative_exec_safe,
                 #docstring,
-                starlark::values::type_repr::type_repr_from_attr_impl(#name_inner #turbofish),
+                starlark::values::type_expr::type_repr_from_attr_impl(#name_inner #turbofish),
                 #name #turbofish
             );
         }

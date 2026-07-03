@@ -22,12 +22,13 @@ use starlark::starlark_module;
 use starlark::starlark_simple_value;
 use starlark::typing::Ty;
 use starlark::values::Freeze;
+use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkValue;
-use starlark::values::StringValue;
 use starlark::values::ValueOf;
 use starlark::values::list::ListType;
 use starlark::values::starlark_value;
+use starlark::values::string::StarlarkStr;
 
 /// Wrapper for `regex::Regex`.
 #[derive(
@@ -75,11 +76,11 @@ impl StarlarkBuckRegex {
     /// without matching the remaining elements.
     fn multi_match<'v>(
         &self,
-        strings: ValueOf<'v, ListType<StringValue<'v>>>,
+        strings: ValueOf<'v, ListType<StarlarkStr>>,
         any: bool,
     ) -> starlark::Result<bool> {
         for string in strings.iter() {
-            if self.is_match(string?.unpack().as_str())? == any {
+            if self.is_match(string?.get().as_str())? == any {
                 return Ok(any);
             }
         }
@@ -135,7 +136,7 @@ fn regex_methods(builder: &mut MethodsBuilder) {
     /// lists because it crosses from Starlark into native code only once.
     fn any_match<'v>(
         this: &StarlarkBuckRegex,
-        #[starlark(require = pos)] strings: ValueOf<'v, ListType<StringValue<'v>>>,
+        #[starlark(require = pos)] strings: ValueOf<'v, ListType<StarlarkStr>>,
     ) -> starlark::Result<bool> {
         this.multi_match(strings, true)
     }
@@ -148,7 +149,7 @@ fn regex_methods(builder: &mut MethodsBuilder) {
     /// lists because it crosses from Starlark into native code only once.
     fn all_match<'v>(
         this: &StarlarkBuckRegex,
-        #[starlark(require = pos)] strings: ValueOf<'v, ListType<StringValue<'v>>>,
+        #[starlark(require = pos)] strings: ValueOf<'v, ListType<StarlarkStr>>,
     ) -> starlark::Result<bool> {
         this.multi_match(strings, false)
     }
@@ -197,15 +198,17 @@ pub fn register_buck_regex(builder: &mut GlobalsBuilder) {
     fn regex<'v>(
         #[starlark(require = pos)] regex: &str,
         #[starlark(require = named, default = false)] fancy: bool,
-    ) -> starlark::Result<StarlarkBuckRegex> {
-        match fancy {
-            false => Ok(StarlarkBuckRegex::Regular(
+        heap: Heap<'v>,
+    ) -> starlark::Result<ValueOf<'v, StarlarkBuckRegex>> {
+        let regex = match fancy {
+            false => StarlarkBuckRegex::Regular(
                 regex::Regex::new(regex).map_err(buck2_error::Error::from)?,
-            )),
-            true => Ok(StarlarkBuckRegex::Fancy(
+            ),
+            true => StarlarkBuckRegex::Fancy(
                 fancy_regex::Regex::new(regex).map_err(buck2_error::Error::from)?,
-            )),
-        }
+            ),
+        };
+        Ok(ValueOf::alloc(heap, regex))
     }
 }
 

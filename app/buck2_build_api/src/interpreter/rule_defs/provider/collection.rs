@@ -8,7 +8,6 @@
  * above-listed licenses.
  */
 
-use std::convert::Infallible;
 use std::fmt;
 use std::fmt::Display;
 use std::sync::Arc;
@@ -36,13 +35,14 @@ use starlark::pagable::SmallMapKeyDeserialize;
 use starlark::pagable::StarlarkDeserialize;
 use starlark::pagable::StarlarkDeserializeContext;
 use starlark::static_starlark_value;
-use starlark::typing::Ty;
-use starlark::values::AllocFrozenValue;
-use starlark::values::AllocValue;
+use starlark::values::AllocFrozenRepresentation;
+use starlark::values::AllocRepresentation;
+use starlark::values::Allocator;
 use starlark::values::Deferred;
 use starlark::values::Freeze;
 use starlark::values::FreezeResult;
 use starlark::values::Freezer;
+use starlark::values::FrozenAllocator;
 use starlark::values::FrozenHeap;
 use starlark::values::FrozenValueTyped;
 use starlark::values::Heap;
@@ -61,7 +61,6 @@ use starlark::values::ValueTyped;
 use starlark::values::list::ListRef;
 use starlark::values::none::NoneOr;
 use starlark::values::starlark_value;
-use starlark::values::type_repr::StarlarkTypeRepr;
 use starlark_map::Hashed;
 
 use crate::actions::impls::json::SerializeOrFail;
@@ -174,22 +173,26 @@ static_starlark_value!(EMPTY_PROVIDER_COLLECTION: ProviderCollection<'static> = 
 // These are the hand-written equivalents of `starlark_complex_value!`,
 // which we can't use because empty collections should be allocated as the
 // statically interned empty collection.
-impl<'v> AllocValue<'v> for ProviderCollection<'v> {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
+impl<'v> AllocRepresentation<'v> for ProviderCollection<'v> {
+    type Repr = Self;
+
+    fn alloc(self, allocator: Allocator<'v>) -> ValueTyped<'v, Self> {
         if self.providers.is_empty() {
-            EMPTY_PROVIDER_COLLECTION.at().to_value()
+            EMPTY_PROVIDER_COLLECTION.at()
         } else {
-            heap.alloc_complex(self)
+            allocator.alloc_complex(self)
         }
     }
 }
 
-impl<'fv> AllocFrozenValue<'fv> for ProviderCollection<'fv> {
-    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> Value<'fv> {
+impl<'fv> AllocFrozenRepresentation<'fv> for ProviderCollection<'fv> {
+    type Repr = Self;
+
+    fn alloc_frozen(self, allocator: FrozenAllocator<'fv>) -> ValueTyped<'fv, Self> {
         if self.providers.is_empty() {
-            EMPTY_PROVIDER_COLLECTION.at().to_value()
+            EMPTY_PROVIDER_COLLECTION.at()
         } else {
-            heap.alloc_simple_typed(self).to_value()
+            allocator.alloc_simple(self)
         }
     }
 }
@@ -198,22 +201,6 @@ impl<'v> ProviderCollection<'v> {
     #[inline]
     pub fn from_value(x: Value<'v>) -> Option<&'v Self> {
         x.downcast_ref::<ProviderCollection<'v>>()
-    }
-}
-
-impl<'v> StarlarkTypeRepr for &'v ProviderCollection<'v> {
-    type Canonical = ProviderCollection<'v>;
-
-    fn starlark_type_repr() -> Ty {
-        <ProviderCollection as StarlarkValue>::get_type_starlark_repr()
-    }
-}
-
-impl<'v> UnpackValue<'v> for &'v ProviderCollection<'v> {
-    type Error = Infallible;
-
-    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        Ok(ProviderCollection::from_value(value))
     }
 }
 
@@ -345,7 +332,10 @@ impl<'v> ProviderCollection<'v> {
         if !providers.contains_key(DefaultInfoCallable::provider_id().as_ref()) {
             providers.insert(
                 CollectionKey(DefaultInfoCallable::provider_id().dupe()),
-                Deferred::new(heap.alloc(DefaultInfo::empty(heap))),
+                Deferred::new(
+                    heap.alloc_representation(DefaultInfo::empty(heap))
+                        .to_value(),
+                ),
             );
         }
         Ok(ProviderCollection { providers })
@@ -396,7 +386,7 @@ impl<'v> ProviderCollection<'v> {
 
 impl ProviderCollection<'static> {
     pub fn testing_new_default<'v>(heap: FrozenHeap<'v>) -> ValueTyped<'v, ProviderCollection<'v>> {
-        heap.alloc_typed(ProviderCollection {
+        heap.alloc_representation(ProviderCollection {
             providers: BuckMutInsertionMap::from_iter([(
                 CollectionKey(DefaultInfoCallable::provider_id().dupe()),
                 Deferred::new(DefaultInfo::testing_empty(heap).to_value()),
@@ -424,7 +414,7 @@ fn provider_collection_methods(builder: &mut MethodsBuilder) {
     }
 }
 
-#[starlark_value(type = "ProviderCollection", frozen_vtable)]
+#[starlark_value(type = "ProviderCollection", frozen_vtable, alloc = by_hand)]
 impl<'v> StarlarkValue<'v> for ProviderCollection<'v> {
     fn at(&self, index: Value<'v>, _heap: Heap<'v>) -> starlark::Result<Value<'v>> {
         match self.get_impl(index, GetOp::At)? {
@@ -714,14 +704,19 @@ pub mod tester {
     use buck2_interpreter::types::provider::callable::ValueAsProviderCallableLike;
     use dupe::Dupe;
     use starlark::environment::GlobalsBuilder;
+    use starlark::values::Heap;
     use starlark::values::Value;
+    use starlark::values::ValueTyped;
 
     use crate::interpreter::rule_defs::provider::ProviderCollection;
 
     #[starlark_module]
     pub fn collection_creator(builder: &mut GlobalsBuilder) {
-        fn create_collection<'v>(value: Value<'v>) -> starlark::Result<ProviderCollection<'v>> {
-            Ok(ProviderCollection::try_from_value(value)?)
+        fn create_collection<'v>(
+            value: Value<'v>,
+            heap: Heap<'v>,
+        ) -> starlark::Result<ValueTyped<'v, ProviderCollection<'v>>> {
+            Ok(heap.alloc_representation(ProviderCollection::try_from_value(value)?))
         }
 
         fn get_default_info_default_outputs<'v>(value: Value<'v>) -> starlark::Result<Value<'v>> {
@@ -734,8 +729,7 @@ pub mod tester {
                 )
             })?;
 
-            let ret = collection.default_info()?.default_outputs_raw();
-            Ok(ret)
+            Ok(collection.default_info()?.default_outputs_raw().to_value())
         }
 
         fn get_default_info_sub_targets<'v>(value: Value<'v>) -> starlark::Result<Value<'v>> {

@@ -31,6 +31,7 @@ use dupe::Dupe;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::daemon_routing::DaemonRouting;
 use crate::legacy_configs::configs::LegacyBuckConfig;
 use crate::legacy_configs::key::BuckconfigKeyRef;
 
@@ -501,6 +502,10 @@ pub struct DaemonStartupConfig {
 /// Any difference requires a new daemon; Buck Settings have a separate compatibility check.
 #[derive(Allocative, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DaemonStartupOptions {
+    /// How clients select this daemon; a daemon serves only tenants routed the same way.
+    /// Absent from the startup options of older daemons, which were all unshared.
+    #[serde(default)]
+    pub routing: DaemonRouting,
     /// Share one DICE engine across isolated tenant roots for this daemon's lifetime.
     pub share_dice: bool,
     pub num_tokio_workers: Option<usize>,
@@ -509,8 +514,8 @@ pub struct DaemonStartupOptions {
     pub source_digest_algorithm: Option<String>,
     pub paranoid: bool,
     pub materializations: Option<String>,
-    /// `buck2.materializer_v2_version`: the daemon runs the disk-state materializer when its
-    /// `ROLLOUT_VERSION` is at least this, and the deferred one when this is unset.
+    /// `buck2.materializer_v2_version`: the daemon runs the disk-state materializer when
+    /// `MATERIALIZER_V2_ROLLOUT_VERSION` is at least this, and the deferred one when this is unset.
     pub materializer_v2_version: Option<u32>,
     pub http: HttpConfig,
     pub resource_control: ResourceControlConfig,
@@ -519,6 +524,24 @@ pub struct DaemonStartupOptions {
     pub daemon_idle_timeout_s: Option<u64>,
     /// Pagable DICE storage settings, or `None` when paging is disabled.
     pub hydration: Option<HydrationConfig>,
+}
+
+/// Rolls the disk-state materializer out: a daemon runs it when `buck2.materializer_v2_version`
+/// is set to at most this value, and the deferred materializer otherwise. It lives here rather
+/// than with the materializer because the client reads it too: which materializer a daemon
+/// would run is part of its compatibility key, decided before any daemon runs.
+///
+/// Bump this with any fix that a rollback waited on. Setting the config above every version in
+/// the fleet rolls back; setting it to the fixed version then rolls out again to the binaries
+/// that have the fix, and to no others.
+pub const MATERIALIZER_V2_ROLLOUT_VERSION: u32 = 3;
+
+impl DaemonStartupOptions {
+    /// Whether the daemon runs the disk-state materializer rather than the deferred one.
+    pub fn runs_disk_state_materializer(&self) -> bool {
+        self.materializer_v2_version
+            .is_some_and(|wanted| MATERIALIZER_V2_ROLLOUT_VERSION >= wanted)
+    }
 }
 
 impl DaemonStartupConfig {
@@ -556,7 +579,10 @@ impl DaemonStartupConfig {
             }
         };
 
+        let routing = DaemonRouting::from_config(config)?;
+        let shared = routing.is_shared();
         let startup_options = DaemonStartupOptions {
+            routing,
             share_dice: config
                 .parse(BuckconfigKeyRef {
                     section: "buck2",
@@ -564,7 +590,14 @@ impl DaemonStartupConfig {
                 })?
                 .unwrap_or(false),
             num_tokio_workers: settings.daemon.num_tokio_workers(&mut buckconfig)?,
-            daemon_buster: settings.daemon.buster(&mut buckconfig)?,
+            daemon_buster: {
+                let buster = settings.daemon.buster(&mut buckconfig)?;
+                if shared {
+                    Some(format!("shared-daemon-v1:{}", buster.unwrap_or_default()))
+                } else {
+                    buster
+                }
+            },
             digest_algorithms: settings.digest.algorithms(&mut buckconfig)?,
             source_digest_algorithm: settings.digest.source_algorithm(&mut buckconfig)?,
             paranoid,
@@ -624,6 +657,7 @@ impl DaemonStartupConfig {
 
     pub fn testing_empty() -> Self {
         let startup_options = DaemonStartupOptions {
+            routing: DaemonRouting::Unshared,
             share_dice: false,
             num_tokio_workers: None,
             daemon_buster: None,
@@ -682,6 +716,22 @@ mod tests {
         let deserialized = DaemonStartupConfig::deserialize(&serialized)?;
         assert_eq!(deserialized.startup_options, config.startup_options);
         assert_eq!(deserialized.daemon_buck_settings(), &settings.daemon);
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_routing_is_a_daemon_startup_option() -> buck2_error::Result<()> {
+        let empty = parse(&[("config", "")], "config")?;
+        let unshared = DaemonStartupConfig::new(&empty, &DaemonBuckSettings::default(), false)?;
+        assert_eq!(unshared.startup_options.routing, DaemonRouting::Unshared);
+        let configured = parse(&[("config", "[buck2]\nshare_daemon = true")], "config")?;
+        let shared = DaemonStartupConfig::new(&configured, &DaemonBuckSettings::default(), false)?;
+        if cfg!(target_os = "linux") {
+            assert_eq!(shared.startup_options.routing, DaemonRouting::Shared);
+            assert_ne!(unshared.startup_options, shared.startup_options);
+        }
+        let deserialized = DaemonStartupConfig::deserialize(&shared.serialize()?)?;
+        assert_eq!(deserialized.startup_options, shared.startup_options);
         Ok(())
     }
 

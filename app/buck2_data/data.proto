@@ -1182,6 +1182,15 @@ message ResourceControlEvent {
   uint64 allprocs_memory_current = 6;
   uint64 allprocs_memory_pressure = 7;
   uint64 allprocs_memory_swap_current = 12;
+  // The part of `allprocs_memory_current` that is page cache which the kernel
+  // can drop
+  uint64 allprocs_page_cache = 20;
+  // The part of `allprocs_page_cache` that the kernel has seen in repeated use,
+  // which it drops last
+  uint64 allprocs_page_cache_active = 21;
+  // How many times so far the kernel wanted to move memory of these processes
+  // to swap and couldn't
+  uint64 allprocs_swap_failures = 22;
 
   // Memory information regarding the buck2 daemon cgroup
   uint64 daemon_memory_current = 17;
@@ -1593,6 +1602,11 @@ message Snapshot {
   // materializer's declared artifacts. Always populated by current daemons;
   // absent in event logs recorded by older daemons that pre-date this field.
   optional StandaloneTtlRefreshStats standalone_ttl_refresh = 3002;
+
+  // Time since this command's tenant generation was created. Equals
+  // `daemon_uptime_s` for the tenant a daemon started with; a tenant that
+  // joined a shared daemon later, or was recreated after eviction, is younger.
+  optional uint64 tenant_uptime_s = 3003;
 }
 
 message StandaloneTtlRefreshStats {
@@ -2198,6 +2212,7 @@ enum ActionKind {
   WRITE = 5;
   WRITE_MACROS_TO_FILE = 6;
   CAS_ARTIFACT = 7;
+  EXTRACT_ARCHIVE = 8;
 }
 
 // The kinds of ways an action can be executed by buck2.
@@ -3843,13 +3858,13 @@ message InvocationRecord {
 
   // Peak swap usage (bytes) of all Buck2 processes during the invocation,
   // from allprocs cgroup memory.swap.current.
-  uint64 memory_max_swap_bytes_allprocs = 434;
+  optional uint64 memory_max_swap_bytes_allprocs = 434;
   // Peak memory pressure (PSI full avg10 %) of all Buck2
   // processes during the invocation, from allprocs cgroup memory.pressure.
-  double memory_max_pressure_10s_avg_allprocs = 435;
+  optional double memory_max_pressure_10s_avg_allprocs = 435;
   // Peak memory pressure (PSI full avg60 %) of all Buck2
   // processes during the invocation, from allprocs cgroup memory.pressure.
-  double memory_max_pressure_60s_avg_allprocs = 436;
+  optional double memory_max_pressure_60s_avg_allprocs = 436;
 
   // Agent context entries passed via --agent-context.
   repeated AgentContextEntry agent_context = 437;

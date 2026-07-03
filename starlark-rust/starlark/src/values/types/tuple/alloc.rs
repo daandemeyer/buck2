@@ -17,14 +17,13 @@
 
 use std::iter;
 
-use crate::typing::Ty;
 use crate::values::AllocFrozenValue;
 use crate::values::AllocValue;
 use crate::values::FrozenHeap;
 use crate::values::Heap;
 use crate::values::Value;
+use crate::values::ValueOf;
 use crate::values::tuple::TupleType;
-use crate::values::type_repr::StarlarkTypeRepr;
 
 /// Utility to allocate a tuple.
 ///
@@ -47,25 +46,15 @@ impl<'v> AllocTuple<iter::Empty<Value<'v>>> {
     pub const EMPTY: AllocTuple<iter::Empty<Value<'v>>> = AllocTuple(iter::empty());
 }
 
-impl<T> StarlarkTypeRepr for AllocTuple<T>
-where
-    T: IntoIterator,
-    T::Item: StarlarkTypeRepr,
-{
-    type Canonical = <TupleType<T::Item> as StarlarkTypeRepr>::Canonical;
-
-    fn starlark_type_repr() -> Ty {
-        Ty::tuple_of(T::Item::starlark_type_repr())
-    }
-}
-
 impl<'v, T> AllocValue<'v> for AllocTuple<T>
 where
     T: IntoIterator,
     T::Item: AllocValue<'v>,
 {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_tuple_iter(self.0.into_iter().map(|x| x.alloc_value(heap)))
+    type Type = TupleType<<T::Item as AllocValue<'v>>::Type>;
+
+    fn alloc_value(self, heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
+        ValueOf::alloc_tuple(heap, self.0.into_iter().map(|x| x.alloc_value(heap)))
     }
 }
 
@@ -74,8 +63,17 @@ where
     T: IntoIterator,
     T::Item: AllocFrozenValue<'fv>,
 {
-    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> Value<'fv> {
-        heap.alloc_tuple_iter(self.0.into_iter().map(|x| x.alloc_frozen_value(heap)))
+    type Type = TupleType<<T::Item as AllocFrozenValue<'fv>>::Type>;
+
+    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> ValueOf<'fv, Self::Type> {
+        // The items are `T::Item::Type` by `T::Item`'s declaration.
+        ValueOf::new_unchecked(
+            heap.alloc_tuple_iter(
+                self.0
+                    .into_iter()
+                    .map(|x| x.alloc_frozen_value(heap).to_value()),
+            ),
+        )
     }
 }
 

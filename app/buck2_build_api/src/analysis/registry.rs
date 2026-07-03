@@ -85,7 +85,9 @@ use crate::dynamic::storage::DynamicLambdaParamsStorage;
 use crate::dynamic::storage::FrozenDynamicLambdaParamsStorageBox;
 use crate::interpreter::rule_defs::artifact::associated::AssociatedArtifacts;
 use crate::interpreter::rule_defs::artifact::output_artifact_like::OutputArtifactArg;
+use crate::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactView;
 use crate::interpreter::rule_defs::artifact::starlark_declared_artifact::StarlarkDeclaredArtifact;
+use crate::interpreter::rule_defs::artifact::starlark_output_artifact::StarlarkOutputArtifactView;
 use crate::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValueRef;
 use crate::interpreter::rule_defs::provider::collection::ProviderCollection;
 use crate::interpreter::rule_defs::transitive_set::FrozenTransitiveSetDefinition;
@@ -219,17 +221,26 @@ impl<'v> AnalysisRegistry<'v> {
                     },
                     heap,
                 )?;
-                heap.alloc_typed(StarlarkDeclaredArtifact::new(
+                heap.alloc_representation(StarlarkDeclaredArtifact::new(
                     declaration_location,
                     artifact,
                     AssociatedArtifacts::new(),
                 ))
             }
-            OutputArtifactArg::OutputArtifact(output) => output.inner(),
-            OutputArtifactArg::DeclaredArtifact(artifact) => artifact,
-            OutputArtifactArg::WrongArtifact(artifact) => {
-                return Err(artifact.as_input_artifact_like().as_output_error());
-            }
+            OutputArtifactArg::OutputArtifact(output) => match output {
+                StarlarkOutputArtifactView::Unfrozen(output) => output.inner(),
+                StarlarkOutputArtifactView::Frozen(output) => {
+                    return Err(StarlarkArtifactView::Artifact(output.inner())
+                        .as_input_artifact_like()
+                        .as_output_error());
+                }
+            },
+            OutputArtifactArg::Artifact(artifact) => match artifact {
+                StarlarkArtifactView::DeclaredArtifact(artifact) => artifact,
+                StarlarkArtifactView::Artifact(_) | StarlarkArtifactView::PromiseArtifact(_) => {
+                    return Err(artifact.as_input_artifact_like().as_output_error());
+                }
+            },
         };
 
         let output = declared_artifact.output_artifact();
@@ -307,7 +318,7 @@ impl<'v> AnalysisRegistry<'v> {
             .register_transitive_set(move |key| {
                 let set =
                     TransitiveSet::new_from_values(key.dupe(), definition, value, children, eval)?;
-                Ok(eval.heap().alloc_typed(set))
+                Ok(eval.heap().alloc_representation(set))
             })?)
     }
 
@@ -395,7 +406,7 @@ impl<'v> ArtifactDeclaration<'v> {
         self,
         extra_associated_artifacts: AssociatedArtifacts,
     ) -> ValueTyped<'v, StarlarkDeclaredArtifact<'v>> {
-        self.heap.alloc_typed(
+        self.heap.alloc_representation(
             self.artifact
                 .with_extended_associated_artifacts(extra_associated_artifacts),
         )
@@ -557,7 +568,7 @@ impl<'v> AnalysisValueStorage<'v> {
         let res = extra_v.analysis_value_storage.set(
             module
                 .heap()
-                .alloc_typed(StarlarkAnyComplex { value: self }),
+                .alloc_representation(StarlarkAnyComplex { value: self }),
         );
         if res.is_err() {
             return Err(internal_error!("analysis_value_storage is already set"));
@@ -702,7 +713,7 @@ impl RecordedAnalysisValues {
                     .map(|(_key, tset)| tset.as_ref().add_to_frozen_heap(heap))
                     .collect();
 
-                heap.alloc_simple_typed(StarlarkAnyComplex {
+                heap.alloc_representation(StarlarkAnyComplex {
                     value: FrozenAnalysisValueStorage {
                         self_key: self_key.dupe(),
                         action_data: BuckMutInsertionMap::new(),

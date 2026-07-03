@@ -55,8 +55,6 @@
 //! `values/layout/heap/branding.rs` explains that discipline, and the `heap` module in
 //! `values/layout/heap.rs` describes the heaps and how values move between them.
 
-pub use starlark_derive::AllocFrozenValue;
-pub use starlark_derive::AllocValue;
 pub use starlark_derive::Freeze;
 pub use starlark_derive::NoSerialize;
 pub use starlark_derive::StarlarkPagable;
@@ -103,6 +101,10 @@ pub use crate::values::layout::heap::owned_frozen::OwnedFrozenRef;
 pub use crate::values::layout::heap::owned_frozen_ext::DeferredOwnedFrozen;
 pub use crate::values::layout::heap::owned_frozen_ext::FnOncish;
 pub use crate::values::layout::heap::owned_frozen_ext::FnOncish2;
+pub use crate::values::layout::heap::representation::AllocFrozenRepresentation;
+pub use crate::values::layout::heap::representation::AllocRepresentation;
+pub use crate::values::layout::heap::representation::Allocator;
+pub use crate::values::layout::heap::representation::FrozenAllocator;
 pub use crate::values::layout::heap::send::DynStarlark;
 pub use crate::values::layout::heap::send::HeapSendable;
 pub use crate::values::layout::heap::send::HeapSyncable;
@@ -120,6 +122,8 @@ pub use crate::values::trace::Trace;
 pub use crate::values::traits::ComplexValue;
 pub use crate::values::traits::StarlarkType;
 pub use crate::values::traits::StarlarkValue;
+pub use crate::values::type_expr::StarlarkTypeExpr;
+pub use crate::values::type_expr::StarlarkTypeExprStable;
 pub use crate::values::types::any;
 pub use crate::values::types::any_complex;
 pub use crate::values::types::array;
@@ -144,7 +148,6 @@ pub use crate::values::types::tuple;
 pub use crate::values::unpack::UnpackValue;
 pub use crate::values::unpack::UnpackValueError;
 pub use crate::values::unpack::UnpackValueErrorInfallible;
-pub use crate::values::unpack_stable::UnpackValueStable;
 pub use crate::values::value_of::ValueOf;
 
 mod alloc_value;
@@ -164,9 +167,8 @@ pub(crate) mod starlark_type_id;
 pub(crate) mod thin_box_slice_value;
 mod trace;
 pub(crate) mod traits;
-pub mod type_repr;
+pub mod type_expr;
 pub(crate) mod types;
 pub mod typing;
 mod unpack;
-mod unpack_stable;
 pub(crate) mod value_of;

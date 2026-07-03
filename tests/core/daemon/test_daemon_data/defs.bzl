@@ -63,3 +63,63 @@ pwd_run = rule(
     impl = _pwd_run_impl,
     attrs = {},
 )
+
+def _nested_buck_impl(_ctx: AnalysisContext) -> list[Provider]:
+    return [
+        DefaultInfo(),
+        RunInfo(
+            args = cmd_args(
+                "fbpython",
+                "-c",
+                "import os, subprocess, sys; "
+                + "sys.exit(subprocess.run([os.environ['NESTED_BUCK2'], '--isolation-dir', "
+                + "os.environ['NESTED_ISOLATION_DIR'], 'targets', '--no-buckd', 'root//:']).returncode)",
+            )
+        ),
+    ]
+
+# Runs a nested buck2 invocation from a `buck2 run` target, as its own fresh daemon.
+nested_buck = rule(
+    impl = _nested_buck_impl,
+    attrs = {},
+)
+
+def _restart_copy_impl(ctx: AnalysisContext) -> list[Provider]:
+    out = ctx.actions.declare_output("out", has_content_based_path = False)
+    ctx.actions.run(
+        ["cp", ctx.attrs.src, out.as_output()],
+        category = "restart_copy",
+        local_only = ctx.attrs.local_only,
+        env = {"CACHE_BUSTER": str(ctx.attrs.local_only)},
+    )
+    return [DefaultInfo(default_output = out)]
+
+restart_copy = rule(
+    impl = _restart_copy_impl,
+    attrs = {"local_only": attrs.bool(default = False), "src": attrs.source()},
+)
+
+def _nested_run_impl(ctx: AnalysisContext) -> list[Provider]:
+    script = ctx.actions.write(
+        "nested_run.py",
+        [
+            "import subprocess",
+            "import sys",
+            "buck2, isolation = sys.argv[1], sys.argv[2]",
+            "subprocess.run([buck2, '--isolation-dir', isolation, 'build', '--no-buckd', 'root//:rule'], check=True)",
+        ],
+        has_content_based_path = False,
+    )
+    return [
+        DefaultInfo(),
+        RunInfo(args = cmd_args("fbpython", script, ctx.attrs.buck2_path, ctx.attrs.isolation_dir)),
+    ]
+
+# Runs a nested daemon-less build from inside a `buck2 run` target.
+nested_run = rule(
+    impl = _nested_run_impl,
+    attrs = {
+        "buck2_path": attrs.string(),
+        "isolation_dir": attrs.string(),
+    },
+)

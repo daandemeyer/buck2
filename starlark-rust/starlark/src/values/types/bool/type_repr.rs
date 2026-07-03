@@ -16,14 +16,22 @@
  */
 
 use crate::typing::Ty;
-use crate::values::StarlarkValue;
+use crate::values::Value;
 use crate::values::bool::StarlarkBool;
-use crate::values::type_repr::StarlarkTypeRepr;
+use crate::values::type_expr::StarlarkTypeExpr;
+use crate::values::type_expr::StarlarkTypeExprStable;
 
-impl StarlarkTypeRepr for bool {
-    type Canonical = <StarlarkBool as StarlarkTypeRepr>::Canonical;
+impl<'v> StarlarkTypeExpr<'v> for bool {
+    type Get = bool;
 
     fn starlark_type_repr() -> Ty {
-        StarlarkBool::get_type_starlark_repr()
+        StarlarkBool::starlark_type_repr()
+    }
+
+    #[inline]
+    fn get(value: Value<'v>) -> Option<bool> {
+        value.unpack_bool()
     }
 }
+
+impl<'v> StarlarkTypeExprStable<'v> for bool {}

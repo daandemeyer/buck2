@@ -14,7 +14,7 @@ import com.facebook.buck.jvm.java.lang.model.BridgeMethod;
 import com.facebook.buck.jvm.java.lang.model.ElementsExtended;
 import com.facebook.buck.jvm.java.lang.model.MoreAnnotations;
 import com.facebook.buck.jvm.java.lang.model.MoreElements;
-import com.facebook.buck.util.liteinfersupport.Nullable;
+import com.facebook.infer.annotation.Nullsafe;
 import com.sun.source.util.Trees;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -31,11 +31,13 @@ import javax.lang.model.element.TypeElement;
 import javax.lang.model.util.ElementFilter;
 import javax.lang.model.util.Elements;
 import javax.lang.model.util.Types;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Wraps and extends {@link javax.lang.model.util.Elements} with methods that cannot be added as
  * pure extension methods on {@link MoreElements} because they require per-instance state.
  */
+@Nullsafe(Nullsafe.Mode.LOCAL)
 public class ElementsExtendedImpl extends DelegatingElements implements ElementsExtended {
 
   private final Map<TypeElement, Map<Name, List<ExecutableElement>>> declaredMethodsMaps =

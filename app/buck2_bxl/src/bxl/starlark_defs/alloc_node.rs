@@ -13,8 +13,8 @@ use buck2_node::nodes::configured::ConfiguredTargetNode;
 use buck2_node::nodes::unconfigured::TargetNode;
 use starlark::typing::Ty;
 use starlark::values::Heap;
+use starlark::values::StarlarkTypeExpr;
 use starlark::values::Value;
-use starlark::values::type_repr::StarlarkTypeRepr;
 
 use super::nodes::action::StarlarkActionQueryNode;
 use crate::bxl::starlark_defs::nodes::configured::StarlarkConfiguredTargetNode;
@@ -34,7 +34,8 @@ impl AllocNode for TargetNode {
     }
 
     fn alloc(self, heap: Heap<'_>) -> Value<'_> {
-        heap.alloc(StarlarkTargetNode(self))
+        heap.alloc_representation(StarlarkTargetNode(self))
+            .to_value()
     }
 }
 
@@ -44,7 +45,8 @@ impl AllocNode for ConfiguredTargetNode {
     }
 
     fn alloc(self, heap: Heap<'_>) -> Value<'_> {
-        heap.alloc(StarlarkConfiguredTargetNode(self))
+        heap.alloc_representation(StarlarkConfiguredTargetNode(self))
+            .to_value()
     }
 }
 
@@ -54,6 +56,7 @@ impl AllocNode for ActionQueryNode {
     }
 
     fn alloc(self, heap: Heap<'_>) -> Value<'_> {
-        heap.alloc(StarlarkActionQueryNode(self))
+        heap.alloc_representation(StarlarkActionQueryNode(self))
+            .to_value()
     }
 }

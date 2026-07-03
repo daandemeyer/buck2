@@ -25,13 +25,11 @@ use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use dupe::Dupe;
 use starlark::any::ProvidesStaticType;
 use starlark::codemap::FileSpan;
-use starlark::values::AllocValue;
 use starlark::values::Demand;
 use starlark::values::Freeze;
 use starlark::values::FreezeError;
 use starlark::values::FreezeResult;
 use starlark::values::Freezer;
-use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkValue;
 use starlark::values::StringValue;
@@ -41,7 +39,6 @@ use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
 use starlark::values::list::ListType;
 use starlark::values::starlark_value;
-use starlark::values::type_repr::StarlarkTypeRepr;
 
 use crate::artifact_groups::ArtifactGroup;
 use crate::interpreter::rule_defs::artifact::ArtifactError;
@@ -246,7 +243,7 @@ impl<'v> StarlarkInputArtifactLike<'v> for StarlarkDeclaredArtifact<'v> {
 
 impl<'v> CommandLineArgLike<'v> for StarlarkDeclaredArtifact<'v> {
     fn register_me(&self) {
-        command_line_arg_like_impl!(StarlarkDeclaredArtifact::starlark_type_repr());
+        command_line_arg_like_impl!(StarlarkDeclaredArtifact::get_type_starlark_repr());
     }
 
     fn add_to_command_line(
@@ -315,12 +312,6 @@ impl<'v> Freeze<'v> for StarlarkDeclaredArtifact<'v> {
             artifact,
             associated_artifacts: self.associated_artifacts,
         })
-    }
-}
-
-impl<'v> AllocValue<'v> for StarlarkDeclaredArtifact<'v> {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_complex(self)
     }
 }
 

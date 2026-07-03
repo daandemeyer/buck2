@@ -26,14 +26,10 @@ use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
-use starlark::values::AllocFrozenValue;
-use starlark::values::AllocValue;
 use starlark::values::Demand;
 use starlark::values::Freeze;
 use starlark::values::FreezeResult;
 use starlark::values::Freezer;
-use starlark::values::FrozenHeap;
-use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkPagable;
 use starlark::values::StarlarkRepresentations;
@@ -44,7 +40,6 @@ use starlark::values::Trace;
 use starlark::values::Value;
 use starlark::values::ValueTyped;
 use starlark::values::starlark_value;
-use starlark::values::type_repr::StarlarkTypeRepr;
 use starlark_map::StarlarkHasher;
 
 use crate::interpreter::rule_defs::artifact::methods::any_artifact_methods;
@@ -88,20 +83,6 @@ impl<'v> Freeze<'v> for StarlarkOutputArtifact<'v> {
         Ok(FrozenStarlarkOutputArtifact {
             artifact: Freeze::freeze(self.declared_artifact, freezer)?,
         })
-    }
-}
-
-impl<'v> AllocValue<'v> for StarlarkOutputArtifact<'v> {
-    #[inline]
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_complex(self)
-    }
-}
-
-impl<'fv> AllocFrozenValue<'fv> for FrozenStarlarkOutputArtifact<'fv> {
-    #[inline]
-    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> Value<'fv> {
-        heap.alloc_simple_typed(self).to_value()
     }
 }
 
@@ -333,7 +314,7 @@ fn output_artifact_methods(builder: &mut MethodsBuilder) {
 
 impl<'v> CommandLineArgLike<'v> for StarlarkOutputArtifact<'v> {
     fn register_me(&self) {
-        command_line_arg_like_impl!(StarlarkOutputArtifact::starlark_type_repr());
+        command_line_arg_like_impl!(StarlarkOutputArtifact::get_type_starlark_repr());
     }
 
     fn add_to_command_line(
@@ -370,7 +351,7 @@ impl<'v> CommandLineArgLike<'v> for StarlarkOutputArtifact<'v> {
 
 impl<'v> CommandLineArgLike<'v> for FrozenStarlarkOutputArtifact<'v> {
     fn register_me(&self) {
-        command_line_arg_like_impl!(FrozenStarlarkOutputArtifact::starlark_type_repr());
+        command_line_arg_like_impl!(FrozenStarlarkOutputArtifact::get_type_starlark_repr());
     }
 
     fn add_to_command_line(&self, fmt: &mut CommandLineBuilder<'v, '_>) -> buck2_error::Result<()> {

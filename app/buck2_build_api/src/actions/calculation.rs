@@ -83,8 +83,8 @@ use crate::deferred::calculation::ActionLookup;
 use crate::deferred::calculation::lookup_deferred_holder;
 use crate::keep_going::KeepGoing;
 use crate::materialize::invocation_re_use_case;
+use crate::starlark::values::StarlarkTypeExpr;
 use crate::starlark::values::UnpackValue;
-use crate::starlark::values::type_repr::StarlarkTypeRepr;
 
 pub struct ActionCalculation;
 
@@ -612,14 +612,15 @@ fn try_run_error_handler(
 
                         let error_handler_result = eval.eval_function(
                             error_handler.as_ref().add_to_heap(heap),
-                            &[heap.alloc(error_handler_ctx)],
+                            &[heap.alloc_representation(error_handler_ctx).to_value()],
                             &[],
                         );
 
                         let data = match error_handler_result {
                             Ok(result) => match ActionSubErrorResult::unpack_value_err(result)
-                                .and_then(|result| result.try_to_vec())
-                            {
+                                .and_then(|result| {
+                                    result.iter().collect::<starlark::Result<Vec<_>>>()
+                                }) {
                                 Ok(sub_errors) => Data::SubErrors(ActionSubErrors {
                                     sub_errors: sub_errors
                                         .into_iter()
@@ -629,7 +630,7 @@ fn try_run_error_handler(
                                 Err(_) => Data::HandlerInvocationError(format!(
                                     "{}",
                                     ActionErrorHandlerError::TypeError(
-                                        ActionSubErrorResult::starlark_type_repr(),
+                                        <ActionSubErrorResult as UnpackValue>::Type::starlark_type_repr(),
                                         result.get_type().to_owned()
                                     )
                                 )),

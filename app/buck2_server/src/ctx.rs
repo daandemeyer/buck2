@@ -60,6 +60,7 @@ use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::legacy_configs::dice::HasInjectedLegacyConfigs;
 use buck2_common::legacy_configs::file_ops::ConfigPath;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
+use buck2_common::tenant::tenant_instance_id;
 use buck2_core::buck2_env;
 use buck2_core::cells::name::CellName;
 use buck2_core::execution_types::executor_config::CommandExecutorConfig;
@@ -84,6 +85,7 @@ use buck2_events::schedule_type::SandcastleScheduleType;
 use buck2_execute::dep_file_state::SetDepFileStore;
 use buck2_execute::execute::blocking::SetBlockingExecutor;
 use buck2_execute::execute::low_pass_filter::LowPassFilter;
+use buck2_execute::incremental_state::SetIncrementalStore;
 use buck2_execute::knobs::ExecutorGlobalKnobs;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::materialize::materializer::SetMaterializer;
@@ -977,6 +979,21 @@ impl DiceCommandUpdater<'_, '_> {
             .unwrap_or_else(RolloutPercentage::always)
             .roll();
 
+        let test_timeout_grace_period = root_config
+            .parse::<u64>(BuckconfigKeyRef {
+                section: "buck2",
+                property: "test_timeout_grace_period_s",
+            })?
+            .filter(|s| *s > 0)
+            .map(Duration::from_secs);
+
+        let kill_detached_test_processes = root_config
+            .parse::<bool>(BuckconfigKeyRef {
+                section: "buck2",
+                property: "kill_detached_test_processes",
+            })?
+            .unwrap_or(false);
+
         let log_action_keys = root_config
             .parse::<RolloutPercentage>(BuckconfigKeyRef {
                 section: "buck2",
@@ -1017,6 +1034,8 @@ impl DiceCommandUpdater<'_, '_> {
             log_action_keys,
             re_cancel_on_estimated_queue_time_exceeds,
             re_fallback_on_estimated_queue_time_exceeds,
+            test_timeout_grace_period,
+            kill_detached_test_processes,
         };
 
         let host_sharing_broker = HostSharingBroker::new_with_named_semaphores(
@@ -1174,6 +1193,7 @@ impl DiceCommandUpdater<'_, '_> {
             may_probe_cas: cas_configured
                 && self.execution_strategy != ExecutionStrategy::LocalOnly
                 && !self.skip_cache_read,
+            skip_cache_read: self.skip_cache_read,
         };
 
         set_fallback_executor_config(&mut data.data, self.executor_config.dupe());
@@ -1208,11 +1228,15 @@ impl DiceCommandUpdater<'_, '_> {
             self.cmd_ctx.base_context.repo().incremental_db_state.dupe(),
             output_trees_download_config.dupe(),
             self.cmd_ctx.base_context.daemon.daemon_id.dupe(),
+            self.cmd_ctx.base_context.daemon.user_version.clone(),
         )));
         data.set_blocking_executor(self.cmd_ctx.base_context.repo().blocking_executor.dupe());
         data.set_http_client(self.cmd_ctx.base_context.daemon.http_client.dupe());
         data.set_materializer(self.cmd_ctx.base_context.repo().materializer.dupe());
         data.set_dep_file_cache(self.cmd_ctx.base_context.repo().dep_file_cache.dupe());
+        data.set_incremental_store(Some(
+            self.cmd_ctx.base_context.repo().incremental_db_state.dupe(),
+        ));
         data.set_dep_file_store(
             self.cmd_ctx
                 .base_context
@@ -1499,6 +1523,36 @@ impl ServerCommandContextTrait for ServerCommandContext<'_> {
                 "daemon_originating_cgroup".to_owned(),
                 originating_cgroup.clone(),
             );
+        }
+
+        let tenant_generation = &self.base_context.tenant.generation;
+        let tenant_id = tenant_generation.key().telemetry_id();
+        metadata.insert(
+            "tenant_instance_id".to_owned(),
+            tenant_instance_id(
+                &self.base_context.daemon.daemon_id.to_string(),
+                &tenant_id,
+                tenant_generation.number(),
+            ),
+        );
+        metadata.insert("tenant_id".to_owned(), tenant_id);
+        metadata.insert(
+            "tenant_generation".to_owned(),
+            tenant_generation.number().to_string(),
+        );
+        metadata.insert(
+            "tenant_count".to_owned(),
+            self.base_context
+                .daemon
+                .initialized_tenant_count()
+                .to_string(),
+        );
+        metadata.insert(
+            "daemon_routing".to_owned(),
+            self.base_context.daemon.routing().name().to_owned(),
+        );
+        if let Some(reason) = tenant_generation.take_started_reason() {
+            metadata.insert("tenant_started_reason".to_owned(), reason.to_owned());
         }
 
         if let Some(agent_identity) = buck2_events::metadata::agent_identity_from_env() {

@@ -14,9 +14,12 @@ use std::sync::Arc;
 use buck2_core::configuration::transition::id::TransitionId;
 use starlark::any::ProvidesStaticType;
 use starlark::typing::Ty;
+use starlark::values::StarlarkTypeExpr;
+use starlark::values::StarlarkTypeExprStable;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
-use starlark::values::type_repr::StarlarkTypeRepr;
+use starlark::values::ValueOf;
+use starlark::values::type_expr::UnionPayload;
 
 use crate::late_binding_ty::TransitionReprLate;
 
@@ -32,21 +35,37 @@ unsafe impl<'v> ProvidesStaticType<'v> for &'v dyn TransitionValue {
 /// A value that is a transition, in whichever representation the transition crate gives it.
 pub struct ValueAsTransition<'v>(pub &'v dyn TransitionValue);
 
-impl StarlarkTypeRepr for ValueAsTransition<'_> {
-    type Canonical = TransitionReprLate;
+impl<'v> StarlarkTypeExpr<'v> for ValueAsTransition<'v> {
+    type Get = Self;
 
     fn starlark_type_repr() -> Ty {
-        TransitionReprLate::starlark_type_repr()
+        TransitionReprLate::ty()
+    }
+
+    fn get(value: Value<'v>) -> Option<Self> {
+        value
+            .request_value::<&dyn TransitionValue>()
+            .map(ValueAsTransition)
+    }
+}
+
+impl<'v> StarlarkTypeExprStable<'v> for ValueAsTransition<'v> {}
+
+impl<'v> UnionPayload<'v> for ValueAsTransition<'v> {
+    type Expr = Self;
+
+    fn from_value(value: Value<'v>) -> Option<Self> {
+        <Self as StarlarkTypeExpr<'v>>::get(value)
     }
 }
 
 impl<'v> UnpackValue<'v> for ValueAsTransition<'v> {
+    type Type = Self;
     type Error = Infallible;
 
-    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        Ok(value
-            .request_value::<&dyn TransitionValue>()
-            .map(ValueAsTransition))
+    #[inline]
+    fn unpack(_value: ValueOf<'v, Self>, get: Self) -> Result<Self, Infallible> {
+        Ok(get)
     }
 }
 

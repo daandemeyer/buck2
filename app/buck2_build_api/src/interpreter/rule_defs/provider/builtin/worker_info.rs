@@ -20,13 +20,16 @@ use starlark::eval::Evaluator;
 use starlark::values::Freeze;
 use starlark::values::FreezeError;
 use starlark::values::StarlarkPagable;
-use starlark::values::StringValue;
 use starlark::values::Trace;
+use starlark::values::UnpackValue;
 use starlark::values::Value;
 use starlark::values::ValueOf;
+use starlark::values::ValueTyped;
 use starlark::values::dict::DictType;
+use starlark::values::int::IntView;
 use starlark::values::list::AllocList;
 use starlark::values::none::NoneOr;
+use starlark::values::string::StarlarkStr;
 
 use crate as buck2_build_api;
 use crate::interpreter::rule_defs::cmd_args::CommandLineArgLike;
@@ -51,9 +54,9 @@ pub struct WorkerInfo<'v> {
     // Command to spawn a new worker
     pub exe: ValueOf<'v, StarlarkCmdArgsView<'v>>,
     /// Environment for the command that spawns the worker.
-    env: Option<ValueOf<'v, DictType<StringValue<'v>, ValueAsCommandLineLike<'v>>>>,
+    env: Option<ValueOf<'v, DictType<StarlarkStr, ValueAsCommandLineLike<'v>>>>,
     // Maximum number of concurrent commands to execute on a worker instance without queuing
-    pub concurrency: Option<ValueOf<'v, usize>>,
+    pub concurrency: Option<ValueOf<'v, IntView<'v>>>,
     // Whether to always run actions using this worker via the streaming API
     pub streaming: Option<ValueOf<'v, bool>>,
     // Bazel remote persistent worker protocol capable worker
@@ -73,20 +76,20 @@ fn worker_info_creator(globals: &mut GlobalsBuilder) {
     fn WorkerInfo<'v>(
         #[starlark(default = AllocList::EMPTY)] exe: Value<'v>,
         #[starlark(default = NoneOr::None)] env: NoneOr<
-            ValueOf<'v, DictType<StringValue<'v>, ValueAsCommandLineLike<'v>>>,
+            ValueOf<'v, DictType<StarlarkStr, ValueAsCommandLineLike<'v>>>,
         >,
         #[starlark(require = named, default = NoneOr::None)] concurrency: NoneOr<
-            ValueOf<'v, usize>,
+            ValueOf<'v, IntView<'v>>,
         >,
         #[starlark(require = named, default = NoneOr::None)] streaming: NoneOr<ValueOf<'v, bool>>,
         #[starlark(require = named, default = false)]
         supports_bazel_remote_persistent_worker_protocol: bool,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<WorkerInfo<'v>> {
+    ) -> starlark::Result<ValueTyped<'v, WorkerInfo<'v>>> {
         let heap = eval.heap();
         let valid_exe = StarlarkCmdArgs::try_from_value(exe)?;
         let id = next_id();
-        Ok(WorkerInfo {
+        Ok(heap.alloc_representation(WorkerInfo {
             exe: ValueOf::alloc(heap, valid_exe),
             env: env.into_option(),
             id,
@@ -95,13 +98,13 @@ fn worker_info_creator(globals: &mut GlobalsBuilder) {
             supports_bazel_remote_persistent_worker_protocol: ValueOf::new_unchecked(
                 heap.alloc(supports_bazel_remote_persistent_worker_protocol),
             ),
-        })
+        }))
     }
 }
 
 impl<'v> WorkerInfo<'v> {
     pub fn exe_command_line(&self) -> &'v dyn CommandLineArgLike<'v> {
-        self.exe.unpack().as_command_line_arg_like()
+        self.exe.get().as_command_line_arg_like()
     }
 
     pub fn env(&self) -> buck2_error::Result<Vec<(&'v str, &'v dyn CommandLineArgLike<'v>)>> {
@@ -111,27 +114,30 @@ impl<'v> WorkerInfo<'v> {
         env.iter()
             .map(|entry| {
                 let (key, value) = entry?;
-                Ok((key.unpack().as_str(), value.unpack().0))
+                Ok((key.get().as_str(), value.get().0))
             })
             .collect()
     }
 
-    pub fn concurrency(&self) -> Option<usize> {
-        self.concurrency.map(|v| v.unpack())
+    pub fn concurrency(&self) -> buck2_error::Result<Option<usize>> {
+        Ok(self
+            .concurrency
+            .map(|v| usize::unpack_value_err(v.to_value()))
+            .transpose()?)
     }
 
     pub fn streaming(&self) -> bool {
-        self.streaming.is_some_and(|v| v.unpack())
+        self.streaming.is_some_and(|v| v.get())
     }
 
     pub fn supports_bazel_remote_persistent_worker_protocol(&self) -> bool {
-        self.supports_bazel_remote_persistent_worker_protocol
-            .unpack()
+        self.supports_bazel_remote_persistent_worker_protocol.get()
     }
 }
 
 fn validate_worker_info<'v>(info: &WorkerInfo<'v>) -> buck2_error::Result<()> {
-    if info.exe.unpack().is_empty() {
+    info.concurrency()?;
+    if info.exe.get().is_empty() {
         return Err(buck2_error::buck2_error!(
             buck2_error::ErrorTag::Input,
             "Value for `exe` field is an empty command line: `{}`",

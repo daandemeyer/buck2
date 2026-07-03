@@ -11,8 +11,8 @@
 package com.facebook.buck.jvm.java.abi.source;
 
 import com.facebook.buck.jvm.java.plugin.adapter.ElementsExtendedImpl;
-import com.facebook.buck.util.liteinfersupport.Nullable;
-import com.facebook.buck.util.liteinfersupport.PropagatesNullable;
+import com.facebook.infer.annotation.Nullsafe;
+import com.facebook.infer.annotation.PropagatesNullable;
 import com.sun.source.util.Trees;
 import java.io.Writer;
 import java.util.Arrays;
@@ -33,6 +33,7 @@ import javax.lang.model.element.TypeElement;
 import javax.lang.model.util.ElementFilter;
 import javax.lang.model.util.Elements;
 import javax.lang.model.util.Types;
+import org.jspecify.annotations.Nullable;
 
 /**
  * An implementation of {@link Elements} using just the AST of a single module, without its
@@ -40,6 +41,7 @@ import javax.lang.model.util.Types;
  * meanings of some names, and thus must be used with care. See documentation for individual methods
  * and {@link com.facebook.buck.jvm.java.abi.source} for more information.
  */
+@Nullsafe(Nullsafe.Mode.LOCAL)
 class TreeBackedElements extends ElementsExtendedImpl {
 
   private final Elements javacElements;
@@ -86,18 +88,16 @@ class TreeBackedElements extends ElementsExtendedImpl {
     return result;
   }
 
-  @Nullable
-  /* package */ PackageElement getCanonicalElement(@Nullable PackageElement element) {
+  @Nullable /* package */ PackageElement getCanonicalElement(@Nullable PackageElement element) {
     return (PackageElement) getCanonicalElement((Element) element);
   }
 
-  @Nullable
-  /* package */ TypeElement getCanonicalElement(@Nullable TypeElement element) {
+  @Nullable /* package */ TypeElement getCanonicalElement(@Nullable TypeElement element) {
     return (TypeElement) getCanonicalElement((Element) element);
   }
 
-  @Nullable
-  /* package */ ExecutableElement getCanonicalElement(@Nullable ExecutableElement element) {
+  @Nullable /* package */ ExecutableElement getCanonicalElement(
+      @Nullable ExecutableElement element) {
     return (ExecutableElement) getCanonicalElement((Element) element);
   }
 

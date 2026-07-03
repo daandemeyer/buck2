@@ -16,6 +16,7 @@
 
 package com.facebook
 
+import com.facebook.buck.jvm.kotlin.compilerplugins.common.pluginTriggerAnnotations
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.io.File
@@ -105,6 +106,19 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
 
   private val pipeline = AbiGenPipeline()
 
+  // Annotations a code-rewriting plugin is configured to read in THIS compilation:
+  // allopen's explicit `annotation=` values plus its preset expansions (spring, quarkus,
+  // micronaut, jpa). InlineBodyKeepability subtracts these from its allowlist, so a
+  // configured trigger is rejected even if its package is allowlisted. NoArg and
+  // sam-with-receiver have no jars in third-party and no WA wiring: not read (follow-up
+  // if ever adopted).
+  //
+  // Read reflectively: allopen's key holder is version-skewed (2.3 exposes
+  // ANNOTATION/PRESET, 2.4+ exposes ALLOPEN_ANNOTATION/ALLOPEN_PRESET) while the BUCK
+  // target floats with the toolchain, so a static reference breaks on every bump.
+  // A missing jar (compilers without allopen on the plugin classpath) means its options
+  // cannot exist, and yields no triggers.
+
   override fun isApplicable(configuration: CompilerConfiguration): Boolean {
     return true
   }
@@ -152,7 +166,12 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
       )
 
       // Decide before any FIR cleanup below rewrites declarations.
-      pipeline.inlineBodies.decide(analysisResults, sourceFiles, messageCollector)
+      pipeline.inlineBodies.decide(
+          analysisResults,
+          sourceFiles,
+          messageCollector,
+          pluginTriggerAnnotations(updatedConfiguration),
+      )
 
       // Collect class usage from the resolved FIR tree for dep file tracking.
       // The DependencyTracker compiler plugin's FIR checkers don't run in kosabi's
@@ -1291,15 +1310,11 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
       configuration: CompilerConfiguration,
   ): FrontendOutputCompat? {
 
-    val sourceScope =
-        projectEnvironment.getSearchScopeByPsiFiles(ktFiles) +
-            projectEnvironment.getSearchScopeForProjectJavaSources()
-
     val (librariesScope, providerAndScopeForIncrementalCompilation) =
         prepareLibrariesScopeAndIncrementalContextCompat(
             projectEnvironment,
             configuration,
-            sourceScope,
+            ktFiles,
         )
     val sessionsWithSources = prepareJvmSessionsCompat(
         ktFiles,
@@ -1421,6 +1436,49 @@ class MissingConstantDeclarationGenerationExtension(
       // Check if this class is public
       val classVisibility = classDecl.status.visibility
       if (classVisibility == Visibilities.Public || classVisibility == Visibilities.Protected) {
+        // Members the class already inherits need no generated forwarder: the fake
+        // override carries them into the ABI (materialized when the supertype is
+        // stripped). Generating a second declaration lists the signature twice in
+        // metadata and makes consumer overload resolution ambiguous. Keyed by
+        // erased signature, not (name, arity): overloads that differ only in
+        // parameter types are distinct members, and suppressing one for the
+        // other drops a genuinely distinct signature from the ABI.
+        fun erasedSignatureKey(
+            member: FirNamedFunctionCompat,
+        ): Triple<String, Int, List<String>>? {
+          val params = mutableListOf<String>()
+          for (param in member.valueParameters) {
+            val cone = (param.returnTypeRef as? FirResolvedTypeRef)?.coneType ?: return null
+            params.add(
+                if (cone is ConeClassLikeType) cone.lookupTag.classId.asString()
+                else cone.toString(),
+            )
+          }
+          return Triple(member.name.asString(), member.valueParameters.size, params)
+        }
+        val inheritedMembers = mutableSetOf<Triple<String, Int, List<String>>>()
+        for (superTypeRef in classDecl.superTypeRefs) {
+          val superCone =
+              (superTypeRef as? FirResolvedTypeRef)?.coneType as? ConeClassLikeType ?: continue
+          val superSymbol =
+              session.symbolProvider.getClassLikeSymbolByClassId(superCone.lookupTag.classId)
+                  as? FirClassSymbol<*> ?: continue
+          val superDecl = superSymbol.fir as? FirRegularClass ?: continue
+          // Only direct supertypes: a member inherited transitively through a
+          // stripped intermediate is NOT materialized into the class (the
+          // stripper only materializes fake overrides matching a direct
+          // stripped supertype's declared signatures), so suppressing its
+          // forwarder leaves a hole the consumer cannot resolve. The forwarder
+          // stays load-bearing there.
+          for (member in superDecl.declarations) {
+            if (member is FirNamedFunctionCompat) {
+              val visibility = member.status.visibility
+              if (visibility == Visibilities.Public || visibility == Visibilities.Protected) {
+                erasedSignatureKey(member)?.let(inheritedMembers::add)
+              }
+            }
+          }
+        }
         // Find internal interface supertypes
         val interfaceMethodInfos = mutableListOf<InterfaceMethodInfo>()
 
@@ -1445,19 +1503,22 @@ class MissingConstantDeclarationGenerationExtension(
                 val visibility = decl.status.visibility
                 if (visibility == Visibilities.Public || visibility == Visibilities.Protected) {
                   // Check if method is not already declared in the class
+                  val declKey = erasedSignatureKey(decl)
                   val alreadyDeclaredInClass =
-                      classDecl.declarations.any {
-                        it is FirNamedFunctionCompat && it.name == decl.name
-                      }
+                      declKey != null &&
+                          classDecl.declarations.any {
+                            it is FirNamedFunctionCompat && erasedSignatureKey(it) == declKey
+                          }
 
                   // For enums, also check if method is overridden in any enum entry
                   val alreadyDeclaredInEnumEntry =
-                      classDecl.classKind == ClassKind.ENUM_CLASS &&
+                      declKey != null &&
+                          classDecl.classKind == ClassKind.ENUM_CLASS &&
                           classDecl.declarations.any { entry ->
                             if (entry is FirEnumEntry) {
                               val entryInit = entry.initializer as? FirAnonymousObjectExpression
                               entryInit?.anonymousObject?.declarations?.any {
-                                it is FirNamedFunctionCompat && it.name == decl.name
+                                it is FirNamedFunctionCompat && erasedSignatureKey(it) == declKey
                               } ?: false
                             } else {
                               false
@@ -1465,16 +1526,31 @@ class MissingConstantDeclarationGenerationExtension(
                           }
 
                   val alreadyDeclared = alreadyDeclaredInClass || alreadyDeclaredInEnumEntry
-                  if (!alreadyDeclared) {
+                  val alreadyInherited = declKey != null && declKey in inheritedMembers
+                  if (!alreadyDeclared && !alreadyInherited) {
+                    // Java-loaded members carry FirJavaTypeRef, whose cone type throws;
+                    // without readable types no forwarder can be synthesised, so skip.
+                    val returnType =
+                        (decl.returnTypeRef as? FirResolvedTypeRef)?.coneType ?: continue
+                    val valueParameters = mutableListOf<Pair<Name, ConeKotlinType>>()
+                    var typesReadable = true
+                    for (param in decl.valueParameters) {
+                      val paramType =
+                          (param.returnTypeRef as? FirResolvedTypeRef)?.coneType
+                              ?: run {
+                                typesReadable = false
+                                break
+                              }
+                      valueParameters.add(param.name to paramType)
+                    }
+                    if (!typesReadable) continue
                     internalMethodNames.add(decl.name)
                     interfaceMethodInfos.add(
                         InterfaceMethodInfo(
                             name = decl.name,
-                            returnType = decl.returnTypeRef.coneType,
-                            valueParameters =
-                                decl.valueParameters.map { param ->
-                                  param.name to param.returnTypeRef.coneType
-                                },
+                            returnType = returnType,
+                            valueParameters = valueParameters,
+                            modality = decl.status.modality ?: Modality.OPEN,
                         ),
                     )
                   }
@@ -1538,11 +1614,21 @@ class MissingConstantDeclarationGenerationExtension(
       }
     }
 
-    // Set status: public and final (required for enum implementations)
+    // Set status: public; final only for enum implementations (which cannot be
+    // overridden), otherwise the interface member's modality so overridable
+    // forwarders stay non-final like the class ABI. An abstract interface member
+    // becomes an OPEN implementation.
+    val isEnumOwner = (owner as? FirRegularClass)?.classKind == ClassKind.ENUM_CLASS
+    val modality =
+        when {
+          isEnumOwner -> Modality.FINAL
+          methodInfo.modality == Modality.ABSTRACT -> Modality.OPEN
+          else -> methodInfo.modality
+        }
     function.replaceStatus(
         FirResolvedDeclarationStatusImpl(
             Visibilities.Public,
-            Modality.FINAL,
+            modality,
             EffectiveVisibility.Public,
         ),
     )

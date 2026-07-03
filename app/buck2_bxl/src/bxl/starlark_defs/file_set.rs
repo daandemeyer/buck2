@@ -37,7 +37,6 @@ use starlark::values::ValueError;
 use starlark::values::ValueOf;
 use starlark::values::list_or_tuple::ListOrTupleType;
 use starlark::values::starlark_value;
-use starlark::values::type_repr::StarlarkTypeRepr;
 
 use crate::bxl::starlark_defs::context::BxlContext;
 use crate::bxl::starlark_defs::context::BxlContextCoreData;
@@ -46,11 +45,11 @@ use crate::bxl::starlark_defs::context::BxlContextCoreData;
 /// functions for arguments that should be file sets. It will accept either a
 /// literal (like `//path/to/some/file.txt`) or a FileSet Value (from one of the
 /// bxl functions that return them).
-#[derive(StarlarkTypeRepr, UnpackValue)]
+#[derive(UnpackValue)]
 pub(crate) enum FileSetExpr<'v> {
     Literal(&'v str),
     Literals(ValueOf<'v, ListOrTupleType<&'v str>>),
-    FileSet(&'v StarlarkFileSet),
+    FileSet(ValueOf<'v, StarlarkFileSet>),
 }
 
 impl<'a> FileSetExpr<'a> {
@@ -66,7 +65,7 @@ impl<'a> FileSetExpr<'a> {
                 }
                 Cow::Owned(file_set)
             }
-            FileSetExpr::FileSet(val) => Cow::Borrowed(&val.0),
+            FileSetExpr::FileSet(val) => Cow::Borrowed(&val.as_ref().0),
         };
         Ok(set)
     }
@@ -129,7 +128,10 @@ impl<'v> StarlarkValue<'v> for StarlarkFileSet {
         Ok(self
             .0
             .iter()
-            .map(|cell_path| heap.alloc(StarlarkFileNode(*cell_path)))
+            .map(|cell_path| {
+                heap.alloc_representation(StarlarkFileNode(*cell_path))
+                    .to_value()
+            })
             .collect())
     }
 
@@ -142,7 +144,7 @@ impl<'v> StarlarkValue<'v> for StarlarkFileSet {
             return ValueError::unsupported_with(self, "-", other);
         };
         let difference = self.0.difference(&other.0)?;
-        Ok(heap.alloc(Self(difference)))
+        Ok(heap.alloc_representation(Self(difference)).to_value())
     }
 
     fn equals(&self, other: Value<'v>) -> starlark::Result<bool> {
@@ -155,7 +157,7 @@ impl<'v> StarlarkValue<'v> for StarlarkFileSet {
     fn bit_or(&self, other: Value<'v>, heap: Heap<'v>) -> starlark::Result<Value<'v>> {
         let other = other.downcast_ref_err::<Self>()?;
         let union = self.0.union(&other.0);
-        Ok(heap.alloc(Self(union)))
+        Ok(heap.alloc_representation(Self(union)).to_value())
     }
 
     fn bit_and(&self, other: Value<'v>, heap: Heap<'v>) -> starlark::Result<Value<'v>> {
@@ -163,7 +165,7 @@ impl<'v> StarlarkValue<'v> for StarlarkFileSet {
             return ValueError::unsupported_with(self, "&", other);
         };
         let intersect = self.0.intersect(&other.0)?;
-        Ok(heap.alloc(Self(intersect)))
+        Ok(heap.alloc_representation(Self(intersect)).to_value())
     }
 
     fn get_methods() -> Option<&'static Methods> {
@@ -278,7 +280,10 @@ impl<'v> StarlarkValue<'v> for StarlarkReadDirSet {
         Ok(self
             .children()?
             .into_iter()
-            .map(|cell_path| heap.alloc(StarlarkFileNode(cell_path)))
+            .map(|cell_path| {
+                heap.alloc_representation(StarlarkFileNode(cell_path))
+                    .to_value()
+            })
             .collect::<Vec<_>>())
     }
 }

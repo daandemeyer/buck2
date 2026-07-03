@@ -43,7 +43,6 @@ use crate::values::AllocFrozenValue;
 use crate::values::HeapSendable;
 use crate::values::OwnedFrozen;
 use crate::values::OwnedFrozenRef;
-use crate::values::StarlarkValue;
 use crate::values::StringValue;
 use crate::values::ValueTyped;
 use crate::values::layout::avalue::AValue;
@@ -269,16 +268,7 @@ impl<'fh> FrozenHeap<'fh> {
 
     /// Allocate a new value on this heap.
     pub fn alloc<T: AllocFrozenValue<'fh>>(self, val: T) -> Value<'fh> {
-        val.alloc_frozen_value(self)
-    }
-
-    /// Allocate a value and return [`ValueTyped`] of it.
-    /// Can fail if the [`AllocFrozenValue`] trait generates a different type on the heap.
-    pub fn alloc_typed<T: AllocFrozenValue<'fh> + StarlarkValue<'fh>>(
-        self,
-        val: T,
-    ) -> ValueTyped<'fh, T> {
-        ValueTyped::new(self.alloc(val)).expect("just allocated value must have the right type")
+        val.alloc_frozen_value(self).to_value()
     }
 
     /// Number of bytes allocated on this heap, not including any memory

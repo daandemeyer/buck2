@@ -96,7 +96,7 @@ impl Field {
             }
         };
         syn::parse_quote_spanned! { self.name.span() =>
-            <#ty as starlark::values::type_repr::StarlarkTypeRepr>::starlark_type_repr()
+            <#ty as starlark::values::StarlarkTypeExpr<'v>>::starlark_type_repr()
         }
     }
 
@@ -739,7 +739,7 @@ impl ProviderCodegen {
             },
             syn::parse_quote_spanned! { self.span=>
                 fn register_provider(builder: &mut starlark::environment::GlobalsBuilder) {
-                    builder.set(#name_str, #callable_name::new());
+                    builder.set_representation(#name_str, #callable_name::new());
                 }
             },
         ])

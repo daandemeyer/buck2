@@ -20,13 +20,14 @@ use starlark::typing::ParamIsRequired;
 use starlark::typing::ParamSpec;
 use starlark::util::ArcStr;
 use starlark::values::Freeze;
+use starlark::values::Heap;
 use starlark::values::OwnedFrozen;
 use starlark::values::StarlarkPagable;
-use starlark::values::StringValue;
 use starlark::values::Trace;
 use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
 use starlark::values::list_or_tuple::ListOrTupleType;
+use starlark::values::string::StarlarkStr;
 use starlark::values::typing::StarlarkCallableChecked;
 use starlark::values::typing::StarlarkCallableParamSpec;
 
@@ -68,7 +69,7 @@ impl StarlarkCallableParamSpec for TransitionImplParams {
 pub(crate) struct TransitionInfo<'v> {
     pub(crate) r#impl:
         ValueOf<'v, StarlarkCallableChecked<'v, TransitionImplParams, ImplSingleReturnTy<'static>>>,
-    pub(crate) attrs: Option<ValueOf<'v, ListOrTupleType<StringValue<'v>>>>,
+    pub(crate) attrs: Option<ValueOf<'v, ListOrTupleType<StarlarkStr>>>,
 }
 
 /// A `TransitionInfo` kept alive by its owning frozen heap; usable across threads and awaits.
@@ -82,9 +83,10 @@ fn transition_info_creator(globals: &mut GlobalsBuilder) {
             'v,
             StarlarkCallableChecked<'v, TransitionImplParams, ImplSingleReturnTy<'static>>,
         >,
-        #[starlark(require = named)] attrs: Option<ValueOf<'v, ListOrTupleType<StringValue<'v>>>>,
-    ) -> starlark::Result<TransitionInfo<'v>> {
-        Ok(TransitionInfo { r#impl, attrs })
+        #[starlark(require = named)] attrs: Option<ValueOf<'v, ListOrTupleType<StarlarkStr>>>,
+        heap: Heap<'v>,
+    ) -> starlark::Result<ValueTyped<'v, TransitionInfo<'v>>> {
+        Ok(heap.alloc_representation(TransitionInfo { r#impl, attrs }))
     }
 }
 
@@ -92,6 +94,6 @@ impl<'v> TransitionInfo<'v> {
     pub(crate) fn get_attrs_names(
         &self,
     ) -> Option<impl Iterator<Item = buck2_error::Result<&'v str>> + use<'v>> {
-        Some(self.attrs?.iter().map(|s| Ok(s?.unpack().as_str())))
+        Some(self.attrs?.iter().map(|s| Ok(s?.get().as_str())))
     }
 }

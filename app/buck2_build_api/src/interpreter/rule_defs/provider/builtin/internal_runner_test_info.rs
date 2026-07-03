@@ -16,7 +16,7 @@ use buck2_core::execution_types::execution_group::ExecutionGroup;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_error::buck2_error;
 use buck2_hash::BuckMutInsertionMap;
-use buck2_interpreter::execution_group::ExecutionGroupArg;
+use buck2_interpreter::execution_group::StarlarkExecutionGroupView;
 use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProvidersLabel;
 use buck2_test_api::data::TestListingEntry;
 use buck2_test_api::data::TestResultEntry;
@@ -37,10 +37,12 @@ use starlark::values::ValueTyped;
 use starlark::values::dict::DictRef;
 use starlark::values::dict::DictType;
 use starlark::values::float::StarlarkFloat;
+use starlark::values::int::IntView;
 use starlark::values::list::ListRef;
 use starlark::values::list::ListType;
 use starlark::values::list_or_tuple::ListOrTupleType;
 use starlark::values::none::NoneOr;
+use starlark::values::string::StarlarkStr;
 use starlark::values::typing::StarlarkCallable;
 
 use crate as buck2_build_api;
@@ -97,14 +99,14 @@ pub struct InternalRunnerTestInfo<'v> {
     listing_command: ValueOf<'v, ListOrTupleType<ValueAsCommandLineLike<'v>>>,
 
     /// The environment for this test.
-    env: Option<ValueOf<'v, DictType<StringValue<'v>, ValueAsCommandLineLike<'v>>>>,
+    env: Option<ValueOf<'v, DictType<StarlarkStr, ValueAsCommandLineLike<'v>>>>,
 
     /// The labels for this test.
-    labels: Option<ValueOf<'v, ListOrTupleType<StringValue<'v>>>>,
+    labels: Option<ValueOf<'v, ListOrTupleType<StarlarkStr>>>,
 
     /// The contacts for this test. This is largely expected to be an oncall, though it's not
     /// validated in any way.
-    contacts: Option<ValueOf<'v, ListOrTupleType<StringValue<'v>>>>,
+    contacts: Option<ValueOf<'v, ListOrTupleType<StarlarkStr>>>,
 
     /// Whether this test should use relative paths
     use_project_relative_paths: Option<ValueOf<'v, bool>>,
@@ -116,7 +118,7 @@ pub struct InternalRunnerTestInfo<'v> {
 
     /// Default executor to use to run tests. If none is
     /// passed we will default to the execution platform.
-    default_executor: Option<ValueTyped<'v, StarlarkCommandExecutorConfig>>,
+    default_executor: Option<ValueOf<'v, StarlarkCommandExecutorConfig>>,
 
     /// The execution group whose execution platform runs the tests when the test runner does not
     /// request an executor. When the analysis of a rule that declares the group creates the test
@@ -128,32 +130,26 @@ pub struct InternalRunnerTestInfo<'v> {
     /// field works in any rule. A rule that declares named groups but not `DefaultExecGroup` must
     /// set `exec_group` or `default_executor`; `executor_overrides` does not replace them, as the
     /// tests run in the default group whenever no override is picked.
-    exec_group: Option<ValueOf<'v, ExecutionGroupArg>>,
+    exec_group: Option<ValueOf<'v, StarlarkExecutionGroupView<'v>>>,
 
     /// Executors that can be used to override the default executor.
-    executor_overrides: Option<
-        ValueOf<'v, DictType<StringValue<'v>, ValueTyped<'v, StarlarkCommandExecutorConfig>>>,
-    >,
+    executor_overrides: Option<ValueOf<'v, DictType<StarlarkStr, StarlarkCommandExecutorConfig>>>,
 
     /// Mapping from a local resource type to a target with a corresponding provider.
     /// Required types are passed from test runner.
     /// If the value for a corresponding type is omitted it means local resource
     /// should be ignored when executing tests even if those are passed as required from test runner.
-    local_resources: Option<
-        ValueOf<
-            'v,
-            DictType<StringValue<'v>, NoneOr<ValueTyped<'v, StarlarkConfiguredProvidersLabel>>>,
-        >,
-    >,
+    local_resources:
+        Option<ValueOf<'v, DictType<StarlarkStr, NoneOr<StarlarkConfiguredProvidersLabel>>>>,
 
     /// List of local resource types which should be set up additionally to those which are
     /// passed from test runner. Allows specifying local resources on a per-rule basis.
     required_local_resources:
-        Option<ValueOf<'v, ListOrTupleType<ValueTyped<'v, StarlarkRequiredTestLocalResource>>>>,
+        Option<ValueOf<'v, ListOrTupleType<StarlarkRequiredTestLocalResource>>>,
 
     /// Configuration needed to spawn a new worker. This worker will be used to run every single
     /// command related to test execution, including listing.
-    worker: Option<ValueTyped<'v, WorkerInfo<'v>>>,
+    worker: Option<ValueOf<'v, WorkerInfo<'v>>>,
 
     /// A Starlark callable that parses test listing output into structured test
     /// entries. The callback signature is:
@@ -183,7 +179,11 @@ pub struct InternalRunnerTestInfo<'v> {
     /// ```
     parse_test_result: ValueOf<
         'v,
-        StarlarkCallable<'v, (String, String, i32), ListType<DictType<String, Value<'static>>>>,
+        StarlarkCallable<
+            'v,
+            (String, String, IntView<'static>),
+            ListType<DictType<String, Value<'static>>>,
+        >,
     >,
 }
 
@@ -224,11 +224,11 @@ impl<'v> InternalRunnerTestInfo<'v> {
 
     pub fn use_project_relative_paths(&self) -> bool {
         self.use_project_relative_paths
-            .map_or_else(buck2_core::is_open_source, |v| v.unpack())
+            .map_or_else(buck2_core::is_open_source, |v| v.get())
     }
 
     pub fn run_from_project_root(&self) -> bool {
-        self.run_from_project_root.is_none_or(|v| v.unpack())
+        self.run_from_project_root.is_none_or(|v| v.get())
     }
 
     pub fn default_executor(&self) -> Option<&'v StarlarkCommandExecutorConfig> {
@@ -238,7 +238,7 @@ impl<'v> InternalRunnerTestInfo<'v> {
     pub fn execution_group(&self) -> buck2_error::Result<Option<ExecutionGroup>> {
         match self.exec_group {
             None => Ok(None),
-            Some(exec_group) => Ok(Some(exec_group.try_unpack()?.group)),
+            Some(exec_group) => Ok(Some(exec_group.get().expect_bound()?)),
         }
     }
 
@@ -508,7 +508,11 @@ fn internal_runner_test_info_creator(globals: &mut GlobalsBuilder) {
         >,
         parse_test_result: ValueOf<
             'v,
-            StarlarkCallable<'v, (String, String, i32), ListType<DictType<String, Value<'static>>>>,
+            StarlarkCallable<
+                'v,
+                (String, String, IntView<'static>),
+                ListType<DictType<String, Value<'static>>>,
+            >,
         >,
         listing_command: TestCommand<'v>,
         #[starlark(default = NoneOr::None)] command: NoneOr<TestCommand<'v>>,
@@ -518,23 +522,23 @@ fn internal_runner_test_info_creator(globals: &mut GlobalsBuilder) {
         #[starlark(default = NoneOr::None)] use_project_relative_paths: NoneOr<ValueOf<'v, bool>>,
         #[starlark(default = NoneOr::None)] run_from_project_root: NoneOr<ValueOf<'v, bool>>,
         #[starlark(default = NoneOr::None)] default_executor: NoneOr<
-            ValueTyped<'v, StarlarkCommandExecutorConfig>,
+            ValueOf<'v, StarlarkCommandExecutorConfig>,
         >,
         #[starlark(default = NoneOr::None)] executor_overrides: NoneOr<ExecutorOverrides<'v>>,
         #[starlark(default = NoneOr::None)] local_resources: NoneOr<LocalResources<'v>>,
         #[starlark(default = NoneOr::None)] required_local_resources: NoneOr<
             RequiredLocalResources<'v>,
         >,
-        #[starlark(default = NoneOr::None)] worker: NoneOr<ValueTyped<'v, WorkerInfo<'v>>>,
+        #[starlark(default = NoneOr::None)] worker: NoneOr<ValueOf<'v, WorkerInfo<'v>>>,
         #[starlark(require = named, default = NoneOr::None)] exec_group: NoneOr<
-            ValueOf<'v, ExecutionGroupArg>,
+            ValueOf<'v, StarlarkExecutionGroupView<'v>>,
         >,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<InternalRunnerTestInfo<'v>> {
+    ) -> starlark::Result<ValueTyped<'v, InternalRunnerTestInfo<'v>>> {
         let exec_group = exec_group.into_option();
-        let group = exec_group.map(|g| g.try_unpack()).transpose()?;
+        let group = exec_group.map(|g| g.get().expect_bound()).transpose()?;
         let default_executor = default_executor_with_execution_group(
-            group.as_ref().map(|g| &g.group),
+            group.as_ref(),
             default_executor.into_option(),
             eval,
         )?;
@@ -557,6 +561,6 @@ fn internal_runner_test_info_creator(globals: &mut GlobalsBuilder) {
             parse_test_result,
         };
         validate_internal_runner_test_info(&res)?;
-        Ok(res)
+        Ok(eval.heap().alloc_representation(res))
     }
 }

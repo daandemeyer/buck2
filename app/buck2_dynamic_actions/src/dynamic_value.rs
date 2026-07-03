@@ -17,8 +17,6 @@ use starlark::environment::GlobalsBuilder;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
 use starlark::starlark_module;
-use starlark::values::AllocValue;
-use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkPagable;
 use starlark::values::StarlarkValue;
@@ -43,7 +41,7 @@ pub struct StarlarkDynamicValue {
 
 starlark::methods_static!(DYNAMIC_VALUE_METHODS = dynamic_value_methods);
 
-#[starlark_value(type = "DynamicValue", StarlarkTypeRepr, UnpackValue)]
+#[starlark_value(type = "DynamicValue")]
 impl<'v> StarlarkValue<'v> for StarlarkDynamicValue {
     fn write_hash(&self, hasher: &mut StarlarkHasher) -> starlark::Result<()> {
         self.dynamic_value.hash(hasher);
@@ -60,12 +58,6 @@ impl<'v> StarlarkValue<'v> for StarlarkDynamicValue {
     // used for docs of `DynamicValue`
     fn get_methods() -> Option<&'static Methods> {
         Some(DYNAMIC_VALUE_METHODS.methods())
-    }
-}
-
-impl<'v> AllocValue<'v> for StarlarkDynamicValue {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_simple(self)
     }
 }
 

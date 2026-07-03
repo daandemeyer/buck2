@@ -20,20 +20,20 @@ use std::collections::BTreeMap;
 use mini_map::MiniMutInsertionMap;
 
 use crate::collections::SmallMap;
-use crate::typing::Ty;
 use crate::values::AllocFrozenValue;
 use crate::values::AllocValue;
 use crate::values::FrozenHeap;
 use crate::values::Heap;
-use crate::values::Value;
+use crate::values::ValueOf;
 use crate::values::dict::AllocDict;
-use crate::values::type_repr::StarlarkTypeRepr;
 use crate::values::types::dict::dict_type::DictType;
 
 // MiniMutInsertionMap: the map behind `SmallMap`, for callers that name it directly.
 
 impl<'v, K: AllocValue<'v>, V: AllocValue<'v>> AllocValue<'v> for MiniMutInsertionMap<K, V> {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
+    type Type = DictType<K::Type, V::Type>;
+
+    fn alloc_value(self, heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
         AllocDict(self).alloc_value(heap)
     }
 }
@@ -41,23 +41,19 @@ impl<'v, K: AllocValue<'v>, V: AllocValue<'v>> AllocValue<'v> for MiniMutInserti
 impl<'fv, K: AllocFrozenValue<'fv>, V: AllocFrozenValue<'fv>> AllocFrozenValue<'fv>
     for MiniMutInsertionMap<K, V>
 {
-    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> Value<'fv> {
+    type Type = DictType<K::Type, V::Type>;
+
+    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> ValueOf<'fv, Self::Type> {
         AllocDict(self).alloc_frozen_value(heap)
-    }
-}
-
-impl<K: StarlarkTypeRepr, V: StarlarkTypeRepr> StarlarkTypeRepr for MiniMutInsertionMap<K, V> {
-    type Canonical = <DictType<K, V> as StarlarkTypeRepr>::Canonical;
-
-    fn starlark_type_repr() -> Ty {
-        DictType::<K, V>::starlark_type_repr()
     }
 }
 
 // SmallMap
 
 impl<'v, K: AllocValue<'v>, V: AllocValue<'v>> AllocValue<'v> for SmallMap<K, V> {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
+    type Type = DictType<K::Type, V::Type>;
+
+    fn alloc_value(self, heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
         AllocDict(self).alloc_value(heap)
     }
 }
@@ -65,53 +61,44 @@ impl<'v, K: AllocValue<'v>, V: AllocValue<'v>> AllocValue<'v> for SmallMap<K, V>
 impl<'fv, K: AllocFrozenValue<'fv>, V: AllocFrozenValue<'fv>> AllocFrozenValue<'fv>
     for SmallMap<K, V>
 {
-    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> Value<'fv> {
+    type Type = DictType<K::Type, V::Type>;
+
+    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> ValueOf<'fv, Self::Type> {
         AllocDict(self).alloc_frozen_value(heap)
     }
 }
 
-impl<'a, 'v, K: 'a + StarlarkTypeRepr, V: 'a + StarlarkTypeRepr> AllocValue<'v>
-    for &'a SmallMap<K, V>
+impl<'a, 'v, K: 'a, V: 'a> AllocValue<'v> for &'a SmallMap<K, V>
 where
     &'a K: AllocValue<'v>,
     &'a V: AllocValue<'v>,
 {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
+    type Type = DictType<<&'a K as AllocValue<'v>>::Type, <&'a V as AllocValue<'v>>::Type>;
+
+    fn alloc_value(self, heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
         AllocDict(self).alloc_value(heap)
     }
 }
 
-impl<'fv, 'a, K: 'a + StarlarkTypeRepr, V: 'a + StarlarkTypeRepr> AllocFrozenValue<'fv>
-    for &'a SmallMap<K, V>
+impl<'fv, 'a, K: 'a, V: 'a> AllocFrozenValue<'fv> for &'a SmallMap<K, V>
 where
     &'a K: AllocFrozenValue<'fv>,
     &'a V: AllocFrozenValue<'fv>,
 {
-    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> Value<'fv> {
+    type Type =
+        DictType<<&'a K as AllocFrozenValue<'fv>>::Type, <&'a V as AllocFrozenValue<'fv>>::Type>;
+
+    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> ValueOf<'fv, Self::Type> {
         AllocDict(self).alloc_frozen_value(heap)
-    }
-}
-
-impl<'a, K: StarlarkTypeRepr, V: StarlarkTypeRepr> StarlarkTypeRepr for &'a SmallMap<K, V> {
-    type Canonical = <SmallMap<K, V> as StarlarkTypeRepr>::Canonical;
-
-    fn starlark_type_repr() -> Ty {
-        DictType::<K, V>::starlark_type_repr()
-    }
-}
-
-impl<K: StarlarkTypeRepr, V: StarlarkTypeRepr> StarlarkTypeRepr for SmallMap<K, V> {
-    type Canonical = <DictType<K, V> as StarlarkTypeRepr>::Canonical;
-
-    fn starlark_type_repr() -> Ty {
-        DictType::<K, V>::starlark_type_repr()
     }
 }
 
 // BTreeMap
 
 impl<'v, K: AllocValue<'v>, V: AllocValue<'v>> AllocValue<'v> for BTreeMap<K, V> {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
+    type Type = DictType<K::Type, V::Type>;
+
+    fn alloc_value(self, heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
         AllocDict(self).alloc_value(heap)
     }
 }
@@ -119,45 +106,34 @@ impl<'v, K: AllocValue<'v>, V: AllocValue<'v>> AllocValue<'v> for BTreeMap<K, V>
 impl<'fv, K: AllocFrozenValue<'fv>, V: AllocFrozenValue<'fv>> AllocFrozenValue<'fv>
     for BTreeMap<K, V>
 {
-    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> Value<'fv> {
+    type Type = DictType<K::Type, V::Type>;
+
+    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> ValueOf<'fv, Self::Type> {
         AllocDict(self).alloc_frozen_value(heap)
     }
 }
 
-impl<'a, 'v, K: 'a + StarlarkTypeRepr, V: 'a + StarlarkTypeRepr> AllocValue<'v>
-    for &'a BTreeMap<K, V>
+impl<'a, 'v, K: 'a, V: 'a> AllocValue<'v> for &'a BTreeMap<K, V>
 where
     &'a K: AllocValue<'v>,
     &'a V: AllocValue<'v>,
 {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
+    type Type = DictType<<&'a K as AllocValue<'v>>::Type, <&'a V as AllocValue<'v>>::Type>;
+
+    fn alloc_value(self, heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
         AllocDict(self).alloc_value(heap)
     }
 }
 
-impl<'fv, 'a, K: 'a + StarlarkTypeRepr, V: 'a + StarlarkTypeRepr> AllocFrozenValue<'fv>
-    for &'a BTreeMap<K, V>
+impl<'fv, 'a, K: 'a, V: 'a> AllocFrozenValue<'fv> for &'a BTreeMap<K, V>
 where
     &'a K: AllocFrozenValue<'fv>,
     &'a V: AllocFrozenValue<'fv>,
 {
-    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> Value<'fv> {
+    type Type =
+        DictType<<&'a K as AllocFrozenValue<'fv>>::Type, <&'a V as AllocFrozenValue<'fv>>::Type>;
+
+    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> ValueOf<'fv, Self::Type> {
         AllocDict(self).alloc_frozen_value(heap)
-    }
-}
-
-impl<'a, K: StarlarkTypeRepr, V: StarlarkTypeRepr> StarlarkTypeRepr for &'a BTreeMap<K, V> {
-    type Canonical = <BTreeMap<K, V> as StarlarkTypeRepr>::Canonical;
-
-    fn starlark_type_repr() -> Ty {
-        DictType::<K, V>::starlark_type_repr()
-    }
-}
-
-impl<K: StarlarkTypeRepr, V: StarlarkTypeRepr> StarlarkTypeRepr for BTreeMap<K, V> {
-    type Canonical = <DictType<K, V> as StarlarkTypeRepr>::Canonical;
-
-    fn starlark_type_repr() -> Ty {
-        DictType::<K, V>::starlark_type_repr()
     }
 }

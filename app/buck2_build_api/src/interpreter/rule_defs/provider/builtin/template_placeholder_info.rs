@@ -17,15 +17,19 @@ use either::Either;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::values::Freeze;
+use starlark::values::Heap;
 use starlark::values::StarlarkPagable;
 use starlark::values::StringValue;
 use starlark::values::Trace;
 use starlark::values::Value;
 use starlark::values::ValueOf;
+use starlark::values::ValueTyped;
 use starlark::values::dict::DictType;
+use starlark::values::string::StarlarkStr;
 
 use crate as buck2_build_api;
 use crate::interpreter::rule_defs::cmd_args::value::CommandLineArg;
+use crate::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
 
 /// A provider that is used for expansions in string attribute templates
 ///
@@ -61,24 +65,24 @@ use crate::interpreter::rule_defs::cmd_args::value::CommandLineArg;
 )]
 #[repr(C)]
 pub struct TemplatePlaceholderInfo<'v> {
-    unkeyed_variables: ValueOf<'v, DictType<StringValue<'v>, CommandLineArg<'v>>>,
+    unkeyed_variables: ValueOf<'v, DictType<StarlarkStr, ValueAsCommandLineLike<'v>>>,
     keyed_variables: ValueOf<
         'v,
         DictType<
-            StringValue<'v>,
-            Either<CommandLineArg<'v>, DictType<StringValue<'v>, CommandLineArg<'v>>>,
+            StarlarkStr,
+            Either<ValueAsCommandLineLike<'v>, DictType<StarlarkStr, ValueAsCommandLineLike<'v>>>,
         >,
     >,
 }
 
 fn collect_variables<'v>(
-    variables: ValueOf<'v, DictType<StringValue<'v>, CommandLineArg<'v>>>,
+    variables: ValueOf<'v, DictType<StarlarkStr, ValueAsCommandLineLike<'v>>>,
 ) -> buck2_error::Result<BuckMutInsertionMap<StringValue<'v>, CommandLineArg<'v>>> {
     variables
         .iter()
         .map(|entry| {
             let (k, v) = entry?;
-            Ok((k.unpack(), v.unpack()))
+            Ok((k.get(), v))
         })
         .collect()
 }
@@ -103,10 +107,10 @@ impl<'v> TemplatePlaceholderInfo<'v> {
             .map(|entry| {
                 let (k, v) = entry?;
                 let v = match v.split()? {
-                    Either::Left(arg) => Either::Left(arg.unpack()),
+                    Either::Left(arg) => Either::Left(arg),
                     Either::Right(dict) => Either::Right(collect_variables(dict)?),
                 };
-                Ok((k.unpack(), v))
+                Ok((k.get(), v))
             })
             .collect()
     }
@@ -117,19 +121,23 @@ fn template_placeholder_info_creator(builder: &mut GlobalsBuilder) {
     #[starlark(as_type = TemplatePlaceholderInfo<'static>)]
     fn TemplatePlaceholderInfo<'v>(
         #[starlark(default = ValueOf::new_unchecked(Value::new_empty_dict()))]
-        unkeyed_variables: ValueOf<'v, DictType<StringValue<'v>, CommandLineArg<'v>>>,
+        unkeyed_variables: ValueOf<'v, DictType<StarlarkStr, ValueAsCommandLineLike<'v>>>,
         #[starlark(default = ValueOf::new_unchecked(Value::new_empty_dict()))]
         keyed_variables: ValueOf<
             'v,
             DictType<
-                StringValue<'v>,
-                Either<CommandLineArg<'v>, DictType<StringValue<'v>, CommandLineArg<'v>>>,
+                StarlarkStr,
+                Either<
+                    ValueAsCommandLineLike<'v>,
+                    DictType<StarlarkStr, ValueAsCommandLineLike<'v>>,
+                >,
             >,
         >,
-    ) -> starlark::Result<TemplatePlaceholderInfo<'v>> {
-        Ok(TemplatePlaceholderInfo {
+        heap: Heap<'v>,
+    ) -> starlark::Result<ValueTyped<'v, TemplatePlaceholderInfo<'v>>> {
+        Ok(heap.alloc_representation(TemplatePlaceholderInfo {
             unkeyed_variables,
             keyed_variables,
-        })
+        }))
     }
 }

@@ -20,7 +20,7 @@ use buck2_core::execution_types::execution_group::NamedExecutionGroup;
 use buck2_core::plugins::PluginKind;
 use buck2_error::BuckErrorOptionContext;
 use buck2_hash::BuckMutInsertionMap;
-use buck2_interpreter::execution_group::ExecutionGroupArg;
+use buck2_interpreter::execution_group::StarlarkExecutionGroupView;
 use buck2_interpreter::late_binding_ty::AnalysisContextReprLate;
 use buck2_interpreter::late_binding_ty::ProviderReprLate;
 use buck2_interpreter::starlark_promise::StarlarkPromise;
@@ -54,12 +54,10 @@ use starlark::eval::ParametersSpec;
 use starlark::starlark_module;
 use starlark::typing::ParamSpec;
 use starlark::typing::Ty;
-use starlark::values::AllocValue;
 use starlark::values::Freeze;
 use starlark::values::FreezeError;
 use starlark::values::FreezeResult;
 use starlark::values::Freezer;
-use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkPagable;
 use starlark::values::StarlarkRepresentations;
@@ -74,6 +72,7 @@ use starlark::values::dict::DictType;
 use starlark::values::list::ListType;
 use starlark::values::list_or_tuple::ListOrTupleType;
 use starlark::values::starlark_value;
+use starlark::values::string::StarlarkStr;
 use starlark::values::typing::StarlarkCallable;
 use starlark::values::typing::StarlarkCallableChecked;
 
@@ -86,7 +85,7 @@ use crate::interpreter::extra_value::InterpreterExtraValue;
 use crate::interpreter::module_internals::ModuleInternals;
 use crate::nodes::attr_spec::AttributeSpecExt;
 use crate::nodes::unconfigured::UnsealedTargetNodeExt;
-use crate::plugins::PluginKindArg;
+use crate::plugins::StarlarkPluginKindView;
 
 pub static NAME_ATTRIBUTE_FIELD: &str = "name";
 
@@ -243,16 +242,10 @@ enum RuleError {
     },
 }
 
-impl<'v> AllocValue<'v> for StarlarkRuleCallable<'v> {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_complex(self)
-    }
-}
-
 impl<'v> StarlarkRuleCallable<'v> {
     fn new(
         implementation: RuleImpl<'v>,
-        attrs: ValueOf<'v, DictType<&'v str, &'v StarlarkAttribute>>,
+        attrs: ValueOf<'v, DictType<&'v str, StarlarkAttribute>>,
         cfg: Option<ValueAsTransition>,
         supports_incoming_transition: Option<bool>,
         doc: &str,
@@ -281,7 +274,13 @@ impl<'v> StarlarkRuleCallable<'v> {
             ),
         };
 
-        let attrs = attrs.try_items().collect::<starlark::Result<Vec<_>>>()?;
+        let attrs = attrs
+            .iter()
+            .map(|entry| {
+                let (name, attr) = entry?;
+                Ok((name.get(), attr))
+            })
+            .collect::<starlark::Result<Vec<_>>>()?;
 
         let tool_marks: Vec<(String, ToolMarks)> = attrs
             .iter()
@@ -381,12 +380,12 @@ impl<'v> StarlarkRuleCallable<'v> {
 
     fn new_anon_impl(
         implementation: RuleImpl<'v>,
-        attrs: ValueOf<'v, DictType<&'v str, &'v StarlarkAttribute>>,
+        attrs: ValueOf<'v, DictType<&'v str, StarlarkAttribute>>,
         doc: &str,
         artifact_promise_mappings: ValueOf<
             'v,
             DictType<
-                StringValue<'v>,
+                StarlarkStr,
                 StarlarkCallable<'v, (Value<'static>,), ListType<Value<'static>>>,
             >,
         >,
@@ -404,10 +403,10 @@ impl<'v> StarlarkRuleCallable<'v> {
             Vec::new(),
             Some(ArtifactPromiseMappings {
                 mappings: artifact_promise_mappings
-                    .try_items()
+                    .iter()
                     .map(|entry| {
                         let (k, v) = entry?;
-                        Ok::<_, starlark::Error>((k, v.0))
+                        Ok::<_, starlark::Error>((k.get(), v.get().0))
                     })
                     .collect::<starlark::Result<BuckMutInsertionMap<_, _>>>()?,
             }),
@@ -417,12 +416,12 @@ impl<'v> StarlarkRuleCallable<'v> {
 
     fn new_anon(
         implementation: StarlarkCallable<'v, (Value<'static>,), ListType<Value<'static>>>,
-        attrs: ValueOf<'v, DictType<&'v str, &'v StarlarkAttribute>>,
+        attrs: ValueOf<'v, DictType<&'v str, StarlarkAttribute>>,
         doc: &str,
         artifact_promise_mappings: ValueOf<
             'v,
             DictType<
-                StringValue<'v>,
+                StarlarkStr,
                 StarlarkCallable<'v, (Value<'static>,), ListType<Value<'static>>>,
             >,
         >,
@@ -443,12 +442,12 @@ impl<'v> StarlarkRuleCallable<'v> {
             (Value<'static>, Value<'static>),
             ListType<Value<'static>>,
         >,
-        attrs: ValueOf<'v, DictType<&'v str, &'v StarlarkAttribute>>,
+        attrs: ValueOf<'v, DictType<&'v str, StarlarkAttribute>>,
         doc: &str,
         artifact_promise_mappings: ValueOf<
             'v,
             DictType<
-                StringValue<'v>,
+                StarlarkStr,
                 StarlarkCallable<'v, (Value<'static>,), ListType<Value<'static>>>,
             >,
         >,
@@ -1037,9 +1036,9 @@ pub fn register_rule_function(builder: &mut GlobalsBuilder) {
         #[starlark(require = named)] r#impl: StarlarkCallableChecked<
             'v,
             (AnalysisContextReprLate,),
-            Either<ListType<ProviderReprLate>, StarlarkPromise>,
+            Either<ListType<ProviderReprLate>, StarlarkPromise<'static>>,
         >,
-        #[starlark(require = named)] attrs: ValueOf<'v, DictType<&'v str, &'v StarlarkAttribute>>,
+        #[starlark(require = named)] attrs: ValueOf<'v, DictType<&'v str, StarlarkAttribute>>,
         #[starlark(require = named)] cfg: Option<ValueAsTransition<'v>>,
         #[starlark(require = named)] supports_incoming_transition: Option<bool>,
         #[starlark(require = named, default = "")] doc: &str,
@@ -1047,15 +1046,15 @@ pub fn register_rule_function(builder: &mut GlobalsBuilder) {
         #[starlark(require = named, default = false)] is_toolchain_rule: bool,
         #[starlark(require = named, default = ValueOf::empty_list())] uses_plugins: ValueOf<
             'v,
-            ListOrTupleType<PluginKindArg>,
+            ListOrTupleType<StarlarkPluginKindView<'v>>,
         >,
         #[starlark(require = named, default = ValueOf::empty_list())] exec_groups: ValueOf<
             'v,
-            ListOrTupleType<ExecutionGroupArg>,
+            ListOrTupleType<StarlarkExecutionGroupView<'v>>,
         >,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<StarlarkRuleCallable<'v>> {
-        Ok(StarlarkRuleCallable::new(
+    ) -> starlark::Result<ValueTyped<'v, StarlarkRuleCallable<'v>>> {
+        let rule = StarlarkRuleCallable::new(
             RuleImpl::BuildRule(StarlarkCallable::unchecked_new(r#impl.0)),
             attrs,
             cfg,
@@ -1065,15 +1064,16 @@ pub fn register_rule_function(builder: &mut GlobalsBuilder) {
             is_toolchain_rule,
             uses_plugins
                 .try_items()
-                .map(|arg| arg.map(|PluginKindArg { plugin_kind }| plugin_kind))
+                .map(|arg| Ok(arg?.expect_bound()?))
                 .collect::<starlark::Result<_>>()?,
             exec_groups
                 .try_items()
-                .map(|arg| arg.map(|ExecutionGroupArg { group }| group))
+                .map(|arg| Ok(arg?.expect_bound()?))
                 .collect::<starlark::Result<_>>()?,
             None,
             eval,
-        )?)
+        )?;
+        Ok(eval.heap().alloc_representation(rule))
     }
 
     /// Define an anon rule, similar to how a normal rule is defined, except with an extra `artifact_promise_mappings` field. This
@@ -1085,18 +1085,19 @@ pub fn register_rule_function(builder: &mut GlobalsBuilder) {
             (Value<'static>,),
             ListType<Value<'static>>,
         >,
-        #[starlark(require = named)] attrs: ValueOf<'v, DictType<&'v str, &'v StarlarkAttribute>>,
+        #[starlark(require = named)] attrs: ValueOf<'v, DictType<&'v str, StarlarkAttribute>>,
         #[starlark(require = named, default = "")] doc: &str,
         #[starlark(require = named)] artifact_promise_mappings: ValueOf<
             'v,
             DictType<
-                StringValue<'v>,
+                StarlarkStr,
                 StarlarkCallable<'v, (Value<'static>,), ListType<Value<'static>>>,
             >,
         >,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<StarlarkRuleCallable<'v>> {
-        StarlarkRuleCallable::new_anon(r#impl, attrs, doc, artifact_promise_mappings, eval)
-            .map_err(Into::into)
+    ) -> starlark::Result<ValueTyped<'v, StarlarkRuleCallable<'v>>> {
+        let rule =
+            StarlarkRuleCallable::new_anon(r#impl, attrs, doc, artifact_promise_mappings, eval)?;
+        Ok(eval.heap().alloc_representation(rule))
     }
 }

@@ -17,6 +17,7 @@ use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::values::Freeze;
 use starlark::values::FreezeError;
+use starlark::values::Heap;
 use starlark::values::OwnedFrozen;
 use starlark::values::StarlarkPagable;
 use starlark::values::Trace;
@@ -90,13 +91,13 @@ pub struct ValidationInfo<'v> {
     /// See the [Validations guide](https://buck2.build/docs/rule_authors/validation/)
     /// for how to declare validations end-to-end and write the validator
     /// action that produces each spec's `validation_result`.
-    validations: ValueOf<'v, ListType<ValueTyped<'v, StarlarkValidationSpec<'v>>>>,
+    validations: ValueOf<'v, ListType<StarlarkValidationSpec<'v>>>,
 }
 
 fn validate_validation_info<'v>(info: &ValidationInfo<'v>) -> buck2_error::Result<()> {
     let mut spec_names = BuckMutSet::default();
     for spec in info.validations.iter() {
-        let name = spec?.unpack().as_ref().name();
+        let name = spec?.as_ref().name();
         if !spec_names.insert(name) {
             return Err(ValidationInfoError::SpecsWithDuplicateName(name.to_owned()).into());
         }
@@ -111,14 +112,12 @@ fn validate_validation_info<'v>(info: &ValidationInfo<'v>) -> buck2_error::Resul
 fn validation_info_creator(globals: &mut GlobalsBuilder) {
     #[starlark(as_type = ValidationInfo<'static>)]
     fn ValidationInfo<'v>(
-        #[starlark(require = named)] validations: ValueOf<
-            'v,
-            ListType<ValueTyped<'v, StarlarkValidationSpec<'v>>>,
-        >,
-    ) -> starlark::Result<ValidationInfo<'v>> {
+        #[starlark(require = named)] validations: ValueOf<'v, ListType<StarlarkValidationSpec<'v>>>,
+        heap: Heap<'v>,
+    ) -> starlark::Result<ValueTyped<'v, ValidationInfo<'v>>> {
         let result = ValidationInfo { validations };
         validate_validation_info(&result)?;
-        Ok(result)
+        Ok(heap.alloc_representation(result))
     }
 }
 
@@ -129,8 +128,6 @@ impl<'v> ValidationInfo<'v> {
     pub fn validations(
         &self,
     ) -> impl Iterator<Item = buck2_error::Result<&'v StarlarkValidationSpec<'v>>> + 'v {
-        self.validations
-            .iter()
-            .map(|spec| Ok(spec?.unpack().as_ref()))
+        self.validations.iter().map(|spec| Ok(spec?.as_ref()))
     }
 }

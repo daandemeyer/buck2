@@ -47,9 +47,8 @@ use crate::values::AllocFrozenValue;
 use crate::values::AllocValue;
 use crate::values::FrozenHeap;
 use crate::values::StarlarkValue;
-use crate::values::Value;
+use crate::values::ValueOf;
 use crate::values::starlark_value;
-use crate::values::type_repr::StarlarkTypeRepr;
 
 #[derive(
     Debug,
@@ -92,24 +91,20 @@ See also [`typing.Never` in the Python documentation][1].
 static_starlark_value!(NEVER: TypingNever = TypingNever);
 
 impl<'fv> AllocFrozenValue<'fv> for TypingNever {
-    fn alloc_frozen_value(self, _heap: FrozenHeap<'fv>) -> Value<'fv> {
-        NEVER.at().to_value()
+    type Type = Self;
+
+    fn alloc_frozen_value(self, _heap: FrozenHeap<'fv>) -> ValueOf<'fv, Self::Type> {
+        NEVER.at().into()
     }
 }
 
 /// Never type, can be used as native function return type.
 pub enum StarlarkNever {}
 
-impl StarlarkTypeRepr for StarlarkNever {
-    type Canonical = Self;
-
-    fn starlark_type_repr() -> Ty {
-        Ty::never()
-    }
-}
-
 impl<'v> AllocValue<'v> for StarlarkNever {
-    fn alloc_value(self, _heap: crate::values::Heap<'v>) -> crate::values::Value<'v> {
+    type Type = Self;
+
+    fn alloc_value(self, _heap: crate::values::Heap<'v>) -> ValueOf<'v, Self::Type> {
         match self {}
     }
 }

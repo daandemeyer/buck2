@@ -106,15 +106,15 @@ fn coerce_inner<'v>(
 
         match *selector {
             StarlarkSelector::Primary(v) => {
-                let has_default = v.get_str("DEFAULT")?.is_some();
+                let has_default = v.lookup_str("DEFAULT")?.is_some();
                 let mut entries =
                     Vec::with_capacity(v.dict().len().saturating_sub(has_default as usize));
 
                 let mut default = None;
                 for entry in v.iter() {
                     let (k, v) = entry?;
-                    let k = k.unpack().as_str();
-                    let v = v.unpack();
+                    let k = k.get().as_str();
+                    let v = v.get();
                     let v = match default_attr {
                         Some(default_attr) if v.is_none() => {
                             ctx.attr_arena().encode_view(default_attr)?

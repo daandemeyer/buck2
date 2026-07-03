@@ -19,12 +19,13 @@ use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::values::Freeze;
 use starlark::values::FreezeError;
+use starlark::values::Heap;
 use starlark::values::StarlarkPagable;
-use starlark::values::StringValue;
 use starlark::values::Trace;
 use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
 use starlark::values::dict::DictType;
+use starlark::values::string::StarlarkStr;
 
 use crate as buck2_build_api;
 use crate::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactView;
@@ -52,9 +53,9 @@ enum InstallInfoProviderErrors {
 #[freeze(validator = validate_install_info)]
 pub struct InstallInfo<'v> {
     // Label for the installer
-    installer: ValueTyped<'v, StarlarkConfiguredProvidersLabel>,
+    installer: ValueOf<'v, StarlarkConfiguredProvidersLabel>,
     // list of files that need to be installed
-    files: ValueOf<'v, DictType<StringValue<'v>, StarlarkArtifactView<'v>>>,
+    files: ValueOf<'v, DictType<StarlarkStr, StarlarkArtifactView<'v>>>,
 }
 
 impl<'v> InstallInfo<'v> {
@@ -67,7 +68,7 @@ impl<'v> InstallInfo<'v> {
     ) -> impl Iterator<Item = buck2_error::Result<(&'v str, StarlarkArtifactView<'v>)>> + 'v {
         self.files.iter().map(|entry| {
             let (k, v) = entry?;
-            Ok((k.unpack().as_str(), v.unpack()))
+            Ok((k.get().as_str(), v.get()))
         })
     }
 
@@ -89,12 +90,13 @@ impl<'v> InstallInfo<'v> {
 #[starlark_module]
 fn install_info_creator(globals: &mut GlobalsBuilder) {
     fn InstallInfo<'v>(
-        installer: ValueTyped<'v, StarlarkConfiguredProvidersLabel>,
-        files: ValueOf<'v, DictType<StringValue<'v>, StarlarkArtifactView<'v>>>,
-    ) -> starlark::Result<InstallInfo<'v>> {
+        installer: ValueOf<'v, StarlarkConfiguredProvidersLabel>,
+        files: ValueOf<'v, DictType<StarlarkStr, StarlarkArtifactView<'v>>>,
+        heap: Heap<'v>,
+    ) -> starlark::Result<ValueTyped<'v, InstallInfo<'v>>> {
         let info = InstallInfo { installer, files };
         validate_install_info(&info)?;
-        Ok(info)
+        Ok(heap.alloc_representation(info))
     }
 }
 

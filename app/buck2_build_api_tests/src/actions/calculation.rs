@@ -257,6 +257,7 @@ async fn make_default_dice_state(
         use_case: RemoteExecutorUseCase::buck2_default(),
         cas_configured: false,
         may_probe_cas: false,
+        skip_cache_read: false,
     });
     extra.set_http_client(HttpClientBuilder::https_with_system_roots().await?.build());
     extra.set_dep_file_cache(create_dep_file_cache());
@@ -484,6 +485,7 @@ async fn dice_with_test_file_ops(file_ops: &TestFileOps) -> buck2_error::Result<
         .await
         .unwrap();
     dice.set_cell_resolver(cells)?;
+    dice.set_buck_out_path(None)?;
     dice.set_file_system_baseline(FileSystemBaseline::unique())?;
     Ok(dice.commit().await)
 }

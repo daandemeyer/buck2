@@ -109,7 +109,7 @@ use crate::values::layout::vtable::StarlarkValueRawPtr;
 /// )]
 /// struct One<'v>(Value<'v>);
 ///
-/// #[starlark_value(type = "one")]
+/// #[starlark_value(type = "one", frozen_vtable)]
 /// impl<'v> StarlarkValue<'v> for One<'v> {}
 ///
 /// impl<'v> Freeze<'v> for One<'v> {
@@ -228,6 +228,20 @@ pub trait StarlarkType<'v>: 'v + ProvidesStaticType<'v> + Debug + Display + Size
     fn get_type_value_static() -> StringValue<'static> {
         panic!("This function is implemented by #[starlark_value] proc macro")
     }
+
+    /// What a value of this type is read through: `ValueTyped<'v, Self>` for a type with one
+    /// representation, the view itself for a type with several.
+    ///
+    /// This can be only implemented by the [`#[starlark_value]`](crate::values::starlark_value)
+    /// proc macro.
+    type Get;
+
+    /// `value` as this type's [`Get`](Self::Get), if it is of this type.
+    ///
+    /// This can be only implemented by the [`#[starlark_value]`](crate::values::starlark_value)
+    /// proc macro.
+    #[starlark_internal_vtable(skip)]
+    fn get(value: Value<'v>) -> Option<Self::Get>;
 
     /// The type as a user would write it in a type annotation. This often will be the same as
     /// [`Self::TYPE`], but in some instances it might be slightly different than what is

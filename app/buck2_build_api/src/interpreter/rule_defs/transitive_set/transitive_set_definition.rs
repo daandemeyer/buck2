@@ -33,7 +33,6 @@ use starlark::typing::Ty;
 use starlark::typing::TyStarlarkValue;
 use starlark::typing::TyUser;
 use starlark::typing::TyUserParams;
-use starlark::values::AllocValue;
 use starlark::values::Freeze;
 use starlark::values::FreezeError;
 use starlark::values::FreezeResult;
@@ -104,14 +103,15 @@ impl TransitiveSetProjectionKind {
     }
 }
 
-/// A projection: `def(value) -> cmd_args | json`.
-pub type ProjectionCallable<'v> =
-    ValueOf<'v, StarlarkCallableChecked<'v, (Value<'static>,), Value<'static>>>;
-/// A reduction: `def(children, value) -> value`.
-pub type ReductionCallable<'v> = ValueOf<
-    'v,
-    StarlarkCallableChecked<'v, (ListType<Value<'static>>, Value<'static>), Value<'static>>,
->;
+/// The type of a projection: `def(value) -> cmd_args | json`.
+pub type Projection<'v> = StarlarkCallableChecked<'v, (Value<'static>,), Value<'static>>;
+/// A projection, checked.
+pub type ProjectionCallable<'v> = ValueOf<'v, Projection<'v>>;
+/// The type of a reduction: `def(children, value) -> value`.
+pub type Reduction<'v> =
+    StarlarkCallableChecked<'v, (ListType<Value<'static>>, Value<'static>), Value<'static>>;
+/// A reduction, checked.
+pub type ReductionCallable<'v> = ValueOf<'v, Reduction<'v>>;
 
 #[derive(Debug, Clone, Trace, Freeze, Allocative, StarlarkPagable)]
 pub struct TransitiveSetProjectionSpec<'v> {
@@ -235,12 +235,6 @@ impl<'v> TransitiveSetDefinition<'v> {
 
     pub fn has_id(&self) -> bool {
         self.exported.get().is_some()
-    }
-}
-
-impl<'v> AllocValue<'v> for TransitiveSetDefinition<'v> {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_complex(self)
     }
 }
 
@@ -455,23 +449,23 @@ impl<'v> TransitiveSetDefinitionLike<'v> for FrozenTransitiveSetDefinition<'v> {
 pub fn register_transitive_set(builder: &mut GlobalsBuilder) {
     fn transitive_set<'v>(
         #[starlark(require = named)] args_projections: Option<
-            ValueOf<'v, DictType<String, ProjectionCallable<'v>>>,
+            ValueOf<'v, DictType<String, Projection<'v>>>,
         >,
         #[starlark(require = named)] json_projections: Option<
-            ValueOf<'v, DictType<String, ProjectionCallable<'v>>>,
+            ValueOf<'v, DictType<String, Projection<'v>>>,
         >,
         #[starlark(require = named)] reductions: Option<
-            ValueOf<'v, DictType<String, ReductionCallable<'v>>>,
+            ValueOf<'v, DictType<String, Reduction<'v>>>,
         >,
-        eval: &mut Evaluator,
-    ) -> starlark::Result<TransitiveSetDefinition<'v>> {
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<ValueTyped<'v, TransitiveSetDefinition<'v>>> {
         let projections: BuckMutInsertionMap<_, _> = args_projections
             .into_iter()
-            .flat_map(|v| v.try_items())
+            .flat_map(|v| v.iter())
             .map(|entry| {
                 let (k, v) = entry?;
                 Ok::<_, starlark::Error>((
-                    k,
+                    k.get(),
                     TransitiveSetProjectionSpec {
                         kind: TransitiveSetProjectionKind::Args,
                         projection: v,
@@ -481,11 +475,11 @@ pub fn register_transitive_set(builder: &mut GlobalsBuilder) {
             .chain(
                 json_projections
                     .into_iter()
-                    .flat_map(|v| v.try_items())
+                    .flat_map(|v| v.iter())
                     .map(|entry| {
                         let (k, v) = entry?;
                         Ok::<_, starlark::Error>((
-                            k,
+                            k.get(),
                             TransitiveSetProjectionSpec {
                                 kind: TransitiveSetProjectionKind::Json,
                                 projection: v,
@@ -496,25 +490,33 @@ pub fn register_transitive_set(builder: &mut GlobalsBuilder) {
             .collect::<starlark::Result<_>>()?;
 
         let reductions = match reductions {
-            Some(reductions) => reductions.try_items().collect::<starlark::Result<_>>()?,
+            Some(reductions) => reductions
+                .iter()
+                .map(|entry| {
+                    let (k, v) = entry?;
+                    Ok::<_, starlark::Error>((k.get(), v))
+                })
+                .collect::<starlark::Result<_>>()?,
             None => BuckMutInsertionMap::new(),
         };
 
         let starlark_path: StarlarkPath = starlark_path_from_build_context(eval)?;
-        Ok(TransitiveSetDefinition::new(
-            match starlark_path {
-                StarlarkPath::LoadFile(import_path) => import_path.clone(),
-                _ => {
-                    return Err(buck2_error::Error::from(
-                        TransitiveSetDefinitionError::TransitiveSetOnlyInBzl,
-                    )
-                    .into());
-                }
-            },
-            TransitiveSetOperations {
-                projections,
-                reductions,
-            },
-        ))
+        Ok(eval
+            .heap()
+            .alloc_representation(TransitiveSetDefinition::new(
+                match starlark_path {
+                    StarlarkPath::LoadFile(import_path) => import_path.clone(),
+                    _ => {
+                        return Err(buck2_error::Error::from(
+                            TransitiveSetDefinitionError::TransitiveSetOnlyInBzl,
+                        )
+                        .into());
+                    }
+                },
+                TransitiveSetOperations {
+                    projections,
+                    reductions,
+                },
+            )))
     }
 }

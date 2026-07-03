@@ -21,6 +21,7 @@ use std::fmt::Write;
 use allocative::Allocative;
 use anyhow::Context;
 use derive_more::Display;
+use either::Either;
 use starlark_derive::StarlarkPagable;
 use starlark_derive::StarlarkRepresentations;
 use starlark_derive::starlark_module;
@@ -57,6 +58,8 @@ use crate::values::dict::DictType;
 use crate::values::layout::heap::name::StarlarkTestHeapName;
 use crate::values::list_or_tuple::ListOrTupleType;
 use crate::values::none::NoneType;
+use crate::values::type_expr::StarlarkTypeExpr;
+use crate::values::types::int::view::IntView;
 
 #[test]
 fn alias_test() {
@@ -309,17 +312,21 @@ fn test_radd() {
     starlark_simple_value!(Select);
 
     impl<'v> UnpackValue<'v> for Select {
+        type Type = Either<Select, ListOrTupleType<IntView<'v>>>;
         type Error = crate::Error;
 
-        fn unpack_value_impl(value: Value<'v>) -> crate::Result<Option<Self>> {
-            match Select::from_value(value) {
-                Some(x) => Ok(Some(x.clone())),
-                None => {
-                    let Some(list_or_tuple) = ValueOf::<ListOrTupleType<i32>>::new(value) else {
-                        return Ok(None);
-                    };
-                    Ok(Some(Select(list_or_tuple.try_to_vec()?)))
-                }
+        fn unpack(
+            value: ValueOf<'v, Self::Type>,
+            get: <Self::Type as StarlarkTypeExpr<'v>>::Get,
+        ) -> crate::Result<Self> {
+            match get {
+                Either::Left(x) => Ok(x.as_ref().clone()),
+                Either::Right(_) => Ok(Select(
+                    ValueOf::<ListOrTupleType<IntView>>::new_unchecked(value.to_value())
+                        .try_items()
+                        .map(|x| x?.to_integer())
+                        .collect::<crate::Result<_>>()?,
+                )),
             }
         }
     }
@@ -335,11 +342,13 @@ fn test_radd() {
     impl<'v> StarlarkValue<'v> for Select {
         fn radd(&self, lhs: Value<'v>, heap: Heap<'v>) -> Option<crate::Result<Value<'v>>> {
             let lhs: Select = Select::unpack_value(lhs).unwrap().unwrap();
-            Some(Ok(heap.alloc(lhs.add(self))))
+            Some(Ok(heap.alloc_representation(lhs.add(self)).to_value()))
         }
         fn add(&self, rhs: Value<'v>, heap: Heap<'v>) -> Option<crate::Result<Value<'v>>> {
             let rhs: Select = UnpackValue::unpack_value(rhs).unwrap().unwrap();
-            Some(Ok(heap.alloc(self.clone().add(&rhs))))
+            Some(Ok(heap
+                .alloc_representation(self.clone().add(&rhs))
+                .to_value()))
         }
         fn collect_repr(&self, collector: &mut String) {
             write!(collector, "{self}").unwrap()
@@ -348,8 +357,17 @@ fn test_radd() {
 
     #[starlark_module]
     fn module(build: &mut GlobalsBuilder) {
-        fn select<'v>(xs: ValueOf<'v, ListOrTupleType<i32>>) -> anyhow::Result<Select> {
-            Ok(Select(xs.try_to_vec().map_err(|e| e.into_anyhow())?))
+        fn select<'v>(
+            xs: ValueOf<'v, ListOrTupleType<IntView<'v>>>,
+            heap: Heap<'v>,
+        ) -> anyhow::Result<ValueOf<'v, Select>> {
+            let select = Select(
+                xs.try_items()
+                    .map(|x| i32::unpack_value_err(x?.to_value()))
+                    .collect::<crate::Result<_>>()
+                    .map_err(|e| e.into_anyhow())?,
+            );
+            Ok(ValueOf::alloc(heap, select))
         }
     }
 

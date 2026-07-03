@@ -37,7 +37,6 @@ use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
 use starlark::eval::Arguments;
 use starlark::static_starlark_value;
-use starlark::typing::Ty;
 use starlark::values::AllocValue;
 use starlark::values::Demand;
 use starlark::values::Freeze;
@@ -58,11 +57,10 @@ use starlark::values::Value;
 use starlark::values::ValueError;
 use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
-use starlark::values::list::ListRef;
 use starlark::values::list::ListType;
 use starlark::values::starlark_value;
+use starlark::values::string::StarlarkStr;
 use starlark::values::tuple::TupleType;
-use starlark::values::type_repr::StarlarkTypeRepr;
 
 use crate::artifact_groups::ArtifactGroup;
 use crate::interpreter::rule_defs::artifact::associated::AssociatedArtifacts;
@@ -187,9 +185,24 @@ impl<'v, F: Fields<'v>> Serialize for FieldsRef<'v, F> {
         /// by routing through this struct.
         #[derive(Serialize)]
         struct Mirror<'v, 'a> {
+            #[serde(serialize_with = "serialize_args_as_display")]
             items: &'a [CommandLineArg<'v>],
+            #[serde(serialize_with = "serialize_args_as_display")]
             hidden: &'a [CommandLineArg<'v>],
             options: Option<CommandLineOptionsRef<'v, 'a>>,
+        }
+
+        fn serialize_args_as_display<S: Serializer>(
+            args: &&[CommandLineArg<'_>],
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            struct AsDisplay<'a, 'v>(&'a CommandLineArg<'v>);
+            impl Serialize for AsDisplay<'_, '_> {
+                fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                    serializer.collect_str(self.0)
+                }
+            }
+            serializer.collect_seq(args.iter().map(AsDisplay))
         }
 
         Mirror {
@@ -270,14 +283,14 @@ impl<'v, F: Fields<'v>> FieldsRef<'v, F> {
 
 impl<'v, F: Fields<'v>> CommandLineArgLike<'v> for FieldsRef<'v, F> {
     fn register_me(&self) {
-        command_line_arg_like_impl!(StarlarkCmdArgs::starlark_type_repr());
+        command_line_arg_like_impl!(StarlarkCmdArgs::get_type_starlark_repr());
     }
 
     fn add_to_command_line(&self, fmt: &mut CommandLineBuilder<'v, '_>) -> buck2_error::Result<()> {
         match self.0.options() {
             None => {
                 for item in self.0.items() {
-                    item.as_command_line_arg().add_to_command_line(fmt)?;
+                    item.get().0.add_to_command_line(fmt)?;
                 }
                 Ok(())
             }
@@ -287,7 +300,7 @@ impl<'v, F: Fields<'v>> CommandLineArgLike<'v> for FieldsRef<'v, F> {
                     fmt.push_scope(&options)?;
                 }
                 for item in self.0.items() {
-                    item.as_command_line_arg().add_to_command_line(fmt)?;
+                    item.get().0.add_to_command_line(fmt)?;
                 }
                 if options.changes_builder() {
                     fmt.pop_scope();
@@ -307,7 +320,7 @@ impl<'v, F: Fields<'v>> CommandLineArgLike<'v> for FieldsRef<'v, F> {
         ) -> buck2_error::Result<()> {
             for item in items {
                 visitor.push_frame()?;
-                item.as_command_line_arg().visit_artifacts(visitor)?;
+                item.get().0.visit_artifacts(visitor)?;
                 visitor.pop_frame();
             }
 
@@ -454,15 +467,12 @@ impl<'v, F: Fields<'v>> CommandLineArgLike<'v> for FieldsRef<'v, F> {
     }
 
     fn contains_arg_attr(&self) -> bool {
-        self.0
-            .items()
-            .iter()
-            .any(|x| x.as_command_line_arg().contains_arg_attr())
+        self.0.items().iter().any(|x| x.get().0.contains_arg_attr())
             || self
                 .0
                 .hidden()
                 .iter()
-                .any(|x| x.as_command_line_arg().contains_arg_attr())
+                .any(|x| x.get().0.contains_arg_attr())
     }
 
     fn visit_write_to_file_macros(
@@ -484,11 +494,13 @@ impl<'v, F: Fields<'v>> CommandLineArgLike<'v> for FieldsRef<'v, F> {
         }
 
         for item in self.0.items() {
-            item.as_command_line_arg()
+            item.get()
+                .0
                 .visit_write_to_file_macros(visitor, artifact_path_mapping)?;
         }
         for item in self.0.hidden() {
-            item.as_command_line_arg()
+            item.get()
+                .0
                 .visit_write_to_file_macros(visitor, artifact_path_mapping)?;
         }
         Ok(())
@@ -722,15 +734,9 @@ impl<'v> StarlarkValue<'v> for FrozenStarlarkCmdArgs<'v> {
     }
 }
 
-impl<'v> AllocValue<'v> for StarlarkCmdArgs<'v> {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_complex(self)
-    }
-}
-
 impl<'v> CommandLineArgLike<'v> for StarlarkCmdArgs<'v> {
     fn register_me(&self) {
-        command_line_arg_like_impl!(StarlarkCmdArgs::starlark_type_repr());
+        command_line_arg_like_impl!(StarlarkCmdArgs::get_type_starlark_repr());
     }
 
     fn add_to_command_line(&self, fmt: &mut CommandLineBuilder<'v, '_>) -> buck2_error::Result<()> {
@@ -760,7 +766,7 @@ impl<'v> CommandLineArgLike<'v> for StarlarkCmdArgs<'v> {
 
 impl<'v> CommandLineArgLike<'v> for FrozenStarlarkCmdArgs<'v> {
     fn register_me(&self) {
-        command_line_arg_like_impl!(FrozenStarlarkCmdArgs::starlark_type_repr());
+        command_line_arg_like_impl!(FrozenStarlarkCmdArgs::get_type_starlark_repr());
     }
 
     fn add_to_command_line(&self, fmt: &mut CommandLineBuilder<'v, '_>) -> buck2_error::Result<()> {
@@ -867,10 +873,10 @@ impl<'v> StarlarkCmdArgs<'v> {
     }
 }
 
-#[derive(UnpackValue, StarlarkTypeRepr)]
+#[derive(UnpackValue)]
 pub enum StarlarkCommandLineValueUnpack<'v> {
     // This should be `list[Self]`, but we cannot express it.
-    List(&'v ListRef<'v>),
+    List(ValueOf<'v, ListType<Value<'v>>>),
     CommandLineArg(CommandLineArg<'v>),
 }
 
@@ -884,7 +890,9 @@ impl<'v> StarlarkCommandLineData<'v> {
         value: StarlarkCommandLineValueUnpack<'v>,
     ) -> buck2_error::Result<()> {
         match value {
-            StarlarkCommandLineValueUnpack::List(values) => self.add_values(values.content())?,
+            StarlarkCommandLineValueUnpack::List(values) => {
+                self.add_values(values.list().content())?
+            }
             StarlarkCommandLineValueUnpack::CommandLineArg(value) => self.items.push(value),
         }
         Ok(())
@@ -917,7 +925,7 @@ impl<'v> StarlarkCommandLineData<'v> {
     fn add_hidden(&mut self, value: StarlarkCommandLineValueUnpack<'v>) -> buck2_error::Result<()> {
         match value {
             StarlarkCommandLineValueUnpack::List(values) => {
-                for value in values.content() {
+                for value in values.list().content() {
                     self.add_hidden(StarlarkCommandLineValueUnpack::unpack_value_err(*value)?)?
                 }
             }
@@ -934,26 +942,21 @@ struct StarlarkCommandLineMut<'v> {
     borrow: RefMut<'v, StarlarkCommandLineData<'v>>,
 }
 
-impl<'v> StarlarkTypeRepr for StarlarkCommandLineMut<'v> {
-    type Canonical = <StarlarkCmdArgs<'v> as StarlarkTypeRepr>::Canonical;
-
-    fn starlark_type_repr() -> Ty {
-        StarlarkCmdArgs::starlark_type_repr()
-    }
-}
-
 impl<'v> UnpackValue<'v> for StarlarkCommandLineMut<'v> {
+    type Type = StarlarkCmdArgsView<'v>;
     type Error = starlark::Error;
 
-    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        match StarlarkCmdArgsView::unpack_value_opt(value) {
-            None => Ok(None),
-            Some(StarlarkCmdArgsView::Unfrozen(v)) => Ok(Some(Self {
-                value,
+    fn unpack(
+        value: ValueOf<'v, StarlarkCmdArgsView<'v>>,
+        get: StarlarkCmdArgsView<'v>,
+    ) -> Result<Self, Self::Error> {
+        match get {
+            StarlarkCmdArgsView::Unfrozen(v) => Ok(Self {
+                value: value.to_value(),
                 borrow: v.as_ref().0.borrow_mut(),
-            })),
+            }),
             // A `cmd_args` all the same; what fails is the mutation.
-            Some(StarlarkCmdArgsView::Frozen(_)) => Err(starlark::Error::new_other(
+            StarlarkCmdArgsView::Frozen(_) => Err(starlark::Error::new_other(
                 ValueError::CannotMutateImmutableValue,
             )),
         }
@@ -961,8 +964,10 @@ impl<'v> UnpackValue<'v> for StarlarkCommandLineMut<'v> {
 }
 
 impl<'v> AllocValue<'v> for StarlarkCommandLineMut<'v> {
-    fn alloc_value(self, _heap: Heap<'v>) -> Value<'v> {
-        self.value
+    type Type = <StarlarkCmdArgs<'v> as StarlarkValue<'v>>::Type;
+
+    fn alloc_value(self, _heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
+        ValueOf::new_unchecked(self.value)
     }
 }
 
@@ -1024,8 +1029,11 @@ fn cmd_args_methods(builder: &mut MethodsBuilder) {
 
     /// Returns a copy of the `cmd_args` such that any modifications to the original or the returned value will not impact each other.
     /// Note that this is a shallow copy, so any inner `cmd_args` can still be modified.
-    fn copy<'v>(this: Value<'v>) -> starlark::Result<StarlarkCmdArgs<'v>> {
-        Ok(cmd_args(this).copy())
+    fn copy<'v>(
+        this: Value<'v>,
+        heap: Heap<'v>,
+    ) -> starlark::Result<ValueTyped<'v, StarlarkCmdArgs<'v>>> {
+        Ok(heap.alloc_representation(cmd_args(this).copy()))
     }
 
     /// Collect all the inputs (including hidden) referenced by this command line.
@@ -1051,36 +1059,42 @@ fn cmd_args_methods(builder: &mut MethodsBuilder) {
     ///         pass
     /// ```
     #[starlark(attribute)]
-    fn inputs<'v>(this: Value<'v>) -> starlark::Result<StarlarkCommandLineInputs> {
+    fn inputs<'v>(
+        this: Value<'v>,
+        heap: Heap<'v>,
+    ) -> starlark::Result<ValueOf<'v, StarlarkCommandLineInputs>> {
         let mut visitor = SimpleCommandLineArtifactVisitor::new();
         cmd_args(this).visit_artifacts(&mut visitor)?;
-        Ok(StarlarkCommandLineInputs {
-            inputs: visitor.inputs,
-        })
+        Ok(ValueOf::alloc(
+            heap,
+            StarlarkCommandLineInputs {
+                inputs: visitor.inputs,
+            },
+        ))
     }
 
     /// Collect all the outputs (including hidden) referenced by this command line.
     #[starlark(attribute)]
     fn outputs<'v>(
         this: Value<'v>,
-        heap: Heap<'_>,
-    ) -> starlark::Result<Vec<StarlarkOutputArtifact<'v>>> {
+        heap: Heap<'v>,
+    ) -> starlark::Result<Vec<ValueTyped<'v, StarlarkOutputArtifact<'v>>>> {
         let mut visitor = SimpleCommandLineArtifactVisitor::new();
         cmd_args(this).visit_artifacts(&mut visitor)?;
         let mut outputs =
             Vec::with_capacity(visitor.declared_outputs.len() + visitor.frozen_outputs.len());
         for out in visitor.declared_outputs {
-            let declared = heap.alloc_typed(StarlarkDeclaredArtifact::new(
+            let declared = heap.alloc_representation(StarlarkDeclaredArtifact::new(
                 None,
                 (*out).dupe(),
                 AssociatedArtifacts::new(),
             ));
-            outputs.push(StarlarkOutputArtifact::new(declared));
+            outputs.push(heap.alloc_representation(StarlarkOutputArtifact::new(declared)));
         }
         // FIXME(JakobDegen): We should probably not be allowing people to get an `OutputArtifact`
         // for an artifact declared in a downstream action??
         for out in visitor.frozen_outputs {
-            let declared = heap.alloc_typed(StarlarkDeclaredArtifact::new(
+            let declared = heap.alloc_representation(StarlarkDeclaredArtifact::new(
                 None,
                 (*out
                     .allocate_new_output_artifact_for(heap)
@@ -1088,7 +1102,7 @@ fn cmd_args_methods(builder: &mut MethodsBuilder) {
                 .dupe(),
                 AssociatedArtifacts::new(),
             ));
-            outputs.push(StarlarkOutputArtifact::new(declared));
+            outputs.push(heap.alloc_representation(StarlarkOutputArtifact::new(declared)));
         }
         Ok(outputs)
     }
@@ -1212,9 +1226,10 @@ pub fn register_cmd_args(builder: &mut GlobalsBuilder) {
         >,
         #[starlark(default = Either::Right(ValueOf::empty_list()))] replace_regex: Either<
             (CmdArgsRegex<'v>, StringValue<'v>),
-            ValueOf<'v, ListType<(CmdArgsRegex<'v>, StringValue<'v>)>>,
+            ValueOf<'v, ListType<(CmdArgsRegex<'v>, StarlarkStr)>>,
         >,
-    ) -> starlark::Result<StarlarkCmdArgs<'v>> {
+        heap: Heap<'v>,
+    ) -> starlark::Result<ValueTyped<'v, StarlarkCmdArgs<'v>>> {
         let format = format.filter(|format| format.as_str() != "{}");
         let quote = quote.map(QuoteStyle::parse).transpose()?;
         let mut builder = StarlarkCommandLineData::default();
@@ -1246,7 +1261,10 @@ pub fn register_cmd_args(builder: &mut GlobalsBuilder) {
         }
         let replace_regex: Vec<(CmdArgsRegex, StringValue)> = match replace_regex {
             Either::Left(x) => vec![x],
-            Either::Right(xs) => xs.try_to_vec()?,
+            Either::Right(xs) => xs
+                .iter()
+                .map(|x| Ok(x?.get()))
+                .collect::<starlark::Result<_>>()?,
         };
         if !replace_regex.is_empty() {
             for (pattern, _replacement) in &replace_regex {
@@ -1260,7 +1278,7 @@ pub fn register_cmd_args(builder: &mut GlobalsBuilder) {
         if let Some(hidden) = hidden {
             builder.add_hidden(hidden)?;
         }
-        Ok(StarlarkCmdArgs(RefCell::new(builder)))
+        Ok(heap.alloc_representation(StarlarkCmdArgs(RefCell::new(builder))))
     }
 }
 

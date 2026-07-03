@@ -40,6 +40,7 @@ import org.jetbrains.kotlin.fir.declarations.utils.isConst
 import org.jetbrains.kotlin.fir.expressions.FirAnnotation
 import org.jetbrains.kotlin.fir.expressions.FirAnnotationCall
 import org.jetbrains.kotlin.fir.expressions.FirErrorExpression
+import org.jetbrains.kotlin.fir.expressions.FirFunctionCall
 import org.jetbrains.kotlin.fir.expressions.FirGetClassCall
 import org.jetbrains.kotlin.fir.expressions.FirNamedArgumentExpression
 import org.jetbrains.kotlin.fir.expressions.FirQualifiedAccessExpression
@@ -48,6 +49,7 @@ import org.jetbrains.kotlin.fir.expressions.FirWrappedArgumentExpression
 import org.jetbrains.kotlin.fir.expressions.impl.FirResolvedArgumentList
 import org.jetbrains.kotlin.fir.moduleData
 import org.jetbrains.kotlin.fir.references.FirErrorNamedReference
+import org.jetbrains.kotlin.fir.references.FirNamedReference
 import org.jetbrains.kotlin.fir.references.FirResolvedNamedReference
 import org.jetbrains.kotlin.fir.resolve.providers.symbolProvider
 import org.jetbrains.kotlin.fir.serialization.providedDeclarationsForMetadataService
@@ -73,6 +75,7 @@ import org.jetbrains.kotlin.ir.declarations.IrMetadataSourceOwner
 import org.jetbrains.kotlin.ir.declarations.IrModuleFragment
 import org.jetbrains.kotlin.ir.declarations.IrProperty
 import org.jetbrains.kotlin.ir.declarations.IrSimpleFunction
+import org.jetbrains.kotlin.ir.types.classOrNull
 import org.jetbrains.kotlin.ir.util.kotlinFqName
 import org.jetbrains.kotlin.name.CallableId
 import org.jetbrains.kotlin.name.ClassId
@@ -155,6 +158,9 @@ internal class FirMetadataSanitizerStage(private val repairLog: AbiGenRepairLog)
   fun cleanupFirMetadataSources(moduleFragment: IrModuleFragment, session: FirSession) {
     val THROWS_FQ_NAME = FqName("kotlin.jvm.Throws")
     val THROWS_KOTLIN_FQ_NAME = FqName("kotlin.Throws")
+    // Classes the ABI jar keeps as shells. A private supertype in this set still
+    // resolves for consumers, so the metadata cleanup below must keep naming it.
+    val mustKeepPrivateClassNames = collectMustKeepPrivateClassNames(moduleFragment)
 
     moduleFragment.accept(
         object : IrElementVisitorVoidCompat() {
@@ -169,7 +175,7 @@ internal class FirMetadataSanitizerStage(private val repairLog: AbiGenRepairLog)
 
           override fun visitClass(declaration: IrClass) {
             stripThrowsAndErrorAnnotationsFromDeclaration(declaration)
-            stripPrivateSupertypesFromDeclaration(declaration)
+            stripPrivateSupertypesFromDeclaration(declaration, mustKeepPrivateClassNames)
             stripErrorTypedPrivateMembersFromDeclaration(declaration)
             super.visitClass(declaration)
           }
@@ -558,7 +564,10 @@ internal class FirMetadataSanitizerStage(private val repairLog: AbiGenRepairLog)
           // --- Private supertype stripping helpers ---
 
           @OptIn(SymbolInternals::class)
-          private fun stripPrivateSupertypesFromDeclaration(declaration: IrClass) {
+          private fun stripPrivateSupertypesFromDeclaration(
+              declaration: IrClass,
+              mustKeepPrivateClassNames: Set<String>,
+          ) {
             val metadataSourceOwner = declaration as? IrMetadataSourceOwner ?: return
             val metadataSource = metadataSourceOwner.metadata ?: return
             val firMetadataSource = metadataSource as? FirMetadataSource ?: return
@@ -587,7 +596,9 @@ internal class FirMetadataSanitizerStage(private val repairLog: AbiGenRepairLog)
                   }
 
               val toRemove = superTypeRefs.filter { typeRef ->
-                isPrivateSupertype(typeRef, firClass)
+                isPrivateSupertype(typeRef, firClass) &&
+                    !isRetainedInIrSupertypes(declaration, typeRef) &&
+                    !isKeptShellSupertype(typeRef, mustKeepPrivateClassNames)
               }
 
               for (typeRef in toRemove) {
@@ -631,6 +642,36 @@ internal class FirMetadataSanitizerStage(private val repairLog: AbiGenRepairLog)
                 ?.classId
           }
 
+          // True when the private supertype survives in the ABI jar as a shell, even
+          // though the IR stripper dropped it from the supertype list (interfaces
+          // strip by design; fake overrides materialize instead). The shell still
+          // resolves for consumers, so the metadata must keep naming it — this is
+          // what production jvm-abi-gen emits (its bytecode implements clause
+          // strips while the metadata supertype stays).
+          private fun isKeptShellSupertype(
+              typeRef: org.jetbrains.kotlin.fir.types.FirTypeRef,
+              mustKeepPrivateClassNames: Set<String>,
+          ): Boolean {
+            val dotted =
+                getPrivateClassIdFromTypeRef(typeRef)?.asString()?.replace('/', '.') ?: return false
+            return mustKeepPrivateClassNames.contains(dotted)
+          }
+
+          // True when the IR stripper kept this supertype on the class (e.g. a
+          // must-keep private superclass). The FIR metadata source must keep the
+          // link too, or consumers cannot resolve inherited members. Anything
+          // the IR dropped stays dropped here.
+          private fun isRetainedInIrSupertypes(
+              declaration: IrClass,
+              typeRef: org.jetbrains.kotlin.fir.types.FirTypeRef,
+          ): Boolean {
+            val classId =
+                getPrivateClassIdFromTypeRef(typeRef)?.asString()?.replace('/', '.') ?: return false
+            return declaration.superTypes.any {
+              it.classOrNull?.owner?.kotlinFqName?.asString() == classId
+            }
+          }
+
           @OptIn(SymbolInternals::class)
           private fun convertFirFakeOverridesFromStrippedPrivateSupertypes(
               firClass: FirRegularClass,
@@ -645,15 +686,16 @@ internal class FirMetadataSanitizerStage(private val repairLog: AbiGenRepairLog)
 
             if (interfaceMethods.isEmpty()) return
 
-            val existingMethodNames =
+            val existingMethodKeys =
                 firClass.declarations
                     .filterIsInstance<FirNamedFunctionCompat>()
-                    .map { it.name.asString() }
+                    .mapNotNull { methodKey(it) }
                     .toSet()
 
             for (interfaceMethod in interfaceMethods) {
               val methodName = interfaceMethod.name.asString()
-              if (methodName in existingMethodNames) continue
+              val interfaceKey = methodKey(interfaceMethod)
+              if (interfaceKey != null && interfaceKey in existingMethodKeys) continue
 
               val copiedMethod = copyPrivateInterfaceMethodToClass(interfaceMethod, firClass)
               if (copiedMethod != null) {
@@ -704,6 +746,28 @@ internal class FirMetadataSanitizerStage(private val repairLog: AbiGenRepairLog)
           }
 
           @OptIn(SymbolInternals::class)
+          // Inherited members match by signature, not name: a class declaring d(Int)
+          // while a stripped private interface supplies d(String) must keep both.
+          // Bails out (null) when a parameter type is not resolved, like
+          // erasedSignatureKey in the handler: two distinct unresolved parameters
+          // must never share a key, so an unkeyable method never matches and is
+          // always materialized.
+          private fun methodKey(fn: FirNamedFunctionCompat): String? = runCatching {
+            val params =
+                fn.valueParameters.map { param ->
+                  val coneType =
+                      (param.returnTypeRef as? org.jetbrains.kotlin.fir.types.FirResolvedTypeRef)
+                          ?.coneType ?: return@runCatching null
+                  if (coneType is org.jetbrains.kotlin.fir.types.ConeClassLikeType) {
+                    coneType.lookupTag.classId.asString()
+                  } else {
+                    coneType.toString()
+                  }
+                }
+            "${fn.name.asString()}(${params.joinToString(",")})"
+          }
+              .getOrNull()
+
           private fun collectMethodsFromPrivateInterfaces(
               session: FirSession,
               interfaceClassIds: Set<ClassId>,
@@ -977,7 +1041,9 @@ internal class FirMetadataSanitizerStage(private val repairLog: AbiGenRepairLog)
           // A const val that loses its initializer is emitted without a ConstantValue attribute,
           // so consumers that constant-fold it fail during their own compile rather than here.
           // That reasoning only applies to a constant a consumer can actually see, hence the
-          // visibility, which [ValidationStage] filters on.
+          // visibility, which [ValidationStage] filters on. The unresolved symbols are recorded
+          // so the validation error can name them and tooling can resolve their providers.
+          val unresolved = collectUnresolvedSymbols(initializer)
           repairLog.recordClearedPropertyInitializer(
               owner,
               if (property.isConst) "const val, no ConstantValue will be emitted"
@@ -987,6 +1053,7 @@ internal class FirMetadataSanitizerStage(private val repairLog: AbiGenRepairLog)
                   property.status.visibility != Visibilities.Private &&
                       property.status.visibility != Visibilities.PrivateToThis &&
                       property.status.visibility != Visibilities.Local,
+              unresolvedSymbols = unresolved,
           )
         } catch (e: Exception) {
           repairLog.recordFailedRepair(
@@ -996,6 +1063,48 @@ internal class FirMetadataSanitizerStage(private val repairLog: AbiGenRepairLog)
         }
       }
       super.visitProperty(property)
+    }
+
+    // Dotted source paths (`a.B.C`) of references the frontend could not resolve, innermost
+    // qualifier first, capped so one broken expression cannot flood the repair log. A call whose
+    // callee is missing only because an argument is already an error (the `times` in
+    // `5 * <error>`) names no provider, so it is skipped; its erroneous arguments are still
+    // visited and collected on their own.
+    private fun collectUnresolvedSymbols(root: FirElement): List<String> {
+      val out = LinkedHashSet<String>()
+      root.accept(
+          object : FirDefaultVisitorVoid() {
+            override fun visitElement(element: FirElement) {
+              if (
+                  element is FirQualifiedAccessExpression &&
+                      element.calleeReference is FirErrorNamedReference &&
+                      !(element is FirFunctionCall &&
+                          (element.argumentList.arguments + element.explicitReceiver).any {
+                            it != null && hasErrorExpressionRecursive(it)
+                          })
+              ) {
+                dottedPath(element)?.let(out::add)
+              }
+              element.acceptChildren(this)
+            }
+          },
+      )
+      return out.take(3)
+    }
+
+    // Null when the callee cannot be named (not a FirNamedReference): the caller
+    // drops it, so the "could not name" branch handles it instead of printing "?".
+    private fun dottedPath(access: FirQualifiedAccessExpression): String? {
+      val parts = mutableListOf(
+          (access.calleeReference as? FirNamedReference)?.name?.asString() ?: return null,
+      )
+      var receiver = access.explicitReceiver
+      while (receiver is FirQualifiedAccessExpression) {
+        val name = (receiver.calleeReference as? FirNamedReference)?.name?.asString() ?: break
+        parts.add(0, name)
+        receiver = receiver.explicitReceiver
+      }
+      return parts.joinToString(".")
     }
 
     override fun visitRegularClass(regularClass: FirRegularClass) {
@@ -1342,6 +1451,52 @@ internal class ValidationStage(private val repairLog: AbiGenRepairLog) : AbiGenS
       )
     }
 
+    // Assertion 2 (unconditional): no *consumer-visible* const val silently lost its
+    // ConstantValue attribute. Unlike every other assertion here this one runs even when
+    // validation is off, because a valueless public const is never a correct ABI: any consumer
+    // that constant-folds it crashes in the IR interpreter (InterpreterMethodNotFoundError)
+    // during its own compile, far from the cause. Failing here names the defining target.
+    //
+    // The visibility filter is not a convenience. Every one of the 12 constants this assertion
+    // named on its first repo-wide run was a `private const val` initialised from a constant
+    // declared in another buck target. A private companion constant takes part in no consumer's
+    // constant folding, so the message's own justification - "consumers that constant-fold it fail
+    // during their own compile" - cannot apply to it. Reporting those is a false positive, and
+    // since `warn` is fatal under `-Werror` a false positive here is a broken build. What they do
+    // expose is real but narrower, and belongs to a different check: Kosabi's const resolver is
+    // source-local and cannot read a constant's value off a dependency's ABI.
+    for (cleared in repairLog.clearedPropertyInitializers) {
+      if (!cleared.isConst) continue
+      if (!cleared.consumerVisible) continue
+      val symbols = cleared.unresolvedSymbols
+      // The compiler has no view of the build graph, so the provider buck target behind each
+      // symbol cannot be resolved here; tooling resolves it from the machine-readable marker
+      // (kosabi_sodeps.py auto-applies the edge). Never print a guessed target.
+      val symbolText =
+          if (symbols.isEmpty()) "unresolvable references the sanitizer could not name"
+          else "unresolved ${symbols.joinToString()}"
+      messageCollector.report(
+          // Escape hatch: warn mode downgrades this to a warning (buckconfig
+          // `kotlin.kosabi_abi_validation_mode` or per-target `abiValidationMode=warn`).
+          // Every other mode fails loud: a valueless public const is never a correct ABI.
+          if (policy == AbiRepairPolicy.WARN) CompilerMessageSeverity.WARNING
+          else CompilerMessageSeverity.ERROR,
+          "Kosabi ABI validation: `${cleared.owner}` is a const val whose initializer could not " +
+              "be resolved ($symbolText) and was discarded. It will be emitted without a " +
+              "ConstantValue attribute, so consumers that constant-fold it fail during their own " +
+              "compile. To fix, resolve the provider buck target of each symbol (e.g. with " +
+              "`buck2 uquery \"owner(<file>)\"` or kosabi_sodeps.py) and add it to THIS target's " +
+              "`source_only_abi_deps`. The provider cannot be resolved here: the compiler has " +
+              "no view of the build graph, so no target is named or guessed. An explicit " +
+              "`source_only_abi_deps` edge adds the provider for this consumer only. " +
+              "`required_for_source_only_abi = True` on the provider instead adds its ABI jar " +
+              "(its source-only ABI when the provider is source_only) for every eligible " +
+              "consumer that depends on it. " +
+              "KOSABI_MISSING_CONST_DEP const=`${cleared.owner}` " +
+              "symbols=`${symbols.joinToString("|")}` fix=`ADD_SOURCE_ONLY_ABI_DEP`",
+      )
+    }
+
     if (policy == AbiRepairPolicy.OFF) return
 
     // Always emitted, including at zero, so that "no repairs happened" is distinguishable from
@@ -1361,27 +1516,6 @@ internal class ValidationStage(private val repairLog: AbiGenRepairLog) : AbiGenS
               "with an assumed type of `String`. Neither its type nor its value could be " +
               "established, so if the real constant is not a String this ABI is wrong in a way " +
               "that will not surface until a consumer compiles against it.",
-      )
-    }
-
-    // Assertion 2: no *consumer-visible* const val silently lost its ConstantValue attribute.
-    //
-    // The visibility filter is not a convenience. Every one of the 12 constants this assertion
-    // named on its first repo-wide run was a `private const val` initialised from a constant
-    // declared in another buck target. A private companion constant takes part in no consumer's
-    // constant folding, so the message's own justification - "consumers that constant-fold it fail
-    // during their own compile" - cannot apply to it. Reporting those is a false positive, and
-    // since `warn` is fatal under `-Werror` a false positive here is a broken build. What they do
-    // expose is real but narrower, and belongs to a different check: Kosabi's const resolver is
-    // source-local and cannot read a constant's value off a dependency's ABI.
-    for (cleared in repairLog.clearedPropertyInitializers) {
-      if (!cleared.isConst) continue
-      if (!cleared.consumerVisible) continue
-      messageCollector.report(
-          severity,
-          "Kosabi ABI validation: `${cleared.owner}` is a const val whose initializer could not " +
-              "be resolved and was discarded. It will be emitted without a ConstantValue " +
-              "attribute, so consumers that constant-fold it fail during their own compile.",
       )
     }
 

@@ -51,7 +51,6 @@ use crate::typing::user::TyUser;
 use crate::typing::user::TyUserFields;
 use crate::typing::user::TyUserIndex;
 use crate::typing::user::TyUserParams;
-use crate::values::AllocValue;
 use crate::values::Demand;
 use crate::values::Freeze;
 use crate::values::FreezeResult;
@@ -62,6 +61,7 @@ use crate::values::StarlarkValue;
 use crate::values::StringValue;
 use crate::values::UnpackValue;
 use crate::values::Value;
+use crate::values::ValueOf;
 use crate::values::ValueTyped;
 use crate::values::dict::value::ValueStr;
 use crate::values::enumeration::matcher::EnumTypeMatcher;
@@ -70,7 +70,8 @@ use crate::values::enumeration::value::EnumValue;
 use crate::values::function::FUNCTION_TYPE;
 use crate::values::index::convert_index;
 use crate::values::list::AllocList;
-use crate::values::type_repr::StarlarkTypeRepr;
+use crate::values::type_expr::StarlarkTypeExpr;
+use crate::values::type_expr::StarlarkTypeExprStable;
 use crate::values::types::type_instance_id::StarlarkTypeIdDomain;
 use crate::values::types::type_instance_id::TypeInstanceId;
 use crate::values::typing::type_compiled::type_matcher_factory::TypeMatcherFactory;
@@ -163,12 +164,6 @@ impl<'v> Freeze<'v> for EnumType<'v> {
     }
 }
 
-impl<'v> AllocValue<'v> for EnumType<'v> {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_complex(self)
-    }
-}
-
 // SAFETY: `elements` is written once, in `EnumType::new`, before the value is reachable from
 // anywhere else (see `elements`), so the `UnsafeCell` is shared like the `SmallMap` inside it,
 // whose `Value<'static>`s are `Send + Sync` like the contents of every frozen value. At any
@@ -221,7 +216,7 @@ impl<'v> EnumType<'v> {
     ) -> crate::Result<ValueTyped<'v, EnumType<'v>>> {
         // We are constructing the enum and all elements in one go.
         // They both point at each other, which adds to the complexity.
-        let typ = heap.alloc_typed(EnumType {
+        let typ = heap.alloc_representation(EnumType {
             id,
             ty_enum_data: EnumVariantUnfrozen {
                 data: OnceCell::new(),
@@ -231,12 +226,14 @@ impl<'v> EnumType<'v> {
 
         let mut res = SmallMap::with_capacity(elements.len());
         for (i, x) in elements.iter().enumerate() {
-            let v = heap.alloc(EnumValue {
-                id,
-                typ: typ.to_value(),
-                index: i as i32,
-                value: x.to_value(),
-            });
+            let v = heap
+                .alloc_representation(EnumValue {
+                    id,
+                    typ: typ.to_value(),
+                    index: i as i32,
+                    value: x.to_value(),
+                })
+                .to_value();
             if res.insert_hashed(x.to_value().get_hashed()?, v).is_some() {
                 return Err(crate::Error::new_other(EnumError::DuplicateEnumValue(
                     x.to_string(),
@@ -342,20 +339,27 @@ starlark::methods_static!(ENUM_TYPE_METHODS = enum_type_methods);
 
 pub(crate) type AnyEnumType<'v> = &'v EnumTypeGen<'v, dyn EnumVariant>;
 
-impl<'v> StarlarkTypeRepr for AnyEnumType<'v> {
-    type Canonical = <EnumTypeView<'v> as StarlarkTypeRepr>::Canonical;
+impl<'v> StarlarkTypeExpr<'v> for AnyEnumType<'v> {
+    type Get = Self;
 
-    #[inline]
-    fn starlark_type_repr() -> crate::typing::Ty {
+    fn starlark_type_repr() -> Ty {
         <FrozenEnumType<'v> as StarlarkValue<'v>>::get_type_starlark_repr()
+    }
+
+    fn get(value: Value<'v>) -> Option<Self> {
+        value.request_value()
     }
 }
 
+impl<'v> StarlarkTypeExprStable<'v> for AnyEnumType<'v> {}
+
 impl<'v> UnpackValue<'v> for AnyEnumType<'v> {
+    type Type = Self;
     type Error = std::convert::Infallible;
 
-    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        Ok(value.request_value())
+    #[inline]
+    fn unpack(_value: ValueOf<'v, Self>, get: Self) -> Result<Self, Self::Error> {
+        Ok(get)
     }
 }
 
@@ -469,7 +473,7 @@ impl<'v> StarlarkValue<'v> for EnumType<'v> {
     }
 }
 
-#[starlark_value]
+#[starlark_value(alloc = frozen)]
 impl<'v> StarlarkValue<'v> for FrozenEnumType<'v> {
     type Type = EnumTypeView<'v>;
 

@@ -18,11 +18,10 @@ use starlark::eval::Evaluator;
 use starlark::values::Freeze;
 use starlark::values::OwnedFrozen;
 use starlark::values::StarlarkPagable;
+use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
-use starlark::values::list::ListRef;
-use starlark::values::type_repr::StarlarkTypeRepr;
 
 use crate as buck2_build_api;
 use crate::interpreter::rule_defs::cmd_args::ArtifactPathMapper;
@@ -96,26 +95,26 @@ fn run_info_creator(globals: &mut GlobalsBuilder) {
     #[starlark(as_type = RunInfo<'static>)]
     fn RunInfo<'v>(
         // TODO(nga): make the argument either named or positional.
-        #[starlark(default = StarlarkCommandLineValueUnpack::List(ListRef::empty()))]
+        #[starlark(default = StarlarkCommandLineValueUnpack::List(ValueOf::empty_list()))]
         args: StarlarkCommandLineValueUnpack<'v>,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<RunInfo<'v>> {
+    ) -> starlark::Result<ValueTyped<'v, RunInfo<'v>>> {
         let heap = eval.heap();
         let valid_args = StarlarkCmdArgs::try_from_value_typed(args)?;
-        Ok(RunInfo {
+        Ok(heap.alloc_representation(RunInfo {
             args: ValueOf::alloc(heap, valid_args),
-        })
+        }))
     }
 }
 
 impl<'v> CommandLineArgLike<'v> for RunInfo<'v> {
     fn register_me(&self) {
-        command_line_arg_like_impl!(RunInfo::starlark_type_repr());
+        command_line_arg_like_impl!(RunInfo::get_type_starlark_repr());
     }
 
     fn add_to_command_line(&self, fmt: &mut CommandLineBuilder<'v, '_>) -> buck2_error::Result<()> {
         self.args
-            .unpack()
+            .get()
             .as_command_line_arg_like()
             .add_to_command_line(fmt)
     }
@@ -125,14 +124,14 @@ impl<'v> CommandLineArgLike<'v> for RunInfo<'v> {
         visitor: &mut dyn CommandLineArtifactVisitor<'v>,
     ) -> buck2_error::Result<()> {
         self.args
-            .unpack()
+            .get()
             .as_command_line_arg_like()
             .visit_artifacts(visitor)
     }
 
     fn contains_arg_attr(&self) -> bool {
         self.args
-            .unpack()
+            .get()
             .as_command_line_arg_like()
             .contains_arg_attr()
     }

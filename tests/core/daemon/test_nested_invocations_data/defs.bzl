@@ -72,8 +72,64 @@ subprocess.run([buck_path, "debug", "trace-io", "enable"])
     )
     return [DefaultInfo(default_output = nested_out)]
 
+def _daemon_dir_impl(ctx):
+    out = ctx.actions.declare_output("daemon_dir.txt", has_content_based_path = False)
+    script = ctx.actions.write(
+        "daemon_dir.py",
+        """
+import subprocess
+import sys
+
+with open(sys.argv[2], "w") as out:
+    subprocess.run([sys.argv[1], "root", "--kind", "daemon"], stdout=out, check=True)
+    """,
+        has_content_based_path = False,
+    )
+    ctx.actions.run(
+        ["fbpython", script, ctx.attrs.buck2_path, out.as_output()],
+        env = {"SANDCASTLE_ID": ""},
+        local_only = True,
+        category = "daemon_dir",
+    )
+    return [DefaultInfo(default_output = out)]
+
+nested_daemon_dir = rule(
+    impl = _daemon_dir_impl,
+    attrs = {
+        "buck2_path": attrs.string(),
+    },
+)
+
+def _no_buckd_impl(ctx):
+    out = ctx.actions.declare_output("out.txt", has_content_based_path = False)
+
+    cmd = cmd_args(
+        ctx.attrs.buck2_path,
+        "build",
+        "--no-buckd",
+        "root//:trivial",
+        "-c",
+        "nested.buck2_path=" + ctx.attrs.buck2_path,
+        "--out",
+        out.as_output(),
+    )
+    ctx.actions.run(
+        cmd,
+        env = {"SANDCASTLE_ID": ""},
+        local_only = True,
+        category = "run",
+    )
+    return [DefaultInfo(default_output = out)]
+
 normal_nested_invocation = rule(
     impl = _normal_impl,
+    attrs = {
+        "buck2_path": attrs.string(),
+    },
+)
+
+no_buckd_nested_invocation = rule(
+    impl = _no_buckd_impl,
     attrs = {
         "buck2_path": attrs.string(),
     },

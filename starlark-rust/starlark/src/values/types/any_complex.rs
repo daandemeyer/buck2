@@ -31,15 +31,19 @@ use crate as starlark;
 use crate::any::ProvidesStaticType;
 use crate::pagable::vtable_register::VtableRegistered;
 use crate::typing::starlark_value::TyStarlarkValueVTable;
-use crate::values::AllocValue;
+use crate::values::AllocFrozenRepresentation;
+use crate::values::AllocRepresentation;
+use crate::values::Allocator;
 use crate::values::Freeze;
 use crate::values::FreezeResult;
 use crate::values::Freezer;
+use crate::values::FrozenAllocator;
 use crate::values::Heap;
 use crate::values::HeapSendable;
 use crate::values::StarlarkValue;
 use crate::values::Trace;
 use crate::values::Value;
+use crate::values::ValueTyped;
 use crate::values::layout::avalue::AValueSimpleBound;
 
 /// Allocate arbitrary value on the starlark heap without implementing full [`StarlarkValue`].
@@ -202,7 +206,20 @@ macro_rules! register_starlark_any_complex {
     };
 }
 
-impl<'v, T> AllocValue<'v> for StarlarkAnyComplex<T>
+impl<T> StarlarkAnyComplex<T> {
+    /// Allocate as a value that cannot be frozen, for a payload without a
+    /// [`Freeze`](crate::values::Freeze) impl; freezing the module that holds it is an error.
+    /// A payload that freezes is allocated through
+    /// [`alloc_representation`](crate::values::Heap::alloc_representation) instead.
+    pub fn alloc_no_freeze<'v>(self, heap: Heap<'v>) -> ValueTyped<'v, Self>
+    where
+        Self: StarlarkValue<'v> + Trace<'v> + HeapSendable<'v>,
+    {
+        Allocator::new(heap).alloc_complex_no_freeze(self)
+    }
+}
+
+impl<'v, T> AllocRepresentation<'v> for StarlarkAnyComplex<T>
 where
     Self: StarlarkValue<'v> + HeapSendable<'v>,
     T: Trace<'v> + ProvidesStaticType<'v> + Freeze<'v>,
@@ -210,8 +227,21 @@ where
     for<'fv> StarlarkAnyComplex<T::Frozen<'fv>>:
         ProvidesStaticType<'fv, StaticType = StarlarkAnyComplex<T::Frozen<'static>>>,
 {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_complex(self)
+    type Repr = Self;
+
+    fn alloc(self, allocator: Allocator<'v>) -> ValueTyped<'v, Self> {
+        allocator.alloc_complex(self)
+    }
+}
+
+impl<'fv, T> AllocFrozenRepresentation<'fv> for StarlarkAnyComplex<T>
+where
+    Self: AValueSimpleBound<'fv>,
+{
+    type Repr = Self;
+
+    fn alloc_frozen(self, allocator: FrozenAllocator<'fv>) -> ValueTyped<'fv, Self> {
+        allocator.alloc_simple(self)
     }
 }
 
@@ -278,10 +308,13 @@ mod tests {
     #[test]
     fn test_any_complex() {
         Module::with_temp_heap(|module| {
-            let data = module.heap().alloc(StarlarkAnyComplex::new(UnfrozenData {
-                string: module.heap().alloc_str("aaa"),
-                other: module.heap().alloc(AllocList([1, 2])),
-            }));
+            let data = module
+                .heap()
+                .alloc_representation(StarlarkAnyComplex::new(UnfrozenData {
+                    string: module.heap().alloc_str("aaa"),
+                    other: module.heap().alloc(AllocList([1, 2])),
+                }))
+                .to_value();
 
             assert_eq!(
                 const_frozen_string!("aaa").at(),

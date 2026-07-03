@@ -22,11 +22,9 @@ use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_api::artifact_groups::ResolvedArtifactGroup;
 use buck2_build_api::artifact_groups::calculation::ArtifactGroupCalculation;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactView;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkInputArtifactLike;
-use buck2_build_api::interpreter::rule_defs::artifact::starlark_declared_artifact::StarlarkDeclaredArtifact;
-use buck2_build_api::interpreter::rule_defs::artifact::unpack_artifact::UnpackNonPromiseInputArtifact;
 use buck2_hash::BuckMutInsertionSet;
-use derive_more::Display;
 use dice::DiceComputations;
 use dupe::Dupe;
 use dupe::IterDupedExt;
@@ -37,8 +35,6 @@ use starlark::collections::StarlarkHasher;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
 use starlark::starlark_module;
-use starlark::typing::Ty;
-use starlark::values::AllocValue;
 use starlark::values::Heap;
 use starlark::values::StarlarkValue;
 use starlark::values::Trace;
@@ -46,7 +42,6 @@ use starlark::values::UnpackValue;
 use starlark::values::Value;
 use starlark::values::ValueTyped;
 use starlark::values::starlark_value;
-use starlark::values::type_repr::StarlarkTypeRepr;
 
 #[derive(Clone, Debug, Dupe, Trace, ProvidesStaticType, Allocative)]
 #[repr(C)]
@@ -128,7 +123,9 @@ pub(crate) struct EnsuredArtifactGroup<'v> {
 impl<'v> EnsuredArtifactGroup<'v> {
     pub(crate) fn new(ags: Vec<ArtifactGroup>, abs: bool, heap: Heap<'v>) -> Self {
         EnsuredArtifactGroup {
-            inner: heap.alloc(EnsuredArtifactGroupInner { ags }),
+            inner: heap
+                .alloc_representation(EnsuredArtifactGroupInner { ags })
+                .to_value(),
 
             abs,
         }
@@ -152,12 +149,7 @@ impl<'v> EnsuredArtifactGroup<'v> {
 
 starlark::methods_static!(ARTIFACT_GROUP_METHODS = artifact_group_methods);
 
-#[starlark_value(
-    type = "bxl.EnsuredArtifactGroup",
-    StarlarkTypeRepr,
-    UnpackValue,
-    ty_vtable_no_freeze
-)]
+#[starlark_value(type = "bxl.EnsuredArtifactGroup", no_freeze)]
 impl<'v> StarlarkValue<'v> for EnsuredArtifactGroup<'v>
 where
     Self: ProvidesStaticType<'v>,
@@ -173,12 +165,7 @@ where
     }
 }
 
-#[starlark_value(
-    type = "bxl.EnsuredArtifactGroupInner",
-    StarlarkTypeRepr,
-    UnpackValue,
-    ty_vtable_no_freeze
-)]
+#[starlark_value(type = "bxl.EnsuredArtifactGroupInner", no_freeze)]
 impl<'v> StarlarkValue<'v> for EnsuredArtifactGroupInner
 where
     Self: ProvidesStaticType<'v>,
@@ -204,52 +191,21 @@ impl PartialEq for EnsuredArtifact {
 
 impl Eq for EnsuredArtifact {}
 
-/// An `Artifact` that is not a promise artifact; see `UnpackNonPromiseInputArtifact`.
-#[derive(Display)]
-pub(crate) enum ArtifactArg<'v> {
-    Artifact(ValueTyped<'v, StarlarkArtifact>),
-    DeclaredArtifact(ValueTyped<'v, StarlarkDeclaredArtifact<'v>>),
-}
-
-impl<'v> StarlarkTypeRepr for ArtifactArg<'v> {
-    type Canonical = <UnpackNonPromiseInputArtifact<'v> as StarlarkTypeRepr>::Canonical;
-
-    fn starlark_type_repr() -> Ty {
-        UnpackNonPromiseInputArtifact::starlark_type_repr()
-    }
-}
-
-impl<'v> UnpackValue<'v> for ArtifactArg<'v> {
-    type Error = <UnpackNonPromiseInputArtifact<'v> as UnpackValue<'v>>::Error;
-
-    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        Ok(
-            UnpackNonPromiseInputArtifact::unpack_value_impl(value)?.map(|x| match x {
-                UnpackNonPromiseInputArtifact::Artifact(x) => ArtifactArg::Artifact(x),
-                UnpackNonPromiseInputArtifact::DeclaredArtifact(x) => {
-                    ArtifactArg::DeclaredArtifact(x)
-                }
-            }),
-        )
-    }
-}
-
-impl<'v> ArtifactArg<'v> {
-    pub(crate) fn into_ensured_artifact(self) -> buck2_error::Result<EnsuredArtifact> {
-        match self {
-            ArtifactArg::Artifact(artifact) => Ok(EnsuredArtifact {
-                artifact: artifact.as_ref().dupe(),
-                abs: false,
-            }),
-            ArtifactArg::DeclaredArtifact(artifact) => Ok(EnsuredArtifact {
-                artifact: StarlarkArtifact::new(artifact.get_bound_artifact()?),
-                abs: false,
-            }),
-        }
-    }
-}
-
 impl EnsuredArtifact {
+    pub(crate) fn from_artifact(artifact: StarlarkArtifactView<'_>) -> buck2_error::Result<Self> {
+        let artifact = match artifact {
+            StarlarkArtifactView::Artifact(artifact) => artifact.as_ref().dupe(),
+            StarlarkArtifactView::DeclaredArtifact(_)
+            | StarlarkArtifactView::PromiseArtifact(_) => {
+                StarlarkArtifact::new(artifact.non_promise_artifact()?)
+            }
+        };
+        Ok(EnsuredArtifact {
+            artifact,
+            abs: false,
+        })
+    }
+
     pub(crate) fn as_artifact(&self) -> &dyn StarlarkInputArtifactLike<'_> {
         &self.artifact as &dyn StarlarkInputArtifactLike
     }
@@ -290,24 +246,6 @@ impl Display for EnsuredArtifactGroupInner {
     }
 }
 
-impl<'v> AllocValue<'v> for EnsuredArtifact {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_complex_no_freeze(self)
-    }
-}
-
-impl<'v> AllocValue<'v> for EnsuredArtifactGroup<'v> {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_complex_no_freeze(self)
-    }
-}
-
-impl<'v> AllocValue<'v> for EnsuredArtifactGroupInner {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_complex_no_freeze(self)
-    }
-}
-
 impl Serialize for EnsuredArtifact {
     fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
     where
@@ -337,12 +275,7 @@ impl Serialize for EnsuredArtifactGroupInner {
 
 starlark::methods_static!(ENSURED_ARTIFACT_METHODS = ensured_artifact_methods);
 
-#[starlark_value(
-    type = "bxl.EnsuredArtifact",
-    StarlarkTypeRepr,
-    UnpackValue,
-    ty_vtable_no_freeze
-)]
+#[starlark_value(type = "bxl.EnsuredArtifact", no_freeze)]
 impl<'v> StarlarkValue<'v> for EnsuredArtifact
 where
     Self: ProvidesStaticType<'v>,
@@ -392,7 +325,7 @@ fn ensured_artifact_methods(builder: &mut MethodsBuilder) {
                 abs: true,
             };
 
-            Ok(heap.alloc_typed(artifact))
+            Ok(heap.alloc_representation(artifact))
         }
     }
 
@@ -423,7 +356,7 @@ fn ensured_artifact_methods(builder: &mut MethodsBuilder) {
                 abs: false,
             };
 
-            Ok(heap.alloc_typed(artifact))
+            Ok(heap.alloc_representation(artifact))
         }
     }
 }
@@ -462,7 +395,7 @@ fn artifact_group_methods(builder: &mut MethodsBuilder) {
                 abs: true,
             };
 
-            Ok(heap.alloc_typed(artifact))
+            Ok(heap.alloc_representation(artifact))
         }
     }
 
@@ -493,7 +426,7 @@ fn artifact_group_methods(builder: &mut MethodsBuilder) {
                 abs: false,
             };
 
-            Ok(heap.alloc_typed(artifact))
+            Ok(heap.alloc_representation(artifact))
         }
     }
 }

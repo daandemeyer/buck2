@@ -41,12 +41,10 @@ use starlark::any::ProvidesStaticType;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
 use starlark::starlark_module;
-use starlark::values::AllocValue;
 use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkValue;
 use starlark::values::Trace;
-use starlark::values::Value;
 use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
 use starlark::values::dict::DictType;
@@ -198,8 +196,7 @@ pub(crate) struct BxlActions<'v> {
 
 /// Dependencies configured for the bxl action's execution platform, by the label they were
 /// requested as.
-type Deps<'v> =
-    ValueOf<'v, DictType<ValueTyped<'v, StarlarkProvidersLabel>, ValueTyped<'v, Dependency<'v>>>>;
+type Deps<'v> = ValueOf<'v, DictType<StarlarkProvidersLabel, Dependency<'v>>>;
 
 impl<'v> BxlActions<'v> {
     pub(crate) async fn new<'c>(
@@ -260,8 +257,8 @@ async fn alloc_deps<'v>(
             );
 
             buck2_error::Ok((
-                ValueOf::from(heap.alloc_typed(starlark_label)),
-                ValueOf::from(heap.alloc_typed(dependency)),
+                ValueOf::alloc(heap, starlark_label),
+                ValueOf::alloc(heap, dependency),
             ))
         })
         .collect::<Result<_, _>>()?;
@@ -271,16 +268,10 @@ async fn alloc_deps<'v>(
 
 starlark::methods_static!(BXL_ACTIONS_METHODS = bxl_actions_methods);
 
-#[starlark_value(type = "bxl.Actions", StarlarkTypeRepr, UnpackValue)]
+#[starlark_value(type = "bxl.Actions", no_freeze)]
 impl<'v> StarlarkValue<'v> for BxlActions<'v> {
     fn get_methods() -> Option<&'static Methods> {
         Some(BXL_ACTIONS_METHODS.methods())
-    }
-}
-
-impl<'v> AllocValue<'v> for BxlActions<'v> {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_complex_no_freeze(self)
     }
 }
 

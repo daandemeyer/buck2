@@ -79,9 +79,11 @@ struct ValidatedCommand {
     enable_miniperf: bool,
     std_redirects: Option<StdRedirectPaths>,
     graceful_shutdown_timeout_s: Option<u32>,
+    timeout_grace_period_s: Option<u32>,
     command_cgroup: Option<CgroupPathBuf>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     network_access: Option<buck2_data::NetworkAccess>,
+    kill_detached_descendants: bool,
 }
 
 impl ValidatedCommand {
@@ -97,6 +99,8 @@ impl ValidatedCommand {
             graceful_shutdown_timeout_s,
             command_cgroup,
             network_access,
+            timeout_grace_period_s,
+            kill_detached_descendants,
         } = cmd_request;
 
         let exe = OsStr::from_bytes(&exe);
@@ -130,11 +134,13 @@ impl ValidatedCommand {
             enable_miniperf,
             std_redirects,
             graceful_shutdown_timeout_s,
+            timeout_grace_period_s,
             command_cgroup,
             network_access: network_access
                 .map(buck2_data::NetworkAccess::try_from)
                 .transpose()
                 .map_err(|v| internal_error!("Invalid network_access value: {}", v))?,
+            kill_detached_descendants: kill_detached_descendants.unwrap_or(false),
         })
     }
 }
@@ -262,7 +268,11 @@ impl UnixForkserverService {
         freeze_rx: impl ActionFreezeEventReceiver,
     ) -> buck2_error::Result<RunStream> {
         let timeout = validated_cmd.timeout;
-        let graceful_shutdown_timeout_s = validated_cmd.graceful_shutdown_timeout_s;
+        let kill_process = DefaultKillProcess {
+            graceful_shutdown_timeout_s: validated_cmd.graceful_shutdown_timeout_s,
+            timeout_grace_period_s: validated_cmd.timeout_grace_period_s,
+            kill_detached_descendants: validated_cmd.kill_detached_descendants,
+        };
         let std_redirects = validated_cmd.std_redirects;
         let cgroup = validated_cmd.command_cgroup.clone();
         let stream = match miniperf_output {
@@ -271,9 +281,7 @@ impl UnixForkserverService {
                 timeout,
                 cancellation,
                 MiniperfStatusDecoder::new(out),
-                DefaultKillProcess {
-                    graceful_shutdown_timeout_s,
-                },
+                kill_process,
                 std_redirects,
                 false,
                 cgroup,
@@ -286,9 +294,7 @@ impl UnixForkserverService {
                 timeout,
                 cancellation,
                 DefaultStatusDecoder,
-                DefaultKillProcess {
-                    graceful_shutdown_timeout_s,
-                },
+                kill_process,
                 std_redirects,
                 false,
                 cgroup,

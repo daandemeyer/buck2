@@ -8,7 +8,6 @@
  * above-listed licenses.
  */
 
-use std::convert::Infallible;
 use std::ops::Deref;
 use std::slice;
 use std::sync::OnceLock;
@@ -44,9 +43,12 @@ use starlark::typing::TyUser;
 use starlark::typing::TyUserIndex;
 use starlark::typing::TyUserParams;
 use starlark::typing::TypingBinOp;
-use starlark::values::AllocValue;
+use starlark::values::AllocFrozenRepresentation;
+use starlark::values::AllocRepresentation;
+use starlark::values::Allocator;
 use starlark::values::Freeze;
 use starlark::values::FreezeResult;
+use starlark::values::FrozenAllocator;
 use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkPagable;
@@ -54,8 +56,8 @@ use starlark::values::StarlarkValue;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
 use starlark::values::ValueError;
+use starlark::values::ValueTyped;
 use starlark::values::starlark_value;
-use starlark::values::type_repr::StarlarkTypeRepr;
 use starlark::values::typing::TypeCompiled;
 use starlark::values::typing::TypeInstanceId;
 
@@ -179,34 +181,26 @@ impl<'v, Node: QueryTarget> Freeze<'v> for StarlarkTargetSet<Node> {
     }
 }
 
-impl<Node: NodeLike> StarlarkTypeRepr for &StarlarkTargetSet<Node>
-where
-    StarlarkTargetSet<Node>: HasTyVTable,
-{
-    type Canonical = Self;
-
-    fn starlark_type_repr() -> Ty {
-        StarlarkTargetSet::<Node>::starlark_type_repr()
-    }
-}
-
-impl<'v, Node: NodeLike> UnpackValue<'v> for &'v StarlarkTargetSet<Node>
-where
-    StarlarkTargetSet<Node>: HasTyVTable,
-{
-    type Error = Infallible;
-
-    fn unpack_value_impl(x: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        Ok(StarlarkTargetSet::from_value(x))
-    }
-}
-
-impl<'v, Node: NodeLike> AllocValue<'v> for StarlarkTargetSet<Node>
+// A type with type parameters gets no allocation impls from `#[starlark_value]`.
+impl<'v, Node: NodeLike> AllocRepresentation<'v> for StarlarkTargetSet<Node>
 where
     Self: HasTyVTable,
 {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_simple(self)
+    type Repr = Self;
+
+    fn alloc(self, allocator: Allocator<'v>) -> ValueTyped<'v, Self> {
+        allocator.alloc_simple(self)
+    }
+}
+
+impl<'fv, Node: NodeLike> AllocFrozenRepresentation<'fv> for StarlarkTargetSet<Node>
+where
+    Self: HasTyVTable,
+{
+    type Repr = Self;
+
+    fn alloc_frozen(self, allocator: FrozenAllocator<'fv>) -> ValueTyped<'fv, Self> {
+        allocator.alloc_simple(self)
     }
 }
 
@@ -261,7 +255,7 @@ where
     fn add(&self, other: Value<'v>, heap: Heap<'v>) -> Option<starlark::Result<Value<'v>>> {
         let other = other.downcast_ref::<Self>()?;
         let union = self.0.union(&other.0);
-        Some(Ok(heap.alloc(Self(union))))
+        Some(Ok(heap.alloc_representation(Self(union)).to_value()))
     }
 
     fn sub(&self, other: Value<'v>, heap: Heap<'v>) -> starlark::Result<Value<'v>> {
@@ -269,7 +263,7 @@ where
             return ValueError::unsupported_with(self, "-", other);
         };
         let difference = self.0.difference(&other.0)?;
-        Ok(heap.alloc(Self(difference)))
+        Ok(heap.alloc_representation(Self(difference)).to_value())
     }
 
     fn equals(&self, other: Value<'v>) -> starlark::Result<bool> {
@@ -284,7 +278,7 @@ where
             return ValueError::unsupported_with(self, "&", other);
         };
         let intersect = self.0.intersect(&other.0)?;
-        Ok(heap.alloc(Self(intersect)))
+        Ok(heap.alloc_representation(Self(intersect)).to_value())
     }
 }
 
@@ -311,15 +305,6 @@ impl<Node: QueryTarget> Deref for StarlarkTargetSet<Node> {
 
     fn deref(&self) -> &Self::Target {
         &self.0
-    }
-}
-
-impl<Node: NodeLike> StarlarkTargetSet<Node>
-where
-    Self: HasTyVTable,
-{
-    pub(crate) fn from_value<'v>(x: Value<'v>) -> Option<&'v Self> {
-        x.downcast_ref::<Self>()
     }
 }
 
@@ -469,6 +454,7 @@ starlark::__starlark_pagable_only! {
         use pagable::PagableSerialize;
         use starlark::values::FrozenHeapName;
         use starlark::values::OwnedFrozen;
+        use starlark::values::StarlarkTypeExpr;
 
         use super::*;
 
@@ -533,7 +519,7 @@ starlark::__starlark_pagable_only! {
             let set = TargetSet::from_iter([node]);
             let owned: OwnedFrozen<Value<'static>> = OwnedFrozen::build(
                 FrozenHeapName::user("configured_target_set_round_trips"),
-                |heap| heap.alloc_simple(StarlarkTargetSet(set.clone())),
+                |heap| heap.alloc_representation(StarlarkTargetSet(set.clone())).to_value(),
             );
 
             let mut serializer = pagable::testing::TestingSerializer::new();
@@ -571,7 +557,10 @@ starlark::__starlark_pagable_only! {
             let node = ActionQueryNode::new_analysis(ConfiguredProvidersLabel::default_for(label), analysis);
             let owned: OwnedFrozen<Value<'static>> = OwnedFrozen::build(
                 FrozenHeapName::user("aquery_target_set_fails_page_out_without_panicking"),
-                |heap| heap.alloc_simple(StarlarkTargetSet(TargetSet::from_iter([node]))),
+                |heap| {
+                    heap.alloc_representation(StarlarkTargetSet(TargetSet::from_iter([node])))
+                        .to_value()
+                },
             );
 
             let mut serializer = pagable::testing::TestingSerializer::new();

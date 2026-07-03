@@ -15,11 +15,9 @@
  * limitations under the License.
  */
 
-mod alloc_value;
 mod docs;
 mod freeze;
 mod macro_item;
 mod module;
 mod trace;
 mod unpack_value;
-mod unpack_value_attr;

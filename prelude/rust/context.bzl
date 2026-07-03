@@ -27,7 +27,12 @@ load(
     ":link_info.bzl",
     "resolve_deps",
 )
-load(":rust_toolchain.bzl", "RustToolchainInfo")
+load(
+    ":rust_toolchain.bzl",
+    "RustArchToolchainInfo",
+    "RustToolchainInfo",
+    "get_rust_arch_toolchain_info",
+)
 load(
     ":sources.bzl",
     "RustSources",
@@ -39,6 +44,7 @@ load(
 # (rustdoc just relays bunch of the same args to rustc when trying to gen docs)
 CommonArgsInfo = record(
     args = field(cmd_args),
+    arch_dependency_args = field(dict[str, cmd_args] | None),
     subdir = field(str),
     tempfile = field(str),
     crate_type = field(CrateType),
@@ -49,6 +55,7 @@ CommonArgsInfo = record(
 
 DependencyArgsInfo = record(
     args = field(cmd_args),
+    arch_args = field(dict[str, cmd_args] | None),
     crate_map = field(list[(CrateName, Label)]),
 )
 
@@ -88,11 +95,14 @@ CompileContext = record(
     # Linker args to pass the linker wrapper to rustc.
     sysroot_args = field(cmd_args),
     toolchain_info = field(RustToolchainInfo),
+    arch_toolchain_info = field(RustArchToolchainInfo | None),
     transitive_dependency_dirs = field(set[Artifact]),
 )
 
 def compile_context(ctx: AnalysisContext, binary: bool = False) -> CompileContext:
-    toolchain_info = ctx.attrs._rust_toolchain[RustToolchainInfo]
+    toolchain = ctx.attrs._rust_toolchain
+    toolchain_info = toolchain[RustToolchainInfo]
+    arch_toolchain_info = get_rust_arch_toolchain_info(toolchain, ctx.label)
     _validate_nightly_features(toolchain_info)
     internal_tools_info = ctx.attrs._rust_internal_tools_toolchain[RustInternalToolsInfo]
     cxx_toolchain_info = get_cxx_toolchain_info(ctx)
@@ -100,7 +110,8 @@ def compile_context(ctx: AnalysisContext, binary: bool = False) -> CompileContex
     srcs = symlinked_srcs(ctx)
 
     linker_with_pre_args = _linker(ctx, cxx_toolchain_info.linker_info, binary = binary)
-    clippy_wrapper = _clippy_wrapper(ctx, toolchain_info)
+    # Multi-arch branch dispatch directly from the variant's clippy_driver, it doesn't need the clippy_wrapper here.
+    clippy_wrapper = cmd_args() if arch_toolchain_info != None else _clippy_wrapper(ctx, toolchain_info)
 
     dep_ctx = DepCollectionContext(
         advanced_unstable_linking = toolchain_info.advanced_unstable_linking,
@@ -158,6 +169,7 @@ def compile_context(ctx: AnalysisContext, binary: bool = False) -> CompileContex
         transitive_srcs = transitive_srcs,
         sysroot_args = sysroot_args,
         toolchain_info = toolchain_info,
+        arch_toolchain_info = arch_toolchain_info,
         transitive_dependency_dirs = set(),
     )
 

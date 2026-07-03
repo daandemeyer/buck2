@@ -20,7 +20,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import javax.annotation.Nullable;
+import org.jspecify.annotations.Nullable;
 
 /** Basic implementation of AndroidDevice for mocking purposes. */
 public class TestAndroidDevice implements AndroidDevice {
@@ -65,11 +65,6 @@ public class TestAndroidDevice implements AndroidDevice {
 
   @Override
   public void uninstallPackage(String packageName) throws Exception {
-    throw new UnsupportedOperationException();
-  }
-
-  @Override
-  public String getApkManifestDigest(String packagePath) throws Exception {
     throw new UnsupportedOperationException();
   }
 

@@ -865,9 +865,13 @@ impl<'f> ExprCompiled<'f> {
                 None
             }
         } else if let Some(v) = v.downcast_ref::<StarlarkFloat>() {
-            Some(ExprCompiled::Value(heap.alloc(*v)))
+            Some(ExprCompiled::Value(
+                heap.alloc_representation(*v).to_value(),
+            ))
         } else if let Some(v) = v.downcast_ref::<Range>() {
-            Some(ExprCompiled::Value(heap.alloc(*v)))
+            Some(ExprCompiled::Value(
+                heap.alloc_representation(*v).to_value(),
+            ))
         } else if let Some(v) = ListRef::from_value(v) {
             // When spec-safe function returned a non-frozen list,
             // we try to convert that list to a list of constants instruction.
@@ -922,7 +926,11 @@ impl<'f> ExprCompiled<'f> {
         let v = get_attr_hashed_raw(ctx.edge().rebrand(left), attr, ctx.heap()).ok()?;
         match v {
             MemberOrValue::Member(m) => match m.at() {
-                UnboundValue::Method(m) => Some(ctx.frozen_heap().alloc(BoundMethod::new(left, m))),
+                UnboundValue::Method(m) => Some(
+                    ctx.frozen_heap()
+                        .alloc_representation(BoundMethod::new(left, m))
+                        .to_value(),
+                ),
                 UnboundValue::Attr(..) => None,
             },
             MemberOrValue::Value(v) => ctx.demote(v),
@@ -1117,7 +1125,9 @@ impl AstLiteralCompile for AstLiteral {
             AstLiteral::Int(i) => heap.alloc(StarlarkInt::from(i.node.clone())),
             AstLiteral::Float(f) => heap.alloc(f.node),
             AstLiteral::String(x) => heap.alloc(x.node.as_str()),
-            AstLiteral::Bytes(b) => heap.alloc(StarlarkBytes::new(&b.node)),
+            AstLiteral::Bytes(b) => heap
+                .alloc_representation(StarlarkBytes::new(&b.node))
+                .to_value(),
             AstLiteral::Ellipsis => heap.alloc(Ellipsis),
         }
     }

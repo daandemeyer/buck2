@@ -44,7 +44,6 @@ use crate::values::record::record_type::RecordTypeError;
 use crate::values::record::record_type::RecordTypeGen;
 use crate::values::record::record_type::RecordTypeView;
 use crate::values::record::record_type::RecordVariant;
-use crate::values::type_repr::StarlarkTypeRepr;
 use crate::values::types::type_instance_id::TypeInstanceId;
 
 #[derive(Debug, thiserror::Error)]
@@ -190,24 +189,6 @@ unsafe impl<'v> TrailingValues<'v> for Record<'v> {
     }
 }
 
-impl<'v> StarlarkTypeRepr for &'v Record<'v> {
-    type Canonical = Record<'v>;
-
-    #[inline]
-    fn starlark_type_repr() -> Ty {
-        <Record as StarlarkValue>::get_type_starlark_repr()
-    }
-}
-
-impl<'v> UnpackValue<'v> for &'v Record<'v> {
-    type Error = std::convert::Infallible;
-
-    #[inline]
-    fn unpack_value_impl(x: Value<'v>) -> Result<Option<&'v Record<'v>>, Self::Error> {
-        Ok(Record::from_value(x))
-    }
-}
-
 #[starlark_value(type = Record::TYPE)]
 impl<'v> StarlarkValue<'v> for Record<'v> {
     fn is_special(_: Private) -> bool
@@ -292,11 +273,10 @@ mod tests {
             "port".to_owned(),
             Field::new(TypeCompiled::from_ty(&Ty::int(), heap), None),
         );
-        ValueTyped::new_err(heap.alloc(RecordType::new(
+        heap.alloc_representation(RecordType::new(
             fields,
             TypeInstanceId::for_test(&"unnamed_ip_address_record_type"),
-        )))
-        .expect("just allocated a RecordType")
+        ))
     }
 
     fn ip_address_record_type<'v>(module: &Module<'v>) -> ValueTyped<'v, RecordType<'v>> {
@@ -426,11 +406,10 @@ mod tests {
                     Some(heap.alloc(80)),
                 ),
             );
-            let typ = ValueTyped::<RecordType>::new_err(heap.alloc(RecordType::new(
+            let typ = heap.alloc_representation(RecordType::new(
                 fields,
                 TypeInstanceId::for_test(&"ip_address_record_type_with_defaulted_port"),
-            )))
-            .expect("just allocated a RecordType");
+            ));
             let mut eval = Evaluator::new(&module);
             typ.to_value()
                 .export_as("IpAddress", &mut eval)

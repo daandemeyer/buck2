@@ -50,19 +50,19 @@ use crate::values::Freezer;
 use crate::values::FrozenHeap;
 use crate::values::Heap;
 use crate::values::HeapEdge;
+use crate::values::StarlarkType;
+use crate::values::StarlarkTypeExpr;
 use crate::values::StarlarkValue;
 use crate::values::StringValue;
 use crate::values::Trace;
 use crate::values::Tracer;
 use crate::values::UnpackValue;
 use crate::values::Value;
-use crate::values::alloc_value::AllocStringValue;
+use crate::values::ValueOf;
 use crate::values::layout::avalue::AValue;
 use crate::values::layout::avalue::AValueImpl;
 use crate::values::layout::heap::repr::AValueRepr;
-use crate::values::starlark_type_id::StarlarkTypeId;
 use crate::values::string::str_type::StarlarkStr;
-use crate::values::type_repr::StarlarkTypeRepr;
 
 /// [`Value`] wrapper which asserts contained value is of type `<T>`.
 #[derive(Copy_, Clone_, Dupe_, ProvidesStaticType, Allocative)]
@@ -310,7 +310,7 @@ impl<'v, T: StarlarkValue<'v>> FrozenValueTyped<'v, T> {
         value.downcast_ref_err::<T>()?;
         if !value.is_frozen() {
             return Err(crate::Error::new_value(NotFrozenError {
-                expected: T::starlark_type_repr(),
+                expected: T::get_type_starlark_repr(),
                 value: value.to_string_for_type_error(),
             }));
         }
@@ -381,25 +381,30 @@ impl<'v, T: StarlarkValue<'v>> Deref for ValueTyped<'v, T> {
     }
 }
 
-impl<'v, T: StarlarkValue<'v>> StarlarkTypeRepr for ValueTyped<'v, T> {
-    type Canonical = <T as StarlarkTypeRepr>::Canonical;
-
-    fn starlark_type_repr() -> Ty {
-        T::starlark_type_repr()
-    }
-}
-
-impl<'v, T: StarlarkValue<'v>> UnpackValue<'v> for ValueTyped<'v, T> {
+/// A parameter of a type with one representation, bound to that representation. A type with
+/// several representations is bound as its view or as a [`ValueOf`]; a specific representation
+/// of it is not a parameter binding.
+impl<'v, T> UnpackValue<'v> for ValueTyped<'v, T>
+where
+    T: StarlarkValue<'v> + StarlarkType<'v, Get = ValueTyped<'v, T>>,
+{
+    type Type = T;
     type Error = Infallible;
 
-    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        Ok(ValueTyped::new(value))
+    #[inline]
+    fn unpack(_value: ValueOf<'v, T>, get: ValueTyped<'v, T>) -> Result<Self, Infallible> {
+        Ok(get)
     }
 }
 
-impl<'v, T: StarlarkValue<'v>> AllocValue<'v> for ValueTyped<'v, T> {
-    fn alloc_value(self, _heap: Heap<'v>) -> Value<'v> {
-        self.0
+impl<'v, T: StarlarkValue<'v>> AllocValue<'v> for ValueTyped<'v, T>
+where
+    T::Type: StarlarkTypeExpr<'v>,
+{
+    type Type = T::Type;
+
+    fn alloc_value(self, _heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
+        ValueOf::from_representation(self)
     }
 }
 
@@ -434,46 +439,25 @@ where
     }
 }
 
-impl<'v> AllocStringValue<'v> for StringValue<'v> {
-    fn alloc_string_value(self, _heap: Heap<'v>) -> StringValue<'v> {
-        self
+impl<'v, T: StarlarkValue<'v>> AllocValue<'v> for FrozenValueTyped<'v, T>
+where
+    T::Type: StarlarkTypeExpr<'v>,
+{
+    type Type = T::Type;
+
+    fn alloc_value(self, _heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
+        ValueOf::from_representation(self.to_value_typed())
     }
 }
 
-impl<'v, T: StarlarkValue<'v>> StarlarkTypeRepr for FrozenValueTyped<'v, T> {
-    type Canonical = <T as StarlarkTypeRepr>::Canonical;
+impl<'v, T: StarlarkValue<'v>> AllocFrozenValue<'v> for FrozenValueTyped<'v, T>
+where
+    T::Type: StarlarkTypeExpr<'v>,
+{
+    type Type = T::Type;
 
-    fn starlark_type_repr() -> Ty {
-        T::starlark_type_repr()
-    }
-}
-
-impl<'v, T: StarlarkValue<'v>> UnpackValue<'v> for FrozenValueTyped<'v, T> {
-    type Error = crate::Error;
-
-    fn unpack_value_impl(value: Value<'v>) -> crate::Result<Option<Self>> {
-        if value.is_frozen() {
-            Ok(FrozenValueTyped::new_frozen(value))
-        } else if StarlarkTypeId::of::<T>() == value.vtable().starlark_type_id {
-            Err(crate::Error::new_value(NotFrozenError {
-                expected: T::starlark_type_repr(),
-                value: value.to_string_for_type_error(),
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-impl<'v, T: StarlarkValue<'v>> AllocValue<'v> for FrozenValueTyped<'v, T> {
-    fn alloc_value(self, _heap: Heap<'v>) -> Value<'v> {
-        self.0
-    }
-}
-
-impl<'v, T: StarlarkValue<'v>> AllocFrozenValue<'v> for FrozenValueTyped<'v, T> {
-    fn alloc_frozen_value(self, _heap: FrozenHeap<'v>) -> Value<'v> {
-        self.0
+    fn alloc_frozen_value(self, _heap: FrozenHeap<'v>) -> ValueOf<'v, Self::Type> {
+        ValueOf::from_representation(self.to_value_typed())
     }
 }
 
@@ -615,54 +599,13 @@ impl<'v, T: StarlarkValue<'v>> crate::pagable::StarlarkDeserialize<'v>
 
 #[cfg(test)]
 mod tests {
-    use starlark_derive::starlark_module;
-
-    use crate as starlark;
-    use crate::assert::Assert;
-    use crate::environment::GlobalsBuilder;
-    use crate::eval::Evaluator;
-    use crate::tests::util::TestComplexValue;
     use crate::values::FrozenValueTyped;
     use crate::values::Value;
     use crate::values::int::pointer_i32::PointerI32;
-    use crate::values::none::NoneType;
 
     #[test]
     fn int() {
         let v = FrozenValueTyped::<PointerI32>::new(Value::testing_new_int(17)).unwrap();
         assert_eq!(17, v.as_ref().get().to_i32());
-    }
-
-    #[test]
-    fn test_unpack_value_for_frozen_value_typed() {
-        #[starlark_module]
-        fn module(globals: &mut GlobalsBuilder) {
-            fn mutable<'v>() -> anyhow::Result<TestComplexValue<'v>> {
-                Ok(TestComplexValue(Value::new_none()))
-            }
-
-            fn frozen<'v>(eval: &mut Evaluator<'v, '_, '_>) -> anyhow::Result<Value<'v>> {
-                Ok(eval.frozen_heap(|fh, edge| {
-                    edge.rebrand(fh.alloc(TestComplexValue(Value::new_none())))
-                }))
-            }
-
-            fn takes_frozen_value_typed<'v>(
-                value: FrozenValueTyped<'v, TestComplexValue<'v>>,
-            ) -> anyhow::Result<NoneType> {
-                let _ = value;
-                Ok(NoneType)
-            }
-        }
-
-        let mut a = Assert::new();
-        a.globals_add(module);
-
-        a.pass("takes_frozen_value_typed(frozen())");
-        a.fail("takes_frozen_value_typed(1)", "Type of parameter `value` doesn't match, expected `TestComplexValue`, actual `int (repr: 1)`");
-        a.fail(
-            "takes_frozen_value_typed(mutable())",
-            "Expected frozen value",
-        );
     }
 }

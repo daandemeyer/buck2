@@ -20,14 +20,14 @@ use buck2_core::target::label::label::TargetLabel;
 use buck2_interpreter::types::target_label::StarlarkTargetLabel;
 use dupe::Dupe;
 use starlark::values::UnpackValue;
+use starlark::values::ValueOf;
 use starlark::values::none::NoneType;
-use starlark::values::type_repr::StarlarkTypeRepr;
 
-#[derive(StarlarkTypeRepr, UnpackValue)]
+#[derive(UnpackValue)]
 pub(crate) enum ValueAsStarlarkTargetLabel<'v> {
     None(NoneType),
     Str(&'v str),
-    TargetLabel(&'v StarlarkTargetLabel),
+    TargetLabel(ValueOf<'v, StarlarkTargetLabel>),
 }
 
 impl<'v> ValueAsStarlarkTargetLabel<'v> {

@@ -28,15 +28,14 @@ use starlark::starlark_module;
 use starlark::values::Freeze;
 use starlark::values::Heap;
 use starlark::values::StarlarkPagable;
-use starlark::values::StringValue;
+use starlark::values::StarlarkTypeExpr;
 use starlark::values::Trace;
-use starlark::values::UnpackValue;
 use starlark::values::Value;
 use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
-use starlark::values::dict::DictMut;
 use starlark::values::dict::DictType;
 use starlark::values::none::NoneOr;
+use starlark::values::string::StarlarkStr;
 
 use crate::constraint_setting_info::ConstraintSettingInfo;
 use crate::constraint_value_info::ConstraintValueInfo;
@@ -51,28 +50,22 @@ use crate::constraint_value_info::ConstraintValueInfo;
 #[derive(Debug, Trace, Freeze, ProvidesStaticType, Allocative, StarlarkPagable)]
 #[repr(C)]
 pub struct ConfigurationInfo<'v> {
-    constraints: ValueOf<
-        'v,
-        DictType<ValueTyped<'v, StarlarkTargetLabel>, ValueTyped<'v, ConstraintValueInfo<'v>>>,
-    >,
-    values: ValueOf<'v, DictType<StringValue<'v>, StringValue<'v>>>,
-    root_values: ValueOf<'v, DictType<StringValue<'v>, StringValue<'v>>>,
+    constraints: ValueOf<'v, DictType<StarlarkTargetLabel, ConstraintValueInfo<'v>>>,
+    values: ValueOf<'v, DictType<StarlarkStr, StarlarkStr>>,
+    root_values: ValueOf<'v, DictType<StarlarkStr, StarlarkStr>>,
 }
 
-type Constraints<'v> = ValueOf<
-    'v,
-    DictType<ValueTyped<'v, StarlarkTargetLabel>, ValueTyped<'v, ConstraintValueInfo<'v>>>,
->;
-type Buckconfigs<'v> = ValueOf<'v, DictType<StringValue<'v>, StringValue<'v>>>;
+type Constraints<'v> = ValueOf<'v, DictType<StarlarkTargetLabel, ConstraintValueInfo<'v>>>;
+type Buckconfigs<'v> = ValueOf<'v, DictType<StarlarkStr, StarlarkStr>>;
 
 impl<'v> ConfigurationInfo<'v> {
     pub fn to_config_setting_data(&self) -> buck2_error::Result<ConfigSettingData> {
         let mut constraints = BTreeMap::new();
         for entry in self.constraints.iter() {
             let (key, value) = entry?;
-            let (constraint_key, constraint_value) = value.unpack().to_constraint_key_value();
+            let (constraint_key, constraint_value) = value.to_constraint_key_value();
             debug_assert_eq!(
-                key.unpack().label(),
+                key.label(),
                 &constraint_key.key,
                 "dict key should match constraint setting label"
             );
@@ -100,24 +93,23 @@ impl<'v> ConfigurationInfo<'v> {
     /// Create a provider from configuration data.
     pub fn from_configuration_data(conf: &ConfigurationDataData, heap: Heap<'v>) -> Self {
         let constraints = conf.constraints.iter().map(|(k, v)| {
-            let constraint_setting_label = heap.alloc_typed(StarlarkTargetLabel::new(k.key.dupe()));
+            let constraint_setting_label =
+                ValueOf::alloc(heap, StarlarkTargetLabel::new(k.key.dupe()));
             let default_value = k
                 .default
                 .as_ref()
-                .map(|v| heap.alloc_typed(StarlarkProvidersLabel::new(v.0.dupe())));
-            let constraint_value_label = heap.alloc_typed(StarlarkProvidersLabel::new(v.0.dupe()));
-            let constraint_setting = heap.alloc_typed(ConstraintSettingInfo::new(
-                constraint_setting_label,
-                default_value,
-            ));
-            let constraint_value = heap.alloc_typed(ConstraintValueInfo::new(
-                constraint_setting,
-                constraint_value_label,
-            ));
-            (
-                ValueOf::from(constraint_setting_label),
-                ValueOf::from(constraint_value),
-            )
+                .map(|v| ValueOf::alloc(heap, StarlarkProvidersLabel::new(v.0.dupe())));
+            let constraint_value_label =
+                ValueOf::alloc(heap, StarlarkProvidersLabel::new(v.0.dupe()));
+            let constraint_setting = ValueOf::alloc(
+                heap,
+                ConstraintSettingInfo::new(constraint_setting_label, default_value),
+            );
+            let constraint_value = ValueOf::alloc(
+                heap,
+                ConstraintValueInfo::new(constraint_setting, constraint_value_label),
+            );
+            (constraint_setting_label, constraint_value)
         });
         ConfigurationInfo {
             constraints: ValueOf::alloc_dict(heap, constraints),
@@ -132,10 +124,7 @@ fn buckconfig_map<'v>(values: Buckconfigs<'v>) -> buck2_error::Result<BTreeMap<S
         .iter()
         .map(|entry| {
             let (k, v) = entry?;
-            Ok((
-                k.unpack().as_str().to_owned(),
-                v.unpack().as_str().to_owned(),
-            ))
+            Ok((k.get().as_str().to_owned(), v.get().as_str().to_owned()))
         })
         .collect()
 }
@@ -164,11 +153,11 @@ fn copy_constraints<'v>(
     let mut entries = Vec::with_capacity(constraints.dict().len());
     for entry in constraints.iter() {
         let (setting, value) = entry?;
-        if *setting.unpack() != *value.unpack().setting().label() {
+        if *setting != *value.setting().label() {
             return Err(buck2_error::Error::from(
                 ConfigurationInfoError::ConstraintsKeyValueMismatch(
-                    setting.unpack().to_string(),
-                    value.unpack().to_string(),
+                    setting.to_string(),
+                    value.to_string(),
                 ),
             )
             .into());
@@ -178,7 +167,7 @@ fn copy_constraints<'v>(
     Ok(ValueOf::alloc_dict(heap, entries))
 }
 
-fn copy_dict<'v, K: UnpackValue<'v>, V: UnpackValue<'v>>(
+fn copy_dict<'v, K: StarlarkTypeExpr<'v>, V: StarlarkTypeExpr<'v>>(
     dict: ValueOf<'v, DictType<K, V>>,
     heap: Heap<'v>,
 ) -> starlark::Result<ValueOf<'v, DictType<K, V>>> {
@@ -197,19 +186,19 @@ fn configuration_info_creator(globals: &mut GlobalsBuilder) {
         #[starlark(require = named, default = ValueOf::new_unchecked(Value::new_empty_dict()))]
         root_values: Buckconfigs<'v>,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<ConfigurationInfo<'v>> {
+    ) -> starlark::Result<ValueTyped<'v, ConfigurationInfo<'v>>> {
         let constraints = copy_constraints(constraints, eval.heap())?;
 
         let mut value_keys = BuckMutSet::default();
         for entry in values.iter() {
             let (k, _) = entry?;
-            let k = k.unpack().as_str();
+            let k = k.get().as_str();
             parse_config_section_and_key(k, None)?;
             value_keys.insert(k);
         }
         for entry in root_values.iter() {
             let (k, _) = entry?;
-            let k = k.unpack().as_str();
+            let k = k.get().as_str();
             parse_config_section_and_key(k, None)?;
             if value_keys.contains(k) {
                 return Err(buck2_error::Error::from(
@@ -219,11 +208,11 @@ fn configuration_info_creator(globals: &mut GlobalsBuilder) {
             }
         }
 
-        Ok(ConfigurationInfo {
+        Ok(eval.heap().alloc_representation(ConfigurationInfo {
             constraints,
             values,
             root_values,
-        })
+        }))
     }
 }
 
@@ -275,11 +264,11 @@ fn configuration_info_methods(builder: &mut MethodsBuilder) {
     /// ```
     fn get<'v>(
         this: &ConfigurationInfo<'v>,
-        #[starlark(require = pos)] key: ValueTyped<'v, ConstraintSettingInfo<'v>>,
+        #[starlark(require = pos)] key: ValueOf<'v, ConstraintSettingInfo<'v>>,
         heap: Heap<'v>,
     ) -> starlark::Result<NoneOr<ValueTyped<'v, ConstraintValueInfo<'v>>>> {
-        match this.constraints.get(key.label().to_value())? {
-            Some(v) => Ok(NoneOr::Other(v.unpack())),
+        match this.constraints.lookup(key.label().to_value())? {
+            Some(v) => Ok(NoneOr::Other(v.get())),
             // if not find in the constraints, we return the default constraint value
             None => Ok(get_default_constraint_value(key, heap)),
         }
@@ -309,14 +298,13 @@ fn configuration_info_methods(builder: &mut MethodsBuilder) {
     /// ```
     fn insert<'v>(
         this: &ConfigurationInfo<'v>,
-        #[starlark(require = pos)] value: ValueTyped<'v, ConstraintValueInfo<'v>>,
+        #[starlark(require = pos)] value: ValueOf<'v, ConstraintValueInfo<'v>>,
         heap: Heap<'v>,
     ) -> starlark::Result<NoneOr<ValueTyped<'v, ConstraintValueInfo<'v>>>> {
-        let constraint_value = value.as_ref();
-        let setting_info = constraint_value.setting();
+        let setting_info = value.setting();
         let label = setting_info.label();
 
-        let mut constraints = DictMut::from_value(this.constraints.to_value())?;
+        let mut constraints = this.constraints.dict_mut()?;
 
         let previous = constraints.aref.insert_hashed(
             label
@@ -360,11 +348,11 @@ fn configuration_info_methods(builder: &mut MethodsBuilder) {
     /// ```
     fn pop<'v>(
         this: &ConfigurationInfo<'v>,
-        #[starlark(require = pos)] key: ValueTyped<'v, ConstraintSettingInfo<'v>>,
+        #[starlark(require = pos)] key: ValueOf<'v, ConstraintSettingInfo<'v>>,
         heap: Heap<'v>,
     ) -> starlark::Result<NoneOr<ValueTyped<'v, ConstraintValueInfo<'v>>>> {
         let label = key.label();
-        let mut constraints = DictMut::from_value(this.constraints.to_value())?;
+        let mut constraints = this.constraints.dict_mut()?;
 
         // Remove and return the value
         let removed = constraints.aref.remove_hashed(
@@ -401,24 +389,24 @@ fn configuration_info_methods(builder: &mut MethodsBuilder) {
     fn copy<'v>(
         this: &ConfigurationInfo<'v>,
         heap: Heap<'v>,
-    ) -> starlark::Result<ConfigurationInfo<'v>> {
-        Ok(ConfigurationInfo {
+    ) -> starlark::Result<ValueTyped<'v, ConfigurationInfo<'v>>> {
+        Ok(heap.alloc_representation(ConfigurationInfo {
             constraints: copy_dict(this.constraints, heap)?,
             values: copy_dict(this.values, heap)?,
             root_values: copy_dict(this.root_values, heap)?,
-        })
+        }))
     }
 }
 
 /// Helper function to get the default constraint value from a constraint setting.
 /// Returns the default constraint value if one exists, otherwise returns None.
 fn get_default_constraint_value<'v>(
-    key: ValueTyped<'v, ConstraintSettingInfo<'v>>,
+    key: ValueOf<'v, ConstraintSettingInfo<'v>>,
     heap: Heap<'v>,
 ) -> NoneOr<ValueTyped<'v, ConstraintValueInfo<'v>>> {
     NoneOr::from_option(
         ConstraintValueInfo::default_from_constraint_setting(key)
-            .map(|constraint_value| heap.alloc_typed(constraint_value)),
+            .map(|constraint_value| heap.alloc_representation(constraint_value)),
     )
 }
 
@@ -435,8 +423,8 @@ mod tests {
                 root_values: ValueOf::alloc_dict(
                     heap,
                     [(
-                        ValueOf::from(heap.alloc_str("apple.key")),
-                        ValueOf::from(heap.alloc_str("value")),
+                        ValueOf::from_representation(heap.alloc_str("apple.key")),
+                        ValueOf::from_representation(heap.alloc_str("value")),
                     )],
                 ),
             };

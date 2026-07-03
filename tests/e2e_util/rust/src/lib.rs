@@ -49,6 +49,7 @@ extern crate self as buck2_e2e;
 pub mod ansi;
 pub mod approx;
 mod buck;
+pub mod eden;
 mod fixture;
 pub mod golden;
 pub mod http;
@@ -62,6 +63,7 @@ pub mod process;
 pub mod subscribe;
 pub mod testx;
 pub mod utils;
+pub mod windows_cmd;
 
 pub use buck2_e2e_macros::buck_test;
 

@@ -34,7 +34,7 @@ use crate::values::layout::avalue::AValueImpl;
 use crate::values::layout::avalue::heap_copy_impl;
 use crate::values::layout::heap::repr::AValueRepr;
 
-struct AValueComplex<T>(PhantomData<T>);
+pub(crate) struct AValueComplex<T>(PhantomData<T>);
 
 impl<'v, T> AValue<'v> for AValueComplex<T>
 where
@@ -75,7 +75,7 @@ where
 
 impl<'v> Heap<'v> {
     /// Allocate a value which can be traced (garbage collected) and frozen on the [`Heap`].
-    pub fn alloc_complex<T>(self, x: T) -> Value<'v>
+    pub(crate) fn alloc_complex<T>(self, x: T) -> Value<'v>
     where
         T: ComplexValue<'v>,
         T: HeapSendable<'v>,

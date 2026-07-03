@@ -10,7 +10,7 @@
 
 package com.facebook.buck.jvm.java.abi.source;
 
-import com.facebook.buck.util.liteinfersupport.Nullable;
+import com.facebook.infer.annotation.Nullsafe;
 import com.sun.source.tree.BlockTree;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
@@ -31,6 +31,7 @@ import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Examines the non-private interfaces of types defined in one or more {@link CompilationUnitTree}s
@@ -38,6 +39,7 @@ import javax.lang.model.type.TypeMirror;
  * compilation, to expose references that may be problematic when generating ABIs without
  * dependencies.
  */
+@Nullsafe(Nullsafe.Mode.LOCAL)
 class InterfaceScanner {
   public interface Listener {
     void onTypeDeclared(TypeElement type, TreePath path);

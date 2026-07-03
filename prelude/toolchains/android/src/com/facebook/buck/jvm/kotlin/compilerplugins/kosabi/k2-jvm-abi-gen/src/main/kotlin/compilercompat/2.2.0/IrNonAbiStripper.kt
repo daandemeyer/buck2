@@ -32,6 +32,7 @@ import org.jetbrains.kotlin.ir.declarations.*
 import org.jetbrains.kotlin.ir.expressions.*
 import org.jetbrains.kotlin.ir.expressions.impl.IrConstImpl
 import org.jetbrains.kotlin.ir.expressions.impl.IrReturnImpl
+import org.jetbrains.kotlin.ir.symbols.IrClassSymbol
 import org.jetbrains.kotlin.ir.symbols.IrReturnTargetSymbol
 import org.jetbrains.kotlin.ir.symbols.UnsafeDuringIrConstructionAPI
 import org.jetbrains.kotlin.ir.types.*
@@ -48,6 +49,18 @@ internal class NonAbiDeclarationsStrippingIrExtension(
     private val keptInlineBodies: Set<IrSimpleFunction>,
 ) : IrGenerationExtension {
 
+  private companion object {
+    // ACC_SYNTHETIC (ClassCodegen, FunctionCodegen), ACC_STRICT and ACC_SYNCHRONIZED
+    // (FunctionCodegen), and the DefaultImpls decision (InterfaceLowering, JvmCachedDeclarations).
+    val BACKEND_READ_SOURCE_ANNOTATIONS = setOf(
+        "kotlin.jvm.JvmSynthetic",
+        "kotlin.jvm.Strictfp",
+        "kotlin.jvm.Synchronized",
+        "kotlin.jvm.JvmDefaultWithCompatibility",
+        "kotlin.jvm.JvmDefaultWithoutCompatibility",
+    )
+  }
+
   private fun shouldStripAnnotation(annotation: IrConstructorCall): Boolean {
     val annotationClass = annotation.symbol.owner.parent as? IrClass ?: return false
     val annotationFqName = annotationClass.kotlinFqName.asString()
@@ -60,6 +73,22 @@ internal class NonAbiDeclarationsStrippingIrExtension(
     // We strip it from RuntimeInvisibleAnnotations via bytecode post-processing (see
     // ThrowsAnnotationStripper) to match K1 behavior and prevent Safe Kotlin errors.
     if (annotationFqName == "kotlin.jvm.Throws" || annotationFqName == "kotlin.Throws") {
+      return false
+    }
+
+    // Keep @Transient and @Volatile in IR: the JVM backend (ClassCodegen.computeFieldFlags)
+    // derives ACC_TRANSIENT/ACC_VOLATILE from these IR annotations. The retention-based strip
+    // below cannot be trusted for them: deserialized stdlib annotation classes (origin
+    // IR_EXTERNAL_DECLARATION_STUB) report @Retention(SOURCE) for kotlin.jvm.Transient, so the
+    // SOURCE check misfires and the field loses its flag (location-style compare failure:
+    // access 1 vs 129). Proven by fixture compare/parcelableTransient.
+    if (annotationFqName == "kotlin.jvm.Transient" || annotationFqName == "kotlin.jvm.Volatile") {
+      return false
+    }
+
+    // Keep SOURCE-retention annotations that the JVM backend reads to shape bytecode; the
+    // retention strip below would otherwise change the emitted ABI.
+    if (annotationFqName in BACKEND_READ_SOURCE_ANNOTATIONS) {
       return false
     }
 
@@ -218,6 +247,7 @@ internal class NonAbiDeclarationsStrippingIrExtension(
             pluginContext,
             repairLog,
             keptInlineBodies,
+            collectMustKeepPrivateClassNames(moduleFragment),
         ),
         null,
     )
@@ -231,6 +261,7 @@ internal class NonAbiDeclarationsStrippingIrVisitor(
     private val pluginContext: IrPluginContext,
     private val repairLog: AbiGenRepairLog,
     private val keptInlineBodies: Set<IrSimpleFunction>,
+    private val mustKeepPrivateClassNames: Set<String>,
 ) : IrElementTransformerVoidCompat() {
 
   override fun visitFile(declaration: IrFile): IrFile {
@@ -341,8 +372,12 @@ internal class NonAbiDeclarationsStrippingIrVisitor(
 
   // Convert a fake override to a real method with a stub body.
   private fun materializeFakeOverride(decl: IrSimpleFunction) {
+    // Any's methods always resolve through the present Any supertype: materializing
+    // them would add methods the library jar does not have (and consumers flag the
+    // mismatch). Leave the fake, which the backend skips as in the class ABI.
+    if (decl.isAnyMethod()) return
     decl.isFakeOverride = false
-    decl.modality = Modality.FINAL
+    // Keep the FIR modality: forcing FINAL breaks subclasses of open classes.
     decl.origin = IrDeclarationOrigin.DEFINED
     if (decl.body == null) {
       decl.body =
@@ -369,8 +404,16 @@ internal class NonAbiDeclarationsStrippingIrVisitor(
   // True when removeNonPublicApi will drop this class from the ABI, which is the only reason a
   // supertype has to leave a supertype list. Only top-level private classes are dropped; a nested
   // private class is kept, so a `private sealed class`/`sealed interface` and everything nested
-  // under it stays referenceable and must keep appearing as a supertype.
+  // under it stays referenceable and must keep appearing as a supertype. Must-keep classes
+  // stay, so hierarchies keep resolving; interfaces still strip even when kept, because
+  // fake overrides of their members materialize instead.
   private fun isClassAbsentFromAbi(irClass: IrClass): Boolean {
+    if (
+        irClass.kind != ClassKind.INTERFACE &&
+            mustKeepPrivateClassNames.contains(irClass.kotlinFqName.asString())
+    ) {
+      return false
+    }
     var current: IrClass = irClass
     while (true) {
       if (current.visibility == DescriptorVisibilities.LOCAL) {
@@ -528,6 +571,23 @@ internal class NonAbiDeclarationsStrippingIrVisitor(
             kind != ClassKind.ENUM_ENTRY &&
             kind != ClassKind.ANNOTATION_CLASS
 
+    // A top-level private class kept as a shell (a must-keep private class, or one
+    // carrying JVM-public nests) needs the same member stripping as a private nested
+    // class: its members are unreachable through the private owner, and keeping them leaks
+    // `error/NonExistentClass` references into the ABI when their types don't resolve on
+    // the ABI classpath. Nested classes still survive via the nested-class rule above, so
+    // the shell and its nests stay while the members go.
+    val ownerIsKeptPrivateShell =
+        this is IrClass &&
+            parent !is IrClass &&
+            (visibility == DescriptorVisibilities.PRIVATE ||
+                visibility == DescriptorVisibilities.LOCAL) &&
+            isMustKeepPrivateClass() &&
+            inlineClassRepresentation == null &&
+            kind != ClassKind.ENUM_CLASS &&
+            kind != ClassKind.ENUM_ENTRY &&
+            kind != ClassKind.ANNOTATION_CLASS
+
     this.declarations.filterIsInstance<IrProperty>().forEach { property ->
       if (property.isDelegated) property.backingField = null
     }
@@ -551,7 +611,7 @@ internal class NonAbiDeclarationsStrippingIrVisitor(
       if (declaration.isInlineClassBackingMember(inlineClassBackingFieldName))
           return@removeAll false
 
-      if (declaration.isPropertyDelegateBackingField()) return@removeAll true
+      if (declaration.isDelegateBackingField()) return@removeAll true
 
       // Keep synthetic declarations (generated by compiler)
       if (declaration.origin.isSynthetic) return@removeAll false
@@ -563,7 +623,7 @@ internal class NonAbiDeclarationsStrippingIrVisitor(
       // removing them crashes compilation instead of shrinking the ABI.
       // Private members go first, so the exemptions only ever keep non-private ones,
       // matching the general private-member rule below.
-      if (ownerIsPrivateNestedClass) {
+      if (ownerIsPrivateNestedClass || ownerIsKeptPrivateShell) {
         if (declaration.isPrivateOrLocal()) return@removeAll true
         if (declaration.origin == IrDeclarationOrigin.FAKE_OVERRIDE) return@removeAll false
         if ((declaration as? IrProperty)?.isConst == true) return@removeAll false
@@ -571,15 +631,37 @@ internal class NonAbiDeclarationsStrippingIrVisitor(
         return@removeAll true
       }
 
+      // A must-keep private class (named by kept sealed metadata or annotation literals) stays as a
+      // stub.
+      if (declaration.isMustKeepPrivateClass()) return@removeAll false
+
       // Remove private/local members only (NOT internal - K1 kept internal in ABI)
       declaration.isPrivateOrLocal()
     }
   }
 
-  private fun IrDeclaration.isPropertyDelegateBackingField(): Boolean =
-      this is IrField &&
-          visibility == DescriptorVisibilities.PRIVATE &&
-          origin == IrDeclarationOrigin.PROPERTY_DELEGATE
+  private fun IrDeclaration.isMustKeepPrivateClass(): Boolean {
+    if (this !is IrClass) return false
+    // A must-keep private class must stay (as a stub): dropping it breaks consumers.
+    return mustKeepPrivateClassNames.contains(this.kotlinFqName.asString())
+  }
+
+  private fun IrSimpleFunction.isAnyMethod(): Boolean {
+    if (
+        name.asString() != "equals" &&
+            name.asString() != "hashCode" &&
+            name.asString() != "toString"
+    ) {
+      return false
+    }
+    if (name.asString() != "equals") return valueParameters.isEmpty()
+    // An equals overload with a narrower parameter (equals(other: Foo)) does not
+    // override Any.equals; only equals(other: Any?) skips materialization.
+    val paramType = valueParameters.singleOrNull()?.type ?: return false
+    return (paramType as? IrSimpleType)?.classifier?.let {
+      (it as? IrClassSymbol)?.owner?.kotlinFqName?.asString()
+    } == "kotlin.Any" && paramType.isNullable()
+  }
 
   private fun IrDeclaration.isInlineClassBackingMember(backingFieldName: Name?): Boolean {
     if (backingFieldName == null) return false
@@ -653,6 +735,22 @@ internal class NonAbiDeclarationsStrippingIrVisitor(
       val body = declaration.body
       declaration.body = null
       return super.visitSimpleFunction(declaration).also { declaration.body = body }
+    }
+    // Members of a kept-but-dropped interface cannot carry implementations: the JVM
+    // backend moves interface bodies to DefaultImpls and crashes on the emptied
+    // method. Abstract them; no consumer can implement the private interface anyway.
+    val ownerClass = declaration.parent as? IrClass
+    if (
+        ownerClass != null &&
+            ownerClass.kind == ClassKind.INTERFACE &&
+            ownerClass.isPrivateOrLocal() &&
+            mustKeepPrivateClassNames.contains(ownerClass.kotlinFqName.asString()) &&
+            !declaration.isFakeOverride &&
+            declaration.modality != Modality.ABSTRACT
+    ) {
+      declaration.modality = Modality.ABSTRACT
+      declaration.body = null
+      return super.visitSimpleFunction(declaration)
     }
     if (!declaration.origin.isSynthetic) {
       if (declaration.parent is IrProperty) {

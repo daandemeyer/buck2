@@ -51,6 +51,9 @@ pub const BUCK_WRAPPER_PID_ENV_VAR: &str = "BUCK_WRAPPER_PID";
 pub const BUCK_WRAPPER_UUID_ENV_VAR: &str = "BUCK_WRAPPER_UUID";
 pub const BUCK_WRAPPER_START_TIME_ENV_VAR: &str = "BUCK_WRAPPER_START_TIME";
 pub const BUCKD_LIFECYCLE: &str = "buckd.lifecycle";
+/// Flocked by a `--no-buckd` client for its whole life to serialize daemon-less invocations.
+/// Like `BUCKD_LIFECYCLE`, never unlinked: a lock on an unlinked inode stops working.
+pub const DAEMONLESS_LOCK: &str = "daemonless.lock";
 /// Set to `1` on the `buck2 clean --stale` processes that `cleanall --stale` spawns, so their
 /// clean-stale runs are logged with the cleanall origin. An env var rather than a flag because the
 /// spawned client may be an older release that would reject an unknown flag.
@@ -98,6 +101,12 @@ pub struct KillallFilter {
     /// The path is compared against `/proc`-style fully-resolved working directories, so it
     /// should be canonicalized by the caller.
     pub project_root: Option<PathBuf>,
+    /// Never kill processes whose working directory is inside this directory, compared like
+    /// `project_root`.
+    ///
+    /// A shared daemon runs in the state directory of the checkout that started it but serves
+    /// other checkouts too, so a kill aimed at one checkout's processes must leave it alone.
+    pub exclude_cwd: Option<PathBuf>,
 }
 
 enum FilterResult {
@@ -121,6 +130,13 @@ impl KillallFilter {
             match &process.cwd {
                 Some(cwd) if cwd.starts_with(root) => {}
                 Some(_) => return FilterResult::Exclude,
+                None => return FilterResult::Unknown("unknown working directory"),
+            }
+        }
+        if let Some(excluded) = &self.exclude_cwd {
+            match &process.cwd {
+                Some(cwd) if cwd.starts_with(excluded) => return FilterResult::Exclude,
+                Some(_) => {}
                 None => return FilterResult::Unknown("unknown working directory"),
             }
         }
@@ -196,7 +212,7 @@ fn get_all_tgids_linux() -> Option<BuckMutSet<sysinfo::Pid>> {
 /// Working directories are only collected when `collect_cwd` is set, as sysinfo has to read
 /// them per-process.
 fn find_buck2_processes(who_is_asking: WhoIsAsking, collect_cwd: bool) -> Vec<ProcessInfo> {
-    let mut system = System::new();
+    let mut system = System::new().expect("should be supported on this platform");
     let linux_tgids =
         get_all_tgids_linux().map(|pids| pids.into_iter().collect::<Vec<sysinfo::Pid>>());
     let processes_to_update = match &linux_tgids {
@@ -278,7 +294,10 @@ fn find_buck2_processes(who_is_asking: WhoIsAsking, collect_cwd: bool) -> Vec<Pr
 /// Processes the filter cannot attribute are reported and left alone. Returns whether it
 /// succeeded without errors.
 pub fn killall(who_is_asking: WhoIsAsking, filter: &KillallFilter, write: impl Fn(String)) -> bool {
-    let found = find_buck2_processes(who_is_asking, filter.project_root.is_some());
+    let found = find_buck2_processes(
+        who_is_asking,
+        filter.project_root.is_some() || filter.exclude_cwd.is_some(),
+    );
     let found_any = !found.is_empty();
 
     let mut buck2_processes = Vec::new();
@@ -423,6 +442,7 @@ mod tests {
         let filter = |isolation_dir: Option<&str>, project_root: Option<&str>| KillallFilter {
             isolation_dir: isolation_dir.map(str::to_owned),
             project_root: project_root.map(PathBuf::from),
+            exclude_cwd: None,
         };
 
         for (filter, process, expected) in [
@@ -469,6 +489,24 @@ mod tests {
                 filter(Some("v2"), Some("/repo")),
                 process(Some("other"), Some("/repo")),
                 "exclude",
+            ),
+            // A shared daemon running in the checkout's state directory is left alone; other
+            // processes of the checkout are still killed.
+            (
+                KillallFilter {
+                    exclude_cwd: Some(PathBuf::from("/repo/buck-out/._buck2")),
+                    ..filter(None, Some("/repo"))
+                },
+                process(None, Some("/repo/buck-out/._buck2")),
+                "exclude",
+            ),
+            (
+                KillallFilter {
+                    exclude_cwd: Some(PathBuf::from("/repo/buck-out/._buck2")),
+                    ..filter(None, Some("/repo"))
+                },
+                process(None, Some("/repo/buck-out/v2")),
+                "kill",
             ),
         ] {
             let actual = match filter.classify(&process) {

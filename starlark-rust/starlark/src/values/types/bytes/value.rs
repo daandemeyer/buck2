@@ -40,9 +40,9 @@ use crate::values::Heap;
 use crate::values::StarlarkValue;
 use crate::values::UnpackValue;
 use crate::values::Value;
+use crate::values::ValueOf;
 use crate::values::index::apply_slice;
 use crate::values::index::convert_index;
-use crate::values::type_repr::StarlarkTypeRepr;
 
 /// The result of calling `type()` on bytes.
 pub const BYTES_TYPE: &str = "bytes";
@@ -64,43 +64,35 @@ pub struct StarlarkBytes {
 
 starlark_simple_value!(StarlarkBytes);
 
-impl StarlarkTypeRepr for &'_ [u8] {
-    type Canonical = StarlarkBytes;
-
-    fn starlark_type_repr() -> Ty {
-        StarlarkBytes::starlark_type_repr()
-    }
-}
-
 impl<'v> AllocValue<'v> for &'_ [u8] {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc(StarlarkBytes::new(self))
+    type Type = StarlarkBytes;
+
+    fn alloc_value(self, heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
+        ValueOf::alloc(heap, StarlarkBytes::new(self))
     }
 }
 
 impl<'fv> AllocFrozenValue<'fv> for &'_ [u8] {
-    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> Value<'fv> {
-        heap.alloc(StarlarkBytes::new(self))
-    }
-}
+    type Type = StarlarkBytes;
 
-impl StarlarkTypeRepr for Vec<u8> {
-    type Canonical = StarlarkBytes;
-
-    fn starlark_type_repr() -> Ty {
-        StarlarkBytes::starlark_type_repr()
+    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> ValueOf<'fv, Self::Type> {
+        ValueOf::alloc_frozen(heap, StarlarkBytes::new(self))
     }
 }
 
 impl<'v> AllocValue<'v> for Vec<u8> {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc(StarlarkBytes::from_vec(self))
+    type Type = StarlarkBytes;
+
+    fn alloc_value(self, heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
+        ValueOf::alloc(heap, StarlarkBytes::from_vec(self))
     }
 }
 
 impl<'fv> AllocFrozenValue<'fv> for Vec<u8> {
-    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> Value<'fv> {
-        heap.alloc(StarlarkBytes::from_vec(self))
+    type Type = StarlarkBytes;
+
+    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> ValueOf<'fv, Self::Type> {
+        ValueOf::alloc_frozen(heap, StarlarkBytes::from_vec(self))
     }
 }
 
@@ -269,7 +261,9 @@ impl<'v> StarlarkValue<'v> for StarlarkBytes {
         heap: Heap<'v>,
     ) -> crate::Result<Value<'v>> {
         let sliced = apply_slice(&self.content, start, stop, stride)?;
-        Ok(heap.alloc(StarlarkBytes::from_vec(sliced)))
+        Ok(heap
+            .alloc_representation(StarlarkBytes::from_vec(sliced))
+            .to_value())
     }
 
     /// `x in bytes`: supports both int (byte value) and bytes (subsequence).
@@ -305,7 +299,9 @@ impl<'v> StarlarkValue<'v> for StarlarkBytes {
             let mut result = Vec::with_capacity(self.content.len() + other.content.len());
             result.extend_from_slice(&self.content);
             result.extend_from_slice(&other.content);
-            Some(Ok(heap.alloc(StarlarkBytes::from_vec(result))))
+            Some(Ok(heap
+                .alloc_representation(StarlarkBytes::from_vec(result))
+                .to_value()))
         } else {
             None
         }
@@ -320,7 +316,9 @@ impl<'v> StarlarkValue<'v> for StarlarkBytes {
         };
         let count = std::cmp::max(0, l) as usize;
         let result = self.content.repeat(count);
-        Some(Ok(heap.alloc(StarlarkBytes::from_vec(result))))
+        Some(Ok(heap
+            .alloc_representation(StarlarkBytes::from_vec(result))
+            .to_value()))
     }
 
     fn rmul(&self, lhs: Value<'v>, heap: Heap<'v>) -> Option<crate::Result<Value<'v>>> {

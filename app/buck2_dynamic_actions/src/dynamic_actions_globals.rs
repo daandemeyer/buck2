@@ -20,9 +20,11 @@ use starlark::typing::ParamIsRequired;
 use starlark::typing::ParamSpec;
 use starlark::typing::Ty;
 use starlark::util::ArcStr;
+use starlark::values::Heap;
+use starlark::values::StarlarkTypeExpr;
 use starlark::values::ValueOf;
+use starlark::values::ValueTyped;
 use starlark::values::dict::DictType;
-use starlark::values::type_repr::StarlarkTypeRepr;
 use starlark::values::typing::StarlarkCallableChecked;
 
 use crate::attrs::DynamicAttrType;
@@ -41,7 +43,7 @@ pub fn new_dynamic_actions_callable<'v>(
         DynamicActionsCallbackParamSpec,
         DynamicActionsCallbackReturnType,
     >,
-    attrs: ValueOf<'v, DictType<String, &'v StarlarkDynamicAttrType<'v>>>,
+    attrs: ValueOf<'v, DictType<String, StarlarkDynamicAttrType<'v>>>,
     callback_param: &DynamicActionsCallbackParam,
 ) -> buck2_error::Result<DynamicActionsCallable<'v>> {
     if attrs.dict().get_str(callback_param.name.as_str()).is_some() {
@@ -51,10 +53,10 @@ pub fn new_dynamic_actions_callable<'v>(
         ));
     }
     let attrs: BuckMutInsertionMap<String, DynamicAttrType<'v>> = attrs
-        .try_items()
+        .iter()
         .map(|entry| {
             let (name, ty) = entry?;
-            Ok::<_, starlark::Error>((name, ty.ty.clone()))
+            Ok::<_, starlark::Error>((name.get(), ty.ty.clone()))
         })
         .collect::<starlark::Result<_>>()?;
 
@@ -116,9 +118,10 @@ pub fn register_dynamic_actions(globals: &mut GlobalsBuilder) {
         >,
         #[starlark(require = named)] attrs: ValueOf<
             'v,
-            DictType<String, &'v StarlarkDynamicAttrType<'v>>,
+            DictType<String, StarlarkDynamicAttrType<'v>>,
         >,
-    ) -> starlark::Result<DynamicActionsCallable<'v>> {
-        Ok(new_dynamic_actions_callable(r#impl, attrs, &P_ACTIONS)?)
+        heap: Heap<'v>,
+    ) -> starlark::Result<ValueTyped<'v, DynamicActionsCallable<'v>>> {
+        Ok(heap.alloc_representation(new_dynamic_actions_callable(r#impl, attrs, &P_ACTIONS)?))
     }
 }

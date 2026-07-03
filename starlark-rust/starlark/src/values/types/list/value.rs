@@ -53,6 +53,7 @@ use crate::values::StarlarkValue;
 use crate::values::StringValue;
 use crate::values::UnpackValue;
 use crate::values::Value;
+use crate::values::ValueOf;
 use crate::values::ValueTyped;
 use crate::values::array::Array;
 use crate::values::comparison::compare_slice;
@@ -61,7 +62,7 @@ use crate::values::error::ValueError;
 use crate::values::index::apply_slice;
 use crate::values::index::convert_index;
 use crate::values::list::ListRef;
-use crate::values::type_repr::StarlarkTypeRepr;
+use crate::values::list::ListType;
 
 #[derive(Clone, Default, Trace, Debug, ProvidesStaticType, Allocative)]
 #[repr(transparent)]
@@ -237,25 +238,21 @@ impl<'v> ListData<'v> {
 }
 
 impl<'v, V: AllocValue<'v>> AllocValue<'v> for Vec<V> {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_list_iter(self.into_iter().map(|x| x.alloc_value(heap)))
+    type Type = ListType<V::Type>;
+
+    fn alloc_value(self, heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
+        ValueOf::alloc_list(heap, self.into_iter().map(|x| x.alloc_value(heap)))
     }
 }
 
 impl<'fv, V: AllocFrozenValue<'fv>> AllocFrozenValue<'fv> for Vec<V> {
-    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> Value<'fv> {
-        heap.alloc_list(&self.into_map(|x| x.alloc_frozen_value(heap)))
-    }
-}
+    type Type = ListType<V::Type>;
 
-impl<'a, V: 'a> StarlarkTypeRepr for &'a [V]
-where
-    &'a V: StarlarkTypeRepr,
-{
-    type Canonical = <Vec<&'a V> as StarlarkTypeRepr>::Canonical;
-
-    fn starlark_type_repr() -> Ty {
-        Vec::<&'a V>::starlark_type_repr()
+    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> ValueOf<'fv, Self::Type> {
+        // The items are `V::Type` by `V`'s declaration.
+        ValueOf::new_unchecked(
+            heap.alloc_list(&self.into_map(|x| x.alloc_frozen_value(heap).to_value())),
+        )
     }
 }
 
@@ -263,8 +260,10 @@ impl<'a, 'v, V: 'a> AllocValue<'v> for &'a [V]
 where
     &'a V: AllocValue<'v>,
 {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_list_iter(self.iter().map(|x| x.alloc_value(heap)))
+    type Type = ListType<<&'a V as AllocValue<'v>>::Type>;
+
+    fn alloc_value(self, heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
+        ValueOf::alloc_list(heap, self.iter().map(|x| x.alloc_value(heap)))
     }
 }
 
@@ -272,8 +271,13 @@ impl<'fv, 'a, V: 'a> AllocFrozenValue<'fv> for &'a [V]
 where
     &'a V: AllocFrozenValue<'fv>,
 {
-    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> Value<'fv> {
-        heap.alloc_list(&self.map(|x| x.alloc_frozen_value(heap)))
+    type Type = ListType<<&'a V as AllocFrozenValue<'fv>>::Type>;
+
+    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> ValueOf<'fv, Self::Type> {
+        // The items are `V::Type` by `V`'s declaration.
+        ValueOf::new_unchecked(
+            heap.alloc_list(&self.map(|x| x.alloc_frozen_value(heap).to_value())),
+        )
     }
 }
 

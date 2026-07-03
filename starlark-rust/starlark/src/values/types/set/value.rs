@@ -49,12 +49,12 @@ use crate::values::Trace;
 use crate::values::UnpackValue;
 use crate::values::Value;
 use crate::values::ValueError;
+use crate::values::ValueOf;
 use crate::values::ValueTyped;
 use crate::values::comparison::equals_small_set;
 use crate::values::set::SetType;
 use crate::values::set::methods;
 use crate::values::starlark_value;
-use crate::values::type_repr::StarlarkTypeRepr;
 
 #[derive(
     Clone,
@@ -126,17 +126,19 @@ crate::register_simple_vtable_entry!(FrozenSet);
 // lifetime-erased, so the `'static` instantiation covers all heap lifetimes.
 unsafe impl<'v> crate::__derive_refs::VtableRegistered for SetGen<SetData<'v>> {}
 
-impl<'v> AllocValue<'v> for SetData<'v> {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_complex(SetGen(RefCell::new(self)))
+/// Every set is a `set[typing.Any]`.
+impl<'v> From<ValueOf<'v, SetView<'v>>> for ValueOf<'v, SetType<Value<'v>>> {
+    #[inline]
+    fn from(value: ValueOf<'v, SetView<'v>>) -> Self {
+        Self::new_unchecked(value.to_value())
     }
 }
 
-impl<'v> StarlarkTypeRepr for SetData<'v> {
-    type Canonical = <SetType<Value<'static>> as StarlarkTypeRepr>::Canonical;
+impl<'v> AllocValue<'v> for SetData<'v> {
+    type Type = SetType<Value<'v>>;
 
-    fn starlark_type_repr() -> Ty {
-        SetType::<Value<'v>>::starlark_type_repr()
+    fn alloc_value(self, heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
+        ValueOf::alloc(heap, SetGen(RefCell::new(self))).into()
     }
 }
 
@@ -360,31 +362,15 @@ impl<'v> StarlarkType<'v> for SetView<'v> {
     }
 
     // Set difference
-    //TODO(romanp) implement difference on small_set level and reuse it here and in difference function
     fn sub(&self, rhs: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         let rhs = SetRef::unpack_value_opt(rhs)
             .map_or_else(|| ValueError::unsupported_with(self, "-", rhs), Ok)?;
 
         let content = self.content();
-        if content.is_empty() {
-            return Ok(heap.alloc(SetData {
-                content: SmallSet::new(),
-            }));
-        }
 
-        if rhs.aref.content.is_empty() {
-            return Ok(heap.alloc(SetData {
-                content: content.clone(),
-            }));
-        }
+        let content = content.difference_with(&rhs.aref.content);
+        let data = SetData { content };
 
-        let mut data = SetData::default();
-
-        for elem in content.iter_hashed() {
-            if !rhs.aref.contains_hashed(elem.copied()) {
-                data.add_hashed(elem.copied());
-            }
-        }
         Ok(heap.alloc(data))
     }
 
@@ -402,7 +388,7 @@ impl<'v> StarlarkValue<'v> for SetGen<RefCell<SetData<'v>>> {
     type Type = SetView<'v>;
 }
 
-#[starlark_value]
+#[starlark_value(alloc = by_hand)]
 impl<'v> StarlarkValue<'v> for SetGen<SetData<'v>> {
     type Type = SetView<'v>;
 }

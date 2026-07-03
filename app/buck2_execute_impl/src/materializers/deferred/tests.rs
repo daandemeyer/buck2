@@ -878,6 +878,208 @@ pub(crate) mod state_machine {
     }
 
     #[tokio::test]
+    async fn test_fill_keeps_what_prepare_outputs_displaced() -> buck2_error::Result<()> {
+        ignore_stack_overflow_checks_for_future(async {
+            let io = Arc::new(StubIoHandler::new(temp_root()));
+            let path = make_path("foo/bar");
+            let copy = make_path("foo/copy");
+            let value = ArtifactValue::file(io.digest_config().empty_file());
+            let (dm, _daemon_dispatcher_events) = make_materializer(io.dupe(), None).await;
+            let cancellations = CancellationContext::testing();
+            let fill = async |lease: &WriteLease, path: &ProjectRelativePathBuf, from| {
+                dm.fill(
+                    lease,
+                    path.clone(),
+                    value.dupe(),
+                    from,
+                    RemoteExecutorUseCase::buck2_default(),
+                    &cancellations,
+                )
+                .await
+            };
+
+            let report = async |path: &ProjectRelativePathBuf| {
+                let lease = dm.prepare_outputs(vec![path.clone()]).await?;
+                dm.declare_existing(
+                    &lease,
+                    vec![DeclareArtifactPayload {
+                        path: path.clone(),
+                        artifact: value.dupe(),
+                    }],
+                )
+                .await?;
+                io.take_log();
+                buck2_error::Ok(())
+            };
+
+            // Materialized at the path: the lease keeps what it forgot, and the fill keeps it.
+            report(&path).await?;
+            let lease = dm.prepare_outputs(vec![path.clone()]).await?;
+            fill(&lease, &path, None).await?;
+            assert_eq!(io.take_log(), &[]);
+            drop(lease);
+
+            // Nothing known at the path any more: declared from the CAS and materialized.
+            let lease = dm.prepare_outputs(vec![path.clone()]).await?;
+            fill(&lease, &path, None).await?;
+            assert_eq!(
+                io.take_log(),
+                &[(Op::Clean, path.clone()), (Op::Materialize, path.clone())]
+            );
+            drop(lease);
+
+            // With a source this core tracks: a copy from it.
+            report(&path).await?;
+            let lease = dm.prepare_outputs(vec![copy.clone()]).await?;
+            fill(&lease, &copy, Some(path.clone())).await?;
+            assert_eq!(
+                io.take_log(),
+                &[(Op::Clean, copy.clone()), (Op::Materialize, copy.clone())]
+            );
+            drop(lease);
+
+            dm.abort();
+            Ok(())
+        })
+        .await
+    }
+
+    /// A filled path is its caller's to write, so once the caller is gone without reporting
+    /// it, the same value declared there has to be fetched again.
+    #[tokio::test]
+    async fn test_fill_forgets_what_it_fetched() -> buck2_error::Result<()> {
+        ignore_stack_overflow_checks_for_future(async {
+            let io = Arc::new(StubIoHandler::new(temp_root()));
+            let path = make_path("foo/bar");
+            let value = ArtifactValue::file(io.digest_config().empty_file());
+            let (dm, _daemon_dispatcher_events) = make_materializer(io.dupe(), None).await;
+
+            let lease = dm.prepare_outputs(vec![path.clone()]).await?;
+            dm.fill(
+                &lease,
+                path.clone(),
+                value.dupe(),
+                None,
+                RemoteExecutorUseCase::buck2_default(),
+                &CancellationContext::testing(),
+            )
+            .await?;
+            drop(lease);
+            io.take_log();
+
+            dm.declare_cas_many_impl(
+                Arc::new(CasDownloadInfo::new_declared(
+                    RemoteExecutorUseCase::buck2_default(),
+                )),
+                vec![DeclareArtifactPayload {
+                    path: path.clone(),
+                    artifact: value,
+                }],
+            )
+            .await?;
+            dm.ensure_materialized(vec![path.clone()], MaterializationPurpose::IntermediateOnly)
+                .await?;
+            assert_eq!(
+                io.take_log(),
+                &[(Op::Clean, path.clone()), (Op::Materialize, path)]
+            );
+
+            dm.abort();
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_fill_forgets_what_it_failed_to_fetch() -> buck2_error::Result<()> {
+        ignore_stack_overflow_checks_for_future(async {
+            let io = Arc::new(StubIoHandler::new(temp_root()));
+            let path = make_path("foo/bar");
+            let value = ArtifactValue::file(io.digest_config().empty_file());
+            let (dm, _daemon_dispatcher_events) = make_materializer(io.dupe(), None).await;
+
+            io.set_fail_on(vec![path.clone()]);
+            let lease = dm.prepare_outputs(vec![path.clone()]).await?;
+            let filled = dm
+                .fill(
+                    &lease,
+                    path.clone(),
+                    value,
+                    None,
+                    RemoteExecutorUseCase::buck2_default(),
+                    &CancellationContext::testing(),
+                )
+                .await;
+            assert!(filled.is_err());
+            assert!(!dm.has_artifact_at(path).await?);
+
+            dm.abort();
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_fill_forgets_what_it_was_fetching_when_dropped() -> buck2_error::Result<()> {
+        ignore_stack_overflow_checks_for_future(async {
+            let started = Arc::new(tokio::sync::Semaphore::new(0));
+            let mut io = StubIoHandler::new(temp_root());
+            io.block_materialization = Some(started.clone());
+            let path = make_path("foo/bar");
+            let value = ArtifactValue::file(io.digest_config().empty_file());
+            let (dm, _daemon_dispatcher_events) = make_materializer(Arc::new(io), None).await;
+
+            let lease = dm.prepare_outputs(vec![path.clone()]).await?;
+            let cancellations = CancellationContext::testing();
+            {
+                let fill = dm.fill(
+                    &lease,
+                    path.clone(),
+                    value,
+                    None,
+                    RemoteExecutorUseCase::buck2_default(),
+                    &cancellations,
+                );
+                futures::pin_mut!(fill);
+                tokio::select! {
+                    _ = &mut fill => panic!("The stub never finishes a materialization"),
+                    started = started.acquire() => started.unwrap().forget(),
+                }
+            }
+            assert!(!dm.has_artifact_at(path).await?);
+
+            dm.abort();
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_file_contents_path_after_materialization_before_finished()
+    -> buck2_error::Result<()> {
+        // A completed materialization must resolve to its destination before completion commands
+        // are processed. Materialize a declared artifact without processing those commands.
+        ignore_stack_overflow_checks_for_future(async {
+            let (mut dm, _) = make_processor(Default::default());
+            let digest_config = dm.io.digest_config();
+
+            let path = make_path("foo/bar");
+            dm.testing_declare(&path, ArtifactValue::file(digest_config.empty_file()));
+            dm.materialize_artifact(&path, EventDispatcher::null())
+                .internal_error("Expected a future")?
+                .await
+                .map_err(|e| buck2_error::buck2_error!(buck2_error::ErrorTag::Tier0, "{e:?}"))?;
+
+            assert_eq!(
+                dm.tree.file_contents_path(path.clone(), digest_config).ok(),
+                Some(path)
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
     async fn test_declare_reuse() -> buck2_error::Result<()> {
         ignore_stack_overflow_checks_for_future(async {
             let (mut dm, _) = make_processor(Default::default());
@@ -1320,7 +1522,7 @@ pub(crate) mod state_machine {
                 EventDispatcher::null(),
                 None,
             ));
-            receiver.await?.await?;
+            receiver.await?.1.await?;
             assert_eq!(*dm.stats.sizes.read(), MaterializerSizeStats::default());
 
             Ok(())

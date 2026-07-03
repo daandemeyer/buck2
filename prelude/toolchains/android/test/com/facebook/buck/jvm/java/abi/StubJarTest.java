@@ -38,14 +38,17 @@ import com.google.common.io.Files;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -8626,6 +8629,365 @@ public class StubJarTest {
         .addExpectedStub("com/example/buck/UsedHolder")
         .addExpectedStub("com/example/buck/UsedHolder$provide$1")
         .createAndCheckStubJar();
+  }
+
+  @Test
+  public void kotlinExcludesCompanionOfUnreferencedFilePrivateClass() throws IOException {
+    if (!isValidForKotlin()) {
+      return;
+    }
+
+    if (testingMode.equals(MODE_SOURCE_BASED)) {
+      return;
+    }
+
+    // The companion declares its own public visibility, but its outer is a file-private
+    // class nothing references, so the companion is effectively private and both must go.
+    tester = new Tester(Language.KOTLIN);
+    tester
+        .setSourceFile(
+            "A.kt",
+            "package com.example.buck",
+            "open class A {",
+            "  fun publicMethod(): String = \"hello\"",
+            "}",
+            "private data class FilePrivateConfig(",
+            "  val isConfigured: Boolean,",
+            "  val isEnabled: Boolean,",
+            ") {",
+            "  companion object {",
+            "    val DISABLED = FilePrivateConfig(false, false)",
+            "  }",
+            "}")
+        .addExpectedStub("com/example/buck/A")
+        .createAndCheckStubJar();
+  }
+
+  @Test
+  public void kotlinExcludesNestedClassOfUnreferencedFilePrivateClass() throws IOException {
+    if (!isValidForKotlin()) {
+      return;
+    }
+
+    if (testingMode.equals(MODE_SOURCE_BASED)) {
+      return;
+    }
+
+    // Same as above for a plain nested class: unreferenced file-private outer means the
+    // nested class is unreachable however it is declared.
+    tester = new Tester(Language.KOTLIN);
+    tester
+        .setSourceFile(
+            "A.kt",
+            "package com.example.buck",
+            "open class A {",
+            "  fun publicMethod(): String = \"hello\"",
+            "}",
+            "private class FilePrivateOuter {",
+            "  class Nested {",
+            "    fun run(): String = \"nested\"",
+            "  }",
+            "}")
+        .addExpectedStub("com/example/buck/A")
+        .createAndCheckStubJar();
+  }
+
+  @Test
+  public void kotlinKeepsCompanionOfReferencedFilePrivateClass() throws IOException {
+    if (!isValidForKotlin()) {
+      return;
+    }
+
+    if (testingMode.equals(MODE_SOURCE_BASED)) {
+      return;
+    }
+
+    // UsedHolder is kept via A's supertype edge, so its companion must be kept with it.
+    tester = new Tester(Language.KOTLIN);
+    tester
+        .setSourceFile(
+            "A.kt",
+            "package com.example.buck",
+            "@Suppress(\"EXPOSED_SUPER_CLASS\")",
+            "open class A : UsedHolder()",
+            "private open class UsedHolder {",
+            "  companion object {",
+            "    val TAG = \"used\"",
+            "  }",
+            "}")
+        .addExpectedStub("com/example/buck/A")
+        .addExpectedStub("com/example/buck/UsedHolder")
+        .addExpectedStub("com/example/buck/UsedHolder$Companion")
+        .createAndCheckStubJar();
+  }
+
+  @Test
+  public void kotlinKeepsFilePrivateSubclassOfSealedClass() throws IOException {
+    if (!isValidForKotlin()) {
+      return;
+    }
+
+    if (testingMode.equals(MODE_SOURCE_BASED)) {
+      return;
+    }
+
+    // S's metadata lists Priv1 as a sealed subclass. Without Priv1, a consumer's
+    // `when (s) { is Pub1 -> ... }` compiles as exhaustive and throws
+    // NoWhenBranchMatchedException at runtime.
+    tester = new Tester(Language.KOTLIN);
+    tester
+        .setSourceFile(
+            "A.kt",
+            "package com.example.buck",
+            "sealed class S",
+            "class Pub1 : S()",
+            "private class Priv1 : S()")
+        .addExpectedStub("com/example/buck/S")
+        .addExpectedStub("com/example/buck/Pub1")
+        .addExpectedStub("com/example/buck/Priv1")
+        .createAndCheckStubJar();
+  }
+
+  @Test
+  public void kotlinKeepsFilePrivateImplementationOfSealedInterface() throws IOException {
+    if (!isValidForKotlin()) {
+      return;
+    }
+
+    if (testingMode.equals(MODE_SOURCE_BASED)) {
+      return;
+    }
+
+    tester = new Tester(Language.KOTLIN);
+    tester
+        .setSourceFile(
+            "A.kt",
+            "package com.example.buck",
+            "sealed interface S",
+            "object Pub1 : S",
+            "private object Priv1 : S")
+        .addExpectedStub("com/example/buck/S")
+        .addExpectedStub("com/example/buck/Pub1")
+        .addExpectedStub("com/example/buck/Priv1")
+        .createAndCheckStubJar();
+  }
+
+  @Test
+  public void kotlinKeepsSealedSubclassNestedInFilePrivateClass() throws IOException {
+    if (!isValidForKotlin()) {
+      return;
+    }
+
+    if (testingMode.equals(MODE_SOURCE_BASED)) {
+      return;
+    }
+
+    tester = new Tester(Language.KOTLIN);
+    tester
+        .setSourceFile(
+            "A.kt",
+            "package com.example.buck",
+            "sealed class S",
+            "private class Holder {",
+            "  class Sub : S()",
+            "}")
+        .addExpectedStub("com/example/buck/S")
+        .addExpectedStub("com/example/buck/Holder")
+        .addExpectedStub("com/example/buck/Holder$Sub")
+        .createAndCheckStubJar();
+  }
+
+  @Test
+  public void kotlinExcludesFilePrivateClassOutsideSealedHierarchy() throws IOException {
+    if (!isValidForKotlin()) {
+      return;
+    }
+
+    if (testingMode.equals(MODE_SOURCE_BASED)) {
+      return;
+    }
+
+    tester = new Tester(Language.KOTLIN);
+    tester
+        .setSourceFile(
+            "A.kt",
+            "package com.example.buck",
+            "sealed class S",
+            "class Pub1 : S()",
+            "private class Unrelated")
+        .addExpectedStub("com/example/buck/S")
+        .addExpectedStub("com/example/buck/Pub1")
+        .createAndCheckStubJar();
+  }
+
+  private static final String WHEN_COLOR_ENUM = "enum class Color { RED, GREEN, BLUE }";
+
+  private static void assertWhenMappingsKept(JarFile jar, String className) throws IOException {
+    JarEntry entry = jar.getJarEntry(className + ".class");
+    assertNotNull(className + " missing from stub", entry);
+    ClassNode node = new ClassNode(Opcodes.ASM9);
+    try (InputStream in = jar.getInputStream(entry)) {
+      new ClassReader(in).accept(node, 0);
+    }
+    assertTrue(
+        className + " keeps $EnumSwitchMapping$0",
+        node.fields.stream().anyMatch(f -> f.name.equals("$EnumSwitchMapping$0")));
+    assertTrue(
+        className + " keeps a <clinit> body",
+        node.methods.stream()
+            .anyMatch(m -> m.name.equals("<clinit>") && m.instructions.size() > 0));
+  }
+
+  @Test
+  public void kotlinKeepsWhenMappingsReferencedByTopLevelInlineFunction() throws IOException {
+    if (!isValidForKotlin() || !testingMode.equals(MODE_JAR_BASED)) {
+      return;
+    }
+
+    // A caller inlining colorName copies its `when` and regenerates AKt$WhenMappings from the
+    // stub's <clinit>; without it kotlinc fails with "Couldn't inline method call".
+    AbsPath stubJar =
+        compileKotlinToStubJar(
+            "A.kt",
+            "package com.example.buck",
+            WHEN_COLOR_ENUM,
+            "@Suppress(\"NOTHING_TO_INLINE\")",
+            "inline fun colorName(c: Color): String = when (c) {",
+            "  Color.RED -> \"r\"",
+            "  Color.GREEN -> \"g\"",
+            "  Color.BLUE -> \"b\"",
+            "}");
+    try (JarFile jar = new JarFile(stubJar.toFile())) {
+      assertWhenMappingsKept(jar, "com/example/buck/AKt$WhenMappings");
+    }
+  }
+
+  @Test
+  public void kotlinKeepsWhenMappingsReferencedByMemberInlineFunction() throws IOException {
+    if (!isValidForKotlin() || !testingMode.equals(MODE_JAR_BASED)) {
+      return;
+    }
+
+    AbsPath stubJar =
+        compileKotlinToStubJar(
+            "A.kt",
+            "package com.example.buck",
+            WHEN_COLOR_ENUM,
+            "class Palette {",
+            "  @Suppress(\"NOTHING_TO_INLINE\")",
+            "  inline fun short(c: Color): Int = when (c) {",
+            "    Color.RED -> 1",
+            "    else -> 2",
+            "  }",
+            "}");
+    try (JarFile jar = new JarFile(stubJar.toFile())) {
+      assertWhenMappingsKept(jar, "com/example/buck/Palette$WhenMappings");
+    }
+  }
+
+  @Test
+  public void kotlinKeepsWhenMappingsReferencedByLambdaInInlineFunction() throws IOException {
+    if (!isValidForKotlin() || !testingMode.equals(MODE_JAR_BASED)) {
+      return;
+    }
+
+    AbsPath stubJar =
+        compileKotlinToStubJar(
+            "A.kt",
+            "package com.example.buck",
+            WHEN_COLOR_ENUM,
+            "inline fun colorTask(c: Color, crossinline sink: (Int) -> Unit): Runnable =",
+            "  Runnable { sink(when (c) { Color.RED -> 1; else -> 2 }) }");
+    try (JarFile jar = new JarFile(stubJar.toFile())) {
+      assertWhenMappingsKept(jar, "com/example/buck/AKt$colorTask$1$WhenMappings");
+    }
+  }
+
+  @Test
+  public void kotlinStripsWhenMappingsNotReferencedByInlineBodies() throws IOException {
+    if (!isValidForKotlin() || !testingMode.equals(MODE_JAR_BASED)) {
+      return;
+    }
+
+    AbsPath stubJar =
+        compileKotlinToStubJar(
+            "A.kt",
+            "package com.example.buck",
+            WHEN_COLOR_ENUM,
+            "fun colorName(c: Color): String = when (c) {",
+            "  Color.RED -> \"r\"",
+            "  else -> \"x\"",
+            "}");
+    try (JarFile jar = new JarFile(stubJar.toFile())) {
+      ClassNode node = readClass(jar, "com/example/buck/AKt$WhenMappings.class");
+      assertTrue(
+          "unreferenced WhenMappings stays stripped: " + methodNames(node),
+          node.fields.isEmpty() && !methodNames(node).contains("<clinit>"));
+    }
+  }
+
+  @Test
+  public void kotlinKeepsInlineScopeClassThatSortsBeforeItsOwner() throws IOException {
+    if (!isValidForKotlin() || !testingMode.equals(MODE_JAR_BASED)) {
+      return;
+    }
+
+    // Compose hoists capture-free lambdas of an inline function to
+    // ComposableSingletons$<File>Kt$lambda$N$1, whose path sorts before <File>Kt. Renaming the
+    // anonymous class (same length, so constant pools stay valid) reproduces that order without
+    // the Compose plugin.
+    File outputDir = temp.newFolder();
+    AbsPath compiledJar = AbsPath.of(outputDir.toPath()).resolve("compiled.jar");
+    try (KotlinTestCompiler compiler = new KotlinTestCompiler()) {
+      compiler.init();
+      compiler.addSourceFileContents(
+          "A.kt",
+          "package com.example.buck",
+          "inline fun task(): Runnable = object : Runnable {",
+          "  override fun run() {}",
+          "}");
+      compiler.compile();
+      compiler.getClasses().createJar(compiledJar.getPath(), false);
+    }
+
+    byte[] original = "com/example/buck/AKt$task$1".getBytes(StandardCharsets.UTF_8);
+    byte[] renamed = "com/example/buck/AAA$task$1".getBytes(StandardCharsets.UTF_8);
+    AbsPath fullJar = AbsPath.of(outputDir.toPath()).resolve("output.jar");
+    try (JarFile in = new JarFile(compiledJar.toFile());
+        JarOutputStream out = new JarOutputStream(new FileOutputStream(fullJar.toFile()))) {
+      for (Enumeration<JarEntry> entries = in.entries(); entries.hasMoreElements(); ) {
+        JarEntry entry = entries.nextElement();
+        byte[] bytes;
+        try (InputStream stream = in.getInputStream(entry)) {
+          bytes = ByteStreams.toByteArray(stream);
+        }
+        out.putNextEntry(new JarEntry(entry.getName().replace("AKt$task$1", "AAA$task$1")));
+        out.write(replaceAll(bytes, original, renamed));
+        out.closeEntry();
+      }
+    }
+
+    AbsPath stubJar = AbsPath.of(temp.newFolder().toPath()).resolve("stub.jar");
+    new StubJar(fullJar, false).writeTo(stubJar);
+    try (JarFile jar = new JarFile(stubJar.toFile())) {
+      assertNotNull(
+          "anonymous class of an inline function is kept even when it sorts before its owner",
+          jar.getJarEntry("com/example/buck/AAA$task$1.class"));
+    }
+  }
+
+  private static byte[] replaceAll(byte[] bytes, byte[] from, byte[] to) {
+    byte[] result = bytes.clone();
+    for (int i = 0; i + from.length <= result.length; i++) {
+      boolean match = true;
+      for (int j = 0; j < from.length && match; j++) {
+        match = result[i + j] == from[j];
+      }
+      if (match) {
+        System.arraycopy(to, 0, result, i, to.length);
+      }
+    }
+    return result;
   }
 
   @Test

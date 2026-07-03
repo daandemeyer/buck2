@@ -29,10 +29,11 @@ use buck2_common::client_utils::RetryError;
 use buck2_common::client_utils::get_channel_tcp;
 use buck2_common::client_utils::get_channel_uds;
 use buck2_common::client_utils::retrying;
+use buck2_common::daemon_compatibility::DaemonCompatibilityKey;
 use buck2_common::daemon_dir::DaemonDir;
 use buck2_common::init::DaemonStartupConfig;
 use buck2_common::invocation_paths::InvocationPaths;
-use buck2_common::invocation_paths::TenantDiskLock;
+use buck2_common::invocation_paths::UnidaemonLifetimeLock;
 use buck2_core::buck2_env;
 use buck2_core::soft_error_or_panic;
 use buck2_data::DaemonWasStartedReason;
@@ -50,6 +51,7 @@ use buck2_settings::BuckSettingChange;
 use buck2_util::truncate::truncate;
 use buck2_wrapper_common::invocation_id::TraceId;
 use buck2_wrapper_common::kill::process_exists;
+use buck2_wrapper_common::kill::recorded_process_may_be_running;
 use buck2_wrapper_common::pid::Pid;
 use dupe::Dupe;
 use futures::FutureExt;
@@ -71,6 +73,10 @@ use crate::daemon::client::BuckdClientConnector;
 use crate::daemon::client::BuckdLifecycleLock;
 use crate::daemon::client::kill;
 use crate::daemon::client::kill::hard_kill_until;
+use crate::daemon::client::namespaces::prune_exited_unidaemon_namespaces;
+use crate::daemon::client::tenant_slot::SlotOwner;
+use crate::daemon::client::tenant_slot::TenantProxy;
+use crate::daemon::client::tenant_slot::probe_slot;
 use crate::daemon::daemon_windows::spawn_background_process_on_windows;
 use crate::daemon_constraints;
 use crate::daemon_constraints::get_possibly_nested_invocation_daemon_uuid;
@@ -108,7 +114,6 @@ pub struct DaemonConstraintsRequest {
     /// Sandcastle id.
     user_version: Option<String>,
     desired_trace_io_state: DesiredTraceIoState,
-    nested_invocation_daemon_uuid: Option<String>,
     pub reject_daemon: Option<String>,
     pub reject_materializer_state: Option<String>,
     pub daemon_startup_config: DaemonStartupConfig,
@@ -159,6 +164,15 @@ impl ConstraintUnsatisfiedReason {
 }
 
 impl DaemonConstraintsRequest {
+    pub(crate) fn compatibility_key(&self) -> buck2_error::Result<DaemonCompatibilityKey> {
+        Ok(DaemonCompatibilityKey::new(
+            &self.version,
+            self.user_version.as_deref(),
+            &self.daemon_startup_config.serialize()?,
+            self.is_trace_io_requested(),
+        ))
+    }
+
     pub fn new(
         immediate_config: &ImmediateConfigContext<'_>,
         desired_trace_io_state: DesiredTraceIoState,
@@ -167,7 +181,6 @@ impl DaemonConstraintsRequest {
             version: daemon_constraints::version()?,
             user_version: daemon_constraints::user_version()?,
             desired_trace_io_state,
-            nested_invocation_daemon_uuid: get_possibly_nested_invocation_daemon_uuid(),
             reject_daemon: None,
             reject_materializer_state: None,
             daemon_startup_config: immediate_config.daemon_startup_config()?.clone(),
@@ -178,7 +191,26 @@ impl DaemonConstraintsRequest {
         matches!(self.desired_trace_io_state, DesiredTraceIoState::Enabled)
     }
 
-    fn satisfied(
+    /// Settles a request with no trace-I/O preference, which a daemon of the tenant's own would
+    /// serve either way, on the state of the daemon that serves the tenant under sharing, so that
+    /// the request hashes to that daemon's namespace. Without a proxy to follow it settles on no
+    /// tracing, as a daemon started for it would.
+    ///
+    /// A client that an action runs with its own isolation directory has no proxy to follow
+    /// either: it inherits the daemon's user version from its environment but not its trace
+    /// state, so under a tracing daemon it hashes to the non-tracing namespace and starts a
+    /// second shared daemon there. Nested clients under tracing are rare; this is left as is
+    /// until it matters.
+    pub(crate) fn settle_trace_io(&mut self, proxy: Option<&TenantProxy>) {
+        if let DesiredTraceIoState::Existing = self.desired_trace_io_state {
+            self.desired_trace_io_state = match proxy {
+                Some(proxy) if proxy.trace_io_enabled => DesiredTraceIoState::Enabled,
+                _ => DesiredTraceIoState::Disabled,
+            };
+        }
+    }
+
+    pub(crate) fn satisfied(
         &self,
         daemon: &buck2_cli_proto::DaemonConstraints,
     ) -> Result<(), ConstraintUnsatisfiedReason> {
@@ -186,9 +218,7 @@ impl DaemonConstraintsRequest {
             return Err(ConstraintUnsatisfiedReason::Version);
         }
 
-        if !is_nested_invocation(self.nested_invocation_daemon_uuid.as_ref(), daemon)
-            && self.user_version != daemon.user_version
-        {
+        if self.user_version != daemon.user_version {
             return Err(ConstraintUnsatisfiedReason::UserVersion);
         }
 
@@ -439,13 +469,21 @@ impl<'a> BuckdLifecycle<'a> {
     }
 
     async fn clean_daemon_dir(&self) -> buck2_error::Result<()> {
-        if buck2_env!("BUCK2_SHARE_DAEMON", type=bool, default=false)?
-            && !shared_daemon_is_inactive(self.lock.daemon_dir()).await?
+        if self.paths.routing()?.is_shared()
+            && !daemon_dir_is_inactive(self.paths, self.lock.daemon_dir()).await?
         {
-            return Err(buck2_error!(
-                ErrorTag::Input,
-                "Cannot verify shared daemon inactivity; no metadata was changed. Restore consistent buckd.info and buckd.pid before retrying."
-            ));
+            return Err(if self.paths.unidaemon_key().is_some() {
+                buck2_error!(
+                    ErrorTag::Input,
+                    "A daemon of this unidaemon namespace is still running, but its connection \
+                     records are missing; no metadata was changed. `buck2 killall` stops it."
+                )
+            } else {
+                buck2_error!(
+                    ErrorTag::Input,
+                    "Cannot verify shared daemon inactivity; no metadata was changed. Restore consistent buckd.info and buckd.pid before retrying."
+                )
+            });
         }
         self.lock
             .clean_daemon_dir(true)
@@ -481,6 +519,16 @@ impl<'a> BuckdLifecycle<'a> {
         }
 
         let mut daemon_env_vars = Vec::new();
+        if self.paths.unidaemon_key().is_some() {
+            daemon_env_vars.push((
+                OsStr::new("ENABLE_TRACE_IO"),
+                OsString::from(if constraints.is_trace_io_requested() {
+                    "true"
+                } else {
+                    "false"
+                }),
+            ));
+        }
 
         daemon_env_vars.push((OsStr::new("RUST_BACKTRACE"), OsString::from("1")));
 
@@ -806,6 +854,7 @@ impl BuckdChannel {
             daemon_dir,
             client,
             constraints: daemon_status.constraints,
+            tenant_generation: daemon_status.tenant_generation,
             daemon_start_instant: daemon_status.start_instant,
         })
     }
@@ -819,20 +868,111 @@ pub struct BootstrapBuckdClient {
     client: DaemonApiClient<InterceptedService<Channel, BuckAddAuthTokenInterceptor>>,
     /// The constraints for the daemon we're connected to.
     constraints: buck2_cli_proto::DaemonConstraints,
+    tenant_generation: Option<u64>,
     daemon_start_instant: Option<Instant>,
 }
 
 impl BootstrapBuckdClient {
+    /// The constraints the daemon reported when this client connected.
+    pub fn daemon_constraints(&self) -> &buck2_cli_proto::DaemonConstraints {
+        &self.constraints
+    }
+
+    /// The tenant generation a proxy reports; a daemon of its own reports none.
+    pub fn tenant_generation(&self) -> Option<u64> {
+        self.tenant_generation
+    }
+
     /// Boxed and not inlinable: this is the entry point to the daemon connection and start-up
     /// logic, and an `async fn` here would be instantiated afresh in every command crate. See
     /// `buck2_event_log::read` for the mechanism.
     #[inline(never)]
     pub fn connect<'a>(
         paths: &'a InvocationPaths,
-        options: BuckdConnectOptions,
+        mut options: BuckdConnectOptions,
         events_ctx: &'a mut EventsCtx,
     ) -> LocalBoxFuture<'a, buck2_error::Result<Self>> {
         Box::pin(async move {
+            let shared = paths.routing()?.is_shared();
+            let tenant_lifecycle = if shared && matches!(&options, BuckdConnectOptions::Options(_))
+            {
+                Some(
+                    BuckdLifecycleLock::lock_with_timeout(
+                        paths.tenant_paths().unshared_daemon_dir()?,
+                        StartupDeadline::duration_from_now(buckd_startup_init_timeout()?)?,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let mut slot_daemon_id = None;
+            if shared {
+                let slot = probe_slot(paths).await?;
+                let key = match &mut options {
+                    BuckdConnectOptions::ExistingOnly => match slot {
+                        SlotOwner::Proxy(proxy) => {
+                            paths.select_tenant_generation(proxy.generation);
+                            proxy.key
+                        }
+                        _ => {
+                            return Err(buck2_error!(
+                                ErrorTag::Input,
+                                "No unidaemon is registered for this tenant"
+                            ));
+                        }
+                    },
+                    BuckdConnectOptions::Options(options) => {
+                        let proxy = match &slot {
+                            SlotOwner::Proxy(proxy) => Some(proxy),
+                            _ => None,
+                        };
+                        slot_daemon_id = proxy.map(|proxy| proxy.daemon_id.clone());
+                        // The slot's proxy stands for this tenant only while it represents the
+                        // daemon of its namespace; the proxy of a daemon that is gone is killed
+                        // below and does not decide the trace state either.
+                        let proxy = match proxy {
+                            // The daemon this command runs under is alive by construction, so its
+                            // proxy is never mistaken for a stale one and killed from inside it.
+                            Some(proxy)
+                                if get_possibly_nested_invocation_daemon_uuid().as_deref()
+                                    == Some(proxy.daemon_id.as_str()) =>
+                            {
+                                Some(proxy)
+                            }
+                            Some(proxy)
+                                if establish_connection_existing(
+                                    &paths.unidaemon_dir(&proxy.key)?,
+                                )
+                                .await
+                                .is_ok_and(|daemon| {
+                                    daemon.constraints.daemon_id == proxy.daemon_id
+                                }) =>
+                            {
+                                Some(proxy)
+                            }
+                            _ => None,
+                        };
+                        options.constraints.settle_trace_io(proxy);
+                        let key = options.constraints.compatibility_key()?;
+                        if let Some(proxy) = proxy {
+                            refuse_moving_parent_tenant(&options.constraints, proxy, &key)?;
+                        }
+                        let reuse = proxy.is_some_and(|proxy| proxy.key == key);
+                        drop(slot);
+                        if !reuse && let Some(lifecycle) = &tenant_lifecycle {
+                            kill::kill_unidaemon_tenant(
+                                lifecycle,
+                                kill::TenantShutdownCommand::Replace,
+                                None,
+                            )
+                            .await?;
+                        }
+                        key
+                    }
+                };
+                paths.select_unidaemon(key);
+            }
             let daemon_dir = paths.daemon_dir()?;
 
             fs_util::create_dir_all(&daemon_dir.path)
@@ -856,7 +996,72 @@ impl BootstrapBuckdClient {
                     .await
                     .tag([ErrorTag::DaemonConnect]))
             } else {
-                res
+                let mut client = res?;
+                if paths.unidaemon_key().is_some() {
+                    if let BuckdConnectOptions::Options(options) = &options {
+                        if let Some(rejected) = &options.constraints.reject_daemon {
+                            // The slot's proxy stood for the daemon that was just replaced.
+                            if client.constraints.daemon_id != *rejected
+                                && slot_daemon_id.as_deref() == Some(rejected.as_str())
+                                && let Some(lifecycle) = &tenant_lifecycle
+                            {
+                                // A sibling command may have registered with the replacement
+                                // and published a new proxy by now, which is left alone. A proxy
+                                // that could not be stopped is found by the next command's
+                                // connect, standing for a daemon that is gone, and killed there.
+                                if let Err(error) = kill::kill_unidaemon_tenant(
+                                    lifecycle,
+                                    kill::TenantShutdownCommand::Rejected,
+                                    Some(rejected),
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        "Could not stop the rejected daemon's proxy in `{}`: {error:#}",
+                                        lifecycle.daemon_dir()
+                                    );
+                                }
+                            }
+                        }
+                        // The lock covers changes of the tenant directory's owner, and the daemon
+                        // this command may have just started is one: until the tenant's proxy
+                        // owns the directory, a client of any release that finds it vacant starts
+                        // a daemon of its own over the tenant's outputs. Registration publishes
+                        // the proxy under the lock and then waits for the tenant to initialize,
+                        // which may take long, so the lock is released only here.
+                        drop(tenant_lifecycle);
+                        let response = client
+                            .client
+                            .unstable_register_tenant(tonic::Request::new(
+                                buck2_cli_proto::UnstableRegisterTenantRequest {
+                                    context: Some(buck2_cli_proto::ClientContext {
+                                        working_dir: paths.project_root().root().to_string(),
+                                        tenant_identity: Some(buck2_cli_proto::TenantIdentity {
+                                            project_root: paths.project_root().root().to_string(),
+                                            isolation: paths.isolation.to_string(),
+                                        }),
+                                        command_name: "register-unidaemon".to_owned(),
+                                        trace_id: options.trace_id.to_string(),
+                                        ..Default::default()
+                                    }),
+                                    reject_materializer_state: options
+                                        .constraints
+                                        .reject_materializer_state
+                                        .clone(),
+                                },
+                            ))
+                            .await?
+                            .into_inner();
+                        if let Some(extra) = &mut client.constraints.extra {
+                            extra.materializer_state_identity =
+                                response.materializer_state_identity;
+                        }
+                        paths.select_tenant_generation(response.generation);
+                        let current = paths.unidaemon_key();
+                        prune_exited_unidaemon_namespaces(paths, current.as_ref()).await;
+                    }
+                }
+                Ok(client)
             }
         })
     }
@@ -889,9 +1094,28 @@ impl BootstrapBuckdClient {
         }
     }
 
+    pub(crate) fn process_info(&self) -> &DaemonProcessInfo {
+        &self.info
+    }
+
     pub(crate) async fn kill(&mut self, reason: &str) -> buck2_error::Result<Pid> {
         kill::kill(&mut self.client, &self.info, reason).await?;
         Pid::from_i64(self.info.pid)
+    }
+
+    /// Kills with `graceful` as the shutdown grace instead of the default, for a daemon or proxy
+    /// that this client knows needs longer and is prepared to wait for.
+    pub(crate) async fn kill_with_timeout(
+        &mut self,
+        reason: &str,
+        graceful: Duration,
+    ) -> buck2_error::Result<Pid> {
+        kill::kill_with_timeout(&mut self.client, &self.info, reason, graceful).await?;
+        Pid::from_i64(self.info.pid)
+    }
+
+    async fn stop_unidaemon(&mut self) -> buck2_error::Result<()> {
+        kill::stop_unidaemon(&mut self.client, &self.info).await
     }
 
     async fn kill_for_constraints_mismatch(&mut self) -> buck2_error::Result<Pid> {
@@ -943,7 +1167,27 @@ pub async fn establish_connection_existing(
         .await
 }
 
-/// Checks for an empty daemon directory or consistent metadata naming an exited process.
+/// How long a namespace daemon that was just stopped may keep its lifetime lock after its process
+/// was seen to go: the kernel releases the lock as the last of the daemon's threads ends.
+const LIFETIME_LOCK_RELEASE_GRACE: Duration = Duration::from_secs(5);
+
+/// Whether no daemon runs in the invocation's daemon directory: for a unidaemon namespace, whether
+/// its [`UnidaemonLifetimeLock`] is free, allowing a stopped daemon a moment to release it;
+/// otherwise [`shared_daemon_is_inactive`].
+async fn daemon_dir_is_inactive(
+    paths: &InvocationPaths,
+    daemon_dir: &DaemonDir,
+) -> buck2_error::Result<bool> {
+    match paths.unidaemon_key() {
+        Some(key) => {
+            UnidaemonLifetimeLock::wait_until_free(paths, &key, LIFETIME_LOCK_RELEASE_GRACE).await
+        }
+        None => shared_daemon_is_inactive(daemon_dir).await,
+    }
+}
+
+/// Checks for an empty daemon directory or consistent metadata naming a daemon that is no longer
+/// running, judged as [`BuckdProcessInfo::may_be_running`] does.
 /// Hold lifecycle coordination when using the result to change daemon state.
 pub async fn shared_daemon_is_inactive(daemon_dir: &DaemonDir) -> buck2_error::Result<bool> {
     let daemon_dir = daemon_dir.clone();
@@ -958,17 +1202,41 @@ pub async fn shared_daemon_is_inactive(daemon_dir: &DaemonDir) -> buck2_error::R
             .iter()
             .any(|path| path.exists()));
         };
-        let pid = info.pid()?;
-        let recorded_pid: u32 = fs_util::read_to_string(daemon_dir.buckd_pid())
+        let recorded_pid: i64 = fs_util::read_to_string(daemon_dir.buckd_pid())
             .categorize_internal()?
             .trim()
             .parse()?;
-        Ok(recorded_pid == pid.to_u32() && !process_exists(pid)?)
+        Ok(recorded_pid == info.info.pid && !info.may_be_running()?)
     })
     .await?
     .buck_error_context(
         "Cannot verify shared daemon inactivity; restore consistent buckd.info and buckd.pid before retrying",
     )
+}
+
+/// A client that an action runs must not move the tenant its parent's command runs in: the
+/// daemon would evict the tenant and cancel that command. `proxy` is the live proxy of the
+/// tenant's own daemon directory and `key` the namespace this client's constraints hash to.
+fn refuse_moving_parent_tenant(
+    request: &DaemonConstraintsRequest,
+    proxy: &TenantProxy,
+    key: &DaemonCompatibilityKey,
+) -> buck2_error::Result<()> {
+    if get_possibly_nested_invocation_daemon_uuid().as_deref() != Some(proxy.daemon_id.as_str())
+        || proxy.key == *key
+    {
+        return Ok(());
+    }
+    let reason = if proxy.client.daemon_constraints().version != request.version {
+        ConstraintUnsatisfiedReason::Version
+    } else if proxy.user_version != request.user_version {
+        ConstraintUnsatisfiedReason::UserVersion
+    } else if proxy.trace_io_enabled != request.is_trace_io_requested() {
+        ConstraintUnsatisfiedReason::TraceIo
+    } else {
+        ConstraintUnsatisfiedReason::StartupConfig
+    };
+    Err(BuckdConnectError::NestedConstraintMismatch { reason }.into())
 }
 
 async fn establish_connection(
@@ -1041,6 +1309,7 @@ async fn establish_connection_inner(
 
     // Even if we didn't connect before, it's possible that we just raced with another invocation
     // starting the server, so we try to connect again while holding the lock.
+    let mut unstopped_daemon = None;
     let daemon_was_started_reason = {
         match BuckdProcessInfo::load_if_exists(&daemon_dir) {
             Ok(Some(buckd_info)) => {
@@ -1052,14 +1321,6 @@ async fn establish_connection_inner(
                             Ok(()) => return Ok(client),
                             Err(reason) => reason,
                         };
-
-                        if let Some(group) = paths.shared_daemon_group()? {
-                            return Err(BuckdConnectError::GroupConstraintMismatch {
-                                group: group.to_string(),
-                                reason,
-                            }
-                            .into());
-                        }
 
                         if is_nested_invocation(
                             get_possibly_nested_invocation_daemon_uuid().as_ref(),
@@ -1078,41 +1339,67 @@ async fn establish_connection_inner(
                             }
                         }
 
-                        if buck2_env!("BUCK2_SHARE_DAEMON", type=bool, default=false)? {
-                            return Err(buck2_error!(
-                                ErrorTag::Input,
-                                "Shared daemon constraint mismatch: {reason}. Stop its tenants with `buck2 killall --repo` before changing daemon startup settings or binaries."
-                            ));
+                        if paths.unidaemon_key().is_some()
+                            && matches!(reason, ConstraintUnsatisfiedReason::SqliteIdentity)
+                        {
+                            // Materializer state belongs to the tenant: registering below with
+                            // the rejected identity has the daemon replace this tenant's
+                            // generation and reset only that database.
+                            return Ok(client);
                         }
+                        // A shared daemon's namespace is keyed by the compatibility key, so the
+                        // only mismatches a client meets there report unhealthy runtime state.
+                        let corruption_restart = paths.unidaemon_key().is_some()
+                            && matches!(reason, ConstraintUnsatisfiedReason::RejectDaemonId);
 
-                        let message = match reason {
-                            ConstraintUnsatisfiedReason::BuckSettings { .. } => {
-                                format!("{reason}; restarting daemon...")
-                            }
-                            _ => format!(
-                                "buck2 daemon constraint mismatch: {reason}; killing daemon..."
-                            ),
-                        };
-                        events_ctx.eprintln(&message).await?;
+                        // A rejected daemon id reports process-wide state: the forkserver, the
+                        // working directory and digest tracking are shared, as is DICE when
+                        // enabled, so the whole daemon is replaced.
+                        if corruption_restart {
+                            events_ctx
+                                .eprintln(
+                                    "Restarting rejected unidaemon; all tenants will be evicted",
+                                )
+                                .await?;
+                            deadline
+                                .run(
+                                    "stopping rejected unidaemon and its actions",
+                                    client.stop_unidaemon(),
+                                )
+                                .await?;
+                        } else {
+                            let message = match reason {
+                                ConstraintUnsatisfiedReason::BuckSettings { .. } => {
+                                    format!("{reason}; restarting daemon...")
+                                }
+                                _ => format!(
+                                    "buck2 daemon constraint mismatch: {reason}; killing daemon..."
+                                ),
+                            };
+                            events_ctx.eprintln(&message).await?;
 
-                        deadline
-                            .run(
-                                "sending kill command to the Buck daemon",
-                                client.kill_for_constraints_mismatch(),
-                            )
-                            .await?;
+                            deadline
+                                .run(
+                                    "sending kill command to the Buck daemon",
+                                    client.kill_for_constraints_mismatch(),
+                                )
+                                .await?;
+                        }
 
                         events_ctx.eprintln("Starting new buck2 daemon...").await?;
 
                         reason.to_daemon_was_started_reason()
                     }
                     Err(reason) => {
-                        if buck2_env!("BUCK2_SHARE_DAEMON", type=bool, default=false)?
-                            && process_exists(buckd_info.pid()?)?
+                        if paths.routing()?.is_shared()
+                            && match paths.unidaemon_key() {
+                                Some(key) => UnidaemonLifetimeLock::is_held(paths, &key).await?,
+                                None => buckd_info.may_be_running()?,
+                            }
                         {
                             return Err(buck2_error!(
                                 ErrorTag::Input,
-                                "Shared daemon is alive but could not be contacted: {}. No daemon was killed.",
+                                "Shared daemon is alive but could not be contacted: {}. No daemon was killed; if it does not recover, `buck2 killall` stops it.",
                                 explain_failed_to_connect_reason(reason)
                             ));
                         }
@@ -1127,20 +1414,23 @@ async fn establish_connection_inner(
                         // cmdline) before signalling, and any gap in that check is a
                         // cross-user kill primitive. Until that is designed carefully, we accept
                         // that these daemons cannot be removed from here.
-                        if !buck2_env!("BUCK2_SHARE_DAEMON", type=bool, default=false)? {
+                        if !paths.routing()?.is_shared() {
                             events_ctx
                                 .eprintln(&format!(
                                     "Could not connect to buck2 daemon ({}), killing daemon..",
                                     explain_failed_to_connect_reason(reason)
                                 ))
                                 .await?;
-                            if let Err(error) = hard_kill_until(&buckd_info.info, &deadline).await {
-                                events_ctx
-                                    .eprintln(&format!(
-                                        "{}",
-                                        BuckdConnectError::DaemonKillFailed { error }
-                                    ))
-                                    .await?;
+                            // Half the remaining time. The other half is for waiting until the
+                            // daemon releases its outputs (`start_new_buckd_and_connect`), so a
+                            // daemon that dies late still lets the command start, and one that
+                            // never dies leaves time to be named in the error there.
+                            if let Err(error) =
+                                hard_kill_until(&buckd_info.info, &deadline.half()?).await
+                            {
+                                let error = BuckdConnectError::DaemonKillFailed { error };
+                                events_ctx.eprintln(&format!("{error}")).await?;
+                                unstopped_daemon = Some((buckd_info.info.pid, error));
                             }
                         }
 
@@ -1187,6 +1477,7 @@ async fn establish_connection_inner(
                     options,
                     events_ctx,
                     daemon_was_started_reason,
+                    unstopped_daemon,
                 )
             },
         )
@@ -1200,6 +1491,7 @@ async fn start_new_buckd_and_connect(
     options: &BuckdConnectDaemonOptions,
     events_ctx: &mut EventsCtx,
     daemon_was_started_reason: buck2_data::DaemonWasStartedReason,
+    unstopped_daemon: Option<(i64, BuckdConnectError)>,
 ) -> buck2_error::Result<BootstrapBuckdClient> {
     let constraints = &options.constraints;
 
@@ -1209,10 +1501,23 @@ async fn start_new_buckd_and_connect(
     // A previous daemon of this isolation directory may still be releasing its outputs, and the
     // new daemon cannot start until it has. A running `buck2 clean` holds the lifecycle lock, so
     // it has finished by now.
-    if !buck2_env!("BUCK2_SHARE_DAEMON", type=bool, default=false)? {
+    if !paths.routing()?.is_shared() {
+        // All the remaining time: when the previous daemon was killed above, that is the half the
+        // kill left.
         let wait =
             deadline.rem_duration("waiting for the previous daemon to release its outputs")?;
-        drop(TenantDiskLock::acquire(&paths.tenant_paths(), wait).await?);
+        let unowned = paths.tenant_paths().wait_until_disk_unowned(wait).await?;
+        if let (Err(_), Some((pid, kill_error))) = (&unowned, unstopped_daemon) {
+            // Only this command knows which process failed to stop: `buckd.info` is gone, so
+            // later commands report the plain timeout.
+            return Err(BuckdConnectError::UnstoppedDaemonOwnsOutputs {
+                pid,
+                buck_out: paths.buck_out_path(),
+                error: kill_error.into(),
+            }
+            .into());
+        }
+        unowned?;
     }
 
     // Now there's definitely no server that can be connected to
@@ -1393,13 +1698,44 @@ impl<'a> BuckdProcessInfo<'a> {
                 == Some(self.info.pid_start_time)
     }
 
+    /// Whether the recorded daemon may still be running: `false` only when its process is gone or
+    /// the recorded pid now names another process. Unlike
+    /// [`recorded_daemon_is_running`](Self::recorded_daemon_is_running), which decides whether
+    /// the pid may be killed, a record without a start time counts as running unless the process
+    /// with its pid started well after the record was written.
+    pub fn may_be_running(&self) -> buck2_error::Result<bool> {
+        let recorded_at = fs_util::metadata(self.daemon_dir.buckd_info())
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        recorded_process_may_be_running(self.pid()?, self.info.pid_start_time, recorded_at)
+    }
+
     pub fn pid(&self) -> buck2_error::Result<Pid> {
         Pid::from_i64(self.info.pid)
     }
 }
 
+/// Forget the in-process daemon (`--no-buckd`) that dies with this client: a buckd.info left
+/// behind would send the next invocation chasing, and hard-killing, a pid that is no longer a
+/// Buck daemon.
+pub fn remove_in_process_daemon_info(daemon_dir: &DaemonDir) {
+    match BuckdProcessInfo::load_if_exists(daemon_dir) {
+        Ok(Some(info)) if info.info.pid == std::process::id() as i64 => {
+            if let Err(e) = fs_util::remove_file(daemon_dir.buckd_info()) {
+                let _ignored = crate::eprintln!(
+                    "Failed to remove {}: {:#}",
+                    daemon_dir.buckd_info(),
+                    e.categorize_internal()
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 struct DaemonStatus {
     constraints: buck2_cli_proto::DaemonConstraints,
+    tenant_generation: Option<u64>,
     start_instant: Option<Instant>,
 }
 
@@ -1436,6 +1772,7 @@ async fn get_daemon_status(
 
     Ok(DaemonStatus {
         constraints: status.daemon_constraints.unwrap_or_default(),
+        tenant_generation: status.tenant_generation,
         start_instant,
     })
 }
@@ -1501,14 +1838,6 @@ enum BuckdConnectError {
     #[error("buck2 daemon constraint mismatch during nested invocation: {reason}")]
     #[buck2(tag = DaemonNestedConstraintsMismatch)]
     NestedConstraintMismatch { reason: ConstraintUnsatisfiedReason },
-    #[error(
-        "buck2 daemon group `{group}` has incompatible constraints: {reason}. Choose a different BUCK2_DAEMON_GROUP or stop the existing group's tenants before changing its daemon configuration."
-    )]
-    #[buck2(tag = Input)]
-    GroupConstraintMismatch {
-        group: String,
-        reason: ConstraintUnsatisfiedReason,
-    },
     #[error("buckd info {path} does not exist")]
     #[buck2(tag = BuckdInfoMissing)]
     BuckdInfoMissing { path: AbsNormPathBuf },
@@ -1525,6 +1854,18 @@ enum BuckdConnectError {
     #[buck2(tag = DaemonKillFailed)]
     DaemonKillFailed {
         #[source]
+        error: buck2_error::Error,
+    },
+    #[error(
+        "The previous buck2 daemon, recorded as pid {pid}, could not be stopped, and `{buck_out}` is still owned by a daemon, so no new daemon can start without risking corrupted outputs. \
+        Check what pid {pid} is before acting on it (`ps -o user,stat,args -p {pid}`): if it was recorded inside a container it may name an unrelated process here. \
+        If it is a buck2 daemon for this repo, it may belong to another user, or be stuck in the kernel on a hung filesystem (`stat` shows `D`); stop it and retry. \
+        To keep working meanwhile, pass a different `--isolation-dir`. Kill error: {error:#}"
+    )]
+    #[buck2(tag = BuckdLifecycleLock)]
+    UnstoppedDaemonOwnsOutputs {
+        pid: i64,
+        buck_out: AbsNormPathBuf,
         error: buck2_error::Error,
     },
 }
@@ -1580,12 +1921,9 @@ async fn daemon_connect_error(
 
         classify_server_stderr(error, &stderr, disk_near_full)
     };
-    if matches!(
-        buck2_env!("BUCK2_SHARE_DAEMON", type=bool, default=false),
-        Ok(true)
-    ) {
+    if paths.routing().is_ok_and(|routing| routing.is_shared()) {
         return error.context(
-            "Failed to connect to shared buck daemon. Restore consistent buckd.info and buckd.pid before retrying if metadata is damaged.",
+            "Failed to connect to the shared buck daemon. `buck2 killall` stops a daemon that is stuck.",
         );
     }
     let delete_command = if cfg!(windows) {
@@ -1769,7 +2107,6 @@ mod tests {
             version: "version".to_owned(),
             user_version: Some("test".to_owned()),
             desired_trace_io_state,
-            nested_invocation_daemon_uuid: None,
             reject_daemon: None,
             reject_materializer_state: None,
             daemon_startup_config: DaemonStartupConfig::testing_empty(),
@@ -2033,7 +2370,6 @@ mod tests {
             user_version: None,
             desired_trace_io_state: DesiredTraceIoState::Existing,
             reject_daemon: None,
-            nested_invocation_daemon_uuid: None,
             reject_materializer_state: None,
             daemon_startup_config: DaemonStartupConfig::testing_empty(),
         };
@@ -2062,7 +2398,6 @@ mod tests {
             user_version: None,
             desired_trace_io_state: DesiredTraceIoState::Existing,
             reject_daemon: None,
-            nested_invocation_daemon_uuid: None,
             reject_materializer_state: None,
             daemon_startup_config: DaemonStartupConfig::testing_empty(),
         };
@@ -2094,7 +2429,6 @@ mod tests {
             user_version: None,
             desired_trace_io_state: DesiredTraceIoState::Existing,
             reject_daemon: None,
-            nested_invocation_daemon_uuid: None,
             reject_materializer_state: None,
             daemon_startup_config: DaemonStartupConfig::testing_empty(),
         };
@@ -2210,36 +2544,5 @@ mod tests {
             .to_string(),
             "Daemon process info from /tmp/buckd/buckd.info:\n    daemon dir: /tmp/buckd\n    status: unavailable: failed to load buckd.info (internal error)"
         );
-    }
-
-    #[test]
-    fn test_constraints_nested_invocation_diff_user_version() {
-        let mut req = DaemonConstraintsRequest {
-            version: "foo".to_owned(),
-            user_version: Some("fake_version_1".to_owned()),
-            desired_trace_io_state: DesiredTraceIoState::Existing,
-            nested_invocation_daemon_uuid: None,
-            reject_daemon: None,
-            reject_materializer_state: None,
-            daemon_startup_config: DaemonStartupConfig::testing_empty(),
-        };
-
-        let daemon = buck2_cli_proto::DaemonConstraints {
-            version: "foo".to_owned(),
-            user_version: Some("fake_version_2".to_owned()),
-            daemon_id: "ddd".to_owned(),
-            extra: Some(buck2_cli_proto::ExtraDaemonConstraints {
-                trace_io_enabled: false,
-                materializer_state_identity: Some("mmm".to_owned()),
-            }),
-            daemon_startup_config: Some(
-                serde_json::to_string(&DaemonStartupConfig::testing_empty()).unwrap(),
-            ),
-        };
-
-        assert!(req.satisfied(&daemon).is_err());
-
-        req.nested_invocation_daemon_uuid = Some("ddd".to_owned());
-        assert!(req.satisfied(&daemon).is_ok());
     }
 }

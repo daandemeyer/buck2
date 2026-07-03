@@ -19,11 +19,21 @@ use std::pin::Pin;
 use std::process::ExitStatus;
 use std::process::Stdio;
 
+use anyhow::Context;
+use sha2::Digest;
+use sha2::Sha256;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
 use crate::output::BuckError;
 use crate::output::BuckOutput;
+
+/// Marks the routing block the harness appends to a test's external config.
+pub(crate) const DAEMON_ROUTING_MARKER: &str = "# daemon routing, appended by the test harness\n";
+
+pub(crate) fn daemon_routing_config(share_daemon: bool) -> String {
+    format!("{DAEMON_ROUTING_MARKER}[buck2]\nshare_daemon = {share_daemon}\n")
+}
 
 /// The buck2 under test, set up in the test's project. Its methods start commands: awaiting a
 /// [`BuckCommand`] runs it and gives its [`BuckOutput`], or a [`BuckError`] if buck2 failed.
@@ -39,6 +49,7 @@ pub struct Buck {
     env: BTreeMap<OsString, OsString>,
     isolation_prefix: Option<String>,
     write_invocation_record: bool,
+    disk_state_materializer: bool,
 }
 
 macro_rules! subcommands {
@@ -58,6 +69,7 @@ impl Buck {
         cwd: PathBuf,
         env: BTreeMap<OsString, OsString>,
         write_invocation_record: bool,
+        disk_state_materializer: bool,
     ) -> Self {
         let mut buck = Self {
             executable,
@@ -65,14 +77,62 @@ impl Buck {
             env,
             isolation_prefix: None,
             write_invocation_record,
+            disk_state_materializer,
         };
         buck.set_env("NO_BUCKD", "0");
         buck
     }
 
+    /// Whether commands run against the disk-state materializer, for an assertion on one
+    /// implementation's own state in a test that runs under both; see `buck2_core_tests`.
+    pub fn disk_state_materializer(&self) -> bool {
+        self.disk_state_materializer
+    }
+
     /// The project directory commands run in.
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    /// Routes later commands to a daemon of this client's own, or to the shared daemon of its
+    /// repository's compatibility key.
+    ///
+    /// Daemon routing is read from the repository's configuration, so a client routed differently
+    /// from the test's `buck` gets its own copy of the test's external config with the routing key
+    /// replaced. Clients with equal routing share the file. A shared daemon's namespace is keyed
+    /// only by the client's compatibility key, so clients that share get a home of their own
+    /// (`BUCK2_TEST_HOME_DIR`), unless the test set one; unshared ones keep the real one, as they
+    /// do outside tests.
+    pub fn set_daemon_routing(&mut self, share_daemon: bool) -> anyhow::Result<()> {
+        let current = PathBuf::from(
+            self.env_var("BUCK2_TEST_EXTRA_EXTERNAL_CONFIG")
+                .context("the test fixture sets `BUCK2_TEST_EXTRA_EXTERNAL_CONFIG`")?,
+        );
+        let contents = std::fs::read_to_string(&current)?;
+        // Only the routing block goes; what the harness appended after it, such as the
+        // materializer pin or a test's extra configuration, stays.
+        let (before, after) = match contents.split_once(DAEMON_ROUTING_MARKER) {
+            Some((before, rest)) => (before, rest.splitn(3, '\n').nth(2).unwrap_or("")),
+            None => (contents.as_str(), ""),
+        };
+        let routed = format!("{before}{after}{}", daemon_routing_config(share_daemon));
+        let name = hex::encode(Sha256::digest(&routed));
+        let path = current.with_file_name(format!("routing-{}.bcfg", &name[..12]));
+        if !path.exists() {
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, &routed)?;
+            std::fs::rename(&tmp, &path)?;
+        }
+        self.set_env("BUCK2_TEST_EXTRA_EXTERNAL_CONFIG", path);
+        if share_daemon && self.env_var("BUCK2_TEST_HOME_DIR").is_none() {
+            let home = current
+                .parent()
+                .context("the external config has a parent")?
+                .join("home");
+            std::fs::create_dir_all(&home)?;
+            self.set_env("BUCK2_TEST_HOME_DIR", home);
+        }
+        Ok(())
     }
 
     /// Sets an environment variable for every later command.
@@ -94,6 +154,11 @@ impl Buck {
     /// Runs every later command with `--isolation-dir prefix`.
     pub fn set_isolation_prefix(&mut self, prefix: impl Into<String>) {
         self.isolation_prefix = Some(prefix.into());
+    }
+
+    /// The `--isolation-dir` commands run with, if the test set one.
+    pub fn isolation_prefix(&self) -> Option<&str> {
+        self.isolation_prefix.as_deref()
     }
 
     /// Runs every later command in `cwd` instead of the project directory, for a test that makes
@@ -539,6 +604,7 @@ mod tests {
             PathBuf::from("/project"),
             BTreeMap::new(),
             write_invocation_record,
+            false,
         )
     }
 
@@ -651,6 +717,14 @@ mod tests {
                 "--"
             ]
         );
+    }
+
+    #[test]
+    fn test_the_isolation_prefix_is_the_one_set() {
+        let mut buck = buck(false);
+        assert_eq!(buck.isolation_prefix(), None);
+        buck.set_isolation_prefix("iso");
+        assert_eq!(buck.isolation_prefix(), Some("iso"));
     }
 
     #[test]

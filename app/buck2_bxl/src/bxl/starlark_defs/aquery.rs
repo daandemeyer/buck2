@@ -30,8 +30,6 @@ use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
-use starlark::values::AllocValue;
-use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkValue;
 use starlark::values::Trace;
@@ -42,7 +40,6 @@ use starlark::values::ValueTyped;
 use starlark::values::list::ListType;
 use starlark::values::none::NoneOr;
 use starlark::values::starlark_value;
-use starlark::values::type_repr::StarlarkTypeRepr;
 
 use crate::bxl::starlark_defs::context::BxlContext;
 use crate::bxl::starlark_defs::context::ErrorPrinter;
@@ -78,16 +75,10 @@ pub(crate) struct StarlarkAQueryCtx<'v> {
 
 starlark::methods_static!(AQUERY_METHODS = aquery_methods);
 
-#[starlark_value(type = "bxl.AqueryContext", StarlarkTypeRepr, UnpackValue)]
+#[starlark_value(type = "bxl.AqueryContext", no_freeze)]
 impl<'v> StarlarkValue<'v> for StarlarkAQueryCtx<'v> {
     fn get_methods() -> Option<&'static Methods> {
         Some(AQUERY_METHODS.methods())
-    }
-}
-
-impl<'v> AllocValue<'v> for StarlarkAQueryCtx<'v> {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_complex_no_freeze(self)
     }
 }
 
@@ -118,10 +109,10 @@ pub(crate) async fn get_aquery_env(
     .await
 }
 
-#[derive(StarlarkTypeRepr, UnpackValue)]
+#[derive(UnpackValue)]
 enum UnpackActionNodes<'v> {
     ActionQueryNodes(ValueOf<'v, ListType<StarlarkActionQueryNode>>),
-    ActionQueryNodesSet(&'v StarlarkTargetSet<ActionQueryNode>),
+    ActionQueryNodesSet(ValueOf<'v, StarlarkTargetSet<ActionQueryNode>>),
     ConfiguredProviders(AnyProvidersExprArg<'v>),
     ConfiguredTargets(ConfiguredTargetListExprArg<'v>),
     StarlarkActions(ValueOf<'v, ListType<StarlarkAction>>),
@@ -211,8 +202,8 @@ fn aquery_methods(builder: &mut MethodsBuilder) {
         #[starlark(default = NoneOr::None)] depth: NoneOr<i32>,
         #[starlark(default = NoneOr::None)] filter: NoneOr<&'v str>,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<StarlarkTargetSet<ActionQueryNode>> {
-        Ok(this
+    ) -> starlark::Result<ValueTyped<'v, StarlarkTargetSet<ActionQueryNode>>> {
+        let set = this
             .ctx
             .via_dice(eval, |dice| {
                 dice.via(|dice| {
@@ -241,7 +232,8 @@ fn aquery_methods(builder: &mut MethodsBuilder) {
                     .boxed_local()
                 })
             })
-            .map(StarlarkTargetSet::from)?)
+            .map(StarlarkTargetSet::from)?;
+        Ok(eval.heap().alloc_representation(set))
     }
 
     /// Obtain all the actions declared within the analysis of a given target.
@@ -253,8 +245,8 @@ fn aquery_methods(builder: &mut MethodsBuilder) {
         // TODO(nga): parameters should be either positional or named, not both.
         targets: UnpackActionNodes<'v>,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<StarlarkTargetSet<ActionQueryNode>> {
-        Ok(this
+    ) -> starlark::Result<ValueTyped<'v, StarlarkTargetSet<ActionQueryNode>>> {
+        let set = this
             .ctx
             .via_dice(eval, |dice| {
                 dice.via(|dice| {
@@ -268,7 +260,8 @@ fn aquery_methods(builder: &mut MethodsBuilder) {
                     .boxed_local()
                 })
             })
-            .map(StarlarkTargetSet::from)?)
+            .map(StarlarkTargetSet::from)?;
+        Ok(eval.heap().alloc_representation(set))
     }
 
     /// Obtain the actions for all the outputs provided by the `DefaultInfo` for the targets passed
@@ -281,8 +274,8 @@ fn aquery_methods(builder: &mut MethodsBuilder) {
         // TODO(nga): parameters should be either positional or named, not both.
         targets: UnpackActionNodes<'v>,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<StarlarkTargetSet<ActionQueryNode>> {
-        Ok(this
+    ) -> starlark::Result<ValueTyped<'v, StarlarkTargetSet<ActionQueryNode>>> {
+        let set = this
             .ctx
             .via_dice(eval, |dice| {
                 dice.via(|dice| {
@@ -297,7 +290,8 @@ fn aquery_methods(builder: &mut MethodsBuilder) {
                     .boxed_local()
                 })
             })
-            .map(StarlarkTargetSet::from)?)
+            .map(StarlarkTargetSet::from)?;
+        Ok(eval.heap().alloc_representation(set))
     }
 
     /// The attrfilter query for rule attribute filtering.
@@ -308,8 +302,8 @@ fn aquery_methods(builder: &mut MethodsBuilder) {
         value: &str,
         targets: UnpackActionNodes<'v>,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<StarlarkTargetSet<ActionQueryNode>> {
-        Ok(this.ctx.via_dice(eval, |dice| {
+    ) -> starlark::Result<ValueTyped<'v, StarlarkTargetSet<ActionQueryNode>>> {
+        let set = this.ctx.via_dice(eval, |dice| {
             dice.via(|dice| {
                 async {
                     let targets = unpack_action_nodes(this, dice, targets).await?;
@@ -320,7 +314,8 @@ fn aquery_methods(builder: &mut MethodsBuilder) {
                 }
                 .boxed_local()
             })
-        })?)
+        })?;
+        Ok(eval.heap().alloc_representation(set))
     }
 
     /// Evaluates some general query string. `query_args` can be a target_set of unconfigured nodes, or

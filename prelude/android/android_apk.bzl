@@ -137,8 +137,11 @@ def android_apk_impl(ctx: AnalysisContext) -> list[Provider]:
         platforms = android_binary_info.deps_by_platform.keys(),
         primary_platform = android_binary_info.primary_platform,
         resource_infos = set([info.raw_target for info in resources_info.unfiltered_resource_infos]),
+        resource_source_infos = resources_info.unfiltered_resource_infos,
+        resource_id_map = resources_info.r_dot_txt,
         r_dot_java_packages = set([info.specified_r_dot_java_package for info in resources_info.unfiltered_resource_infos if info.specified_r_dot_java_package]),
         shared_libraries = set(native_library_info.shared_libraries),
+        shipped_merged_libs = native_library_info.shipped_merged_libs,
         # Merge map delegate
         native_library_merge_sequence = ctx.attrs.native_library_merge_sequence,
         native_library_merge_code_generator = ctx.attrs.native_library_merge_code_generator,
@@ -288,7 +291,20 @@ def build_apk(
             else:
                 fail("Only 'excluded_resources' and 'uncompressed_files' are supported in packaging_options right now!")
 
-    actions.run(apk_builder_args, category = "apk_build", identifier = output_filename, allow_cache_upload = True)
+    weight = 1
+    if android_toolchain.apk_builder_fast_packaging:
+        apk_builder_args.add(
+            "--fast-packaging",
+            "--compression-threads",
+            str(android_toolchain.apk_builder_compression_threads),
+        )
+
+        # The deflate threads run on as many cores when the action runs locally.
+        weight = android_toolchain.apk_builder_compression_threads
+    if android_toolchain.apk_v1_signing_policy != "always":
+        apk_builder_args.add("--v1-signing-policy", android_toolchain.apk_v1_signing_policy)
+
+    actions.run(apk_builder_args, category = "apk_build", identifier = output_filename, allow_cache_upload = True, weight = weight)
 
     return output_apk
 
@@ -340,23 +356,11 @@ def get_install_info(
     )
 
 def generate_install_config(ctx: AnalysisContext, apex_mode: bool) -> Artifact:
-    data = get_install_config(apex_mode)
-    return ctx.actions.write_json("install_android_options.json", data, has_content_based_path = False)
-
-def get_install_config(apex_mode: bool) -> dict[str, typing.Any]:
-    # TODO: read from toolchains
-    install_config = {
-        "adb_restart_on_failure": read_root_config("adb", "adb_restart_on_failure", "true"),
-        "apex_mode": apex_mode,
-        "multi_install_mode": read_root_config("adb", "multi_install_mode", "false"),
-        "staged_install_mode": read_root_config("adb", "staged_install_mode", None),
-    }
-
-    adb_executable = read_root_config("android", "adb", None)
-    if adb_executable:
-        install_config["adb_executable"] = adb_executable
-
-    return install_config
+    # Only properties of the apk belong here. Install settings are installer flags; the
+    # buckconfig keys for them are read in `prelude//toolchains/android/installer:BUCK`. Starlark
+    # runs a constant-argument `read_root_config` in this module when the module compiles, so
+    # every package would reload when such a key changes.
+    return ctx.actions.write_json("install_android_options.json", {"apex_mode": apex_mode}, has_content_based_path = False)
 
 android_binary = prelude_rule(
     name = "android_binary",

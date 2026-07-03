@@ -37,6 +37,7 @@ use buck2_build_signals::env::WaitingData;
 use buck2_common::cas_digest::CasDigestConfig;
 use buck2_common::cas_digest::CasDigestData;
 use buck2_common::file_ops::metadata::FileDigest;
+use buck2_common::file_ops::metadata::FileMetadata;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_core::buck2_env;
 use buck2_core::configuration::pair::Configuration;
@@ -49,6 +50,7 @@ use buck2_core::soft_error;
 use buck2_core::soft_error_or_panic;
 use buck2_directory::directory::directory::Directory;
 use buck2_directory::directory::directory_hasher::DirectoryDigester;
+use buck2_directory::directory::directory_iterator::DirectoryIterator;
 use buck2_directory::directory::directory_ref::DirectoryRef;
 use buck2_directory::directory::directory_selector::DirectorySelector;
 use buck2_directory::directory::entry::DirectoryEntry;
@@ -59,6 +61,7 @@ use buck2_error::BuckErrorOptionContext;
 use buck2_error::internal_error;
 use buck2_events::dispatch::span_async;
 use buck2_execute::artifact_value::ArtifactValue;
+use buck2_execute::blob_store::BlobStore;
 use buck2_execute::dep_file_state::DepFileStore;
 use buck2_execute::dep_file_state::StoredDepFileDigests;
 use buck2_execute::dep_file_state::StoredDepFileIdentity;
@@ -1240,7 +1243,7 @@ pub(crate) async fn match_if_identical_action(
             // configuration's `BuildArtifactPath`s. Return them directly (an `Arc` clone) and skip
             // the remap -- this is the common cache-hit hot path.
             let live = previous_state.result();
-            if outputs_are_still_present_in_materializer(ctx, live).await? {
+            if outputs_are_still_available(ctx, live, false).await? {
                 tracing::trace!("Dep files are a hit");
                 stats.hit_live();
                 return Ok((Some(live.dupe()), false));
@@ -1478,7 +1481,8 @@ async fn hit_outputs_if_present(
             }
         }
     };
-    if outputs_are_still_present_in_materializer(ctx, &remapped).await? {
+    let reloaded = matches!(candidate, DepFileCandidate::Loaded(_));
+    if outputs_are_still_available(ctx, &remapped, reloaded).await? {
         Ok(Some(remapped))
     } else {
         Ok(None)
@@ -1550,18 +1554,23 @@ async fn resolve_loaded_outputs(
         let entry = match value {
             StoredOutputValue::Leaf(v) => Plan::Ready((*v).dupe()),
             StoredOutputValue::Directory(fingerprint) => {
-                // A content-based directory path embeds its fingerprint, so we must supply it to
-                // resolve the on-disk path we will query. Deriving the hash from the fingerprint
-                // reproduces the path only because an action's own output values always carry an
-                // inferred hash: an explicit one is set solely on projected artifacts, which are
-                // views onto a base artifact rather than outputs an action declares. The same
-                // assumption lets `StoredOutputValue::Leaf` round-trip without persisting the hash.
-                let content_hash = if path.is_content_based_path() {
+                // The path the run left the directory at, where the materializer is asked for
+                // its tree. The disk-state core leaves a content-based output where the run
+                // wrote it, at the placeholder path; the deferred core publishes it to its
+                // content path, which embeds the fingerprint. Deriving the hash from the
+                // fingerprint reproduces that path only because an action's own output values
+                // always carry an inferred hash: an explicit one is set solely on projected
+                // artifacts, which are views onto a base artifact rather than outputs an action
+                // declares. The same assumption lets `StoredOutputValue::Leaf` round-trip without
+                // persisting the hash.
+                let content_hash = if !path.is_content_based_path() {
+                    None
+                } else if ctx.materializer().is_disk_state() {
+                    Some(ContentBasedPathHash::for_output_artifact())
+                } else {
                     Some(ContentBasedPathHash::new(
                         fingerprint.raw_digest().as_bytes(),
                     )?)
-                } else {
-                    None
                 };
                 let project_path = fs
                     .buck_out_path_resolver()
@@ -1752,15 +1761,55 @@ enum DepFileFilteredMatch {
     CannotEvaluate,
 }
 
+/// Whether a hit's outputs can still be served. Under the deferred core they have to be
+/// declared at their paths, which is what a consumer's materialization copies from, so the
+/// match re-declares them and says. The disk-state core needs nothing for an entry produced
+/// this session: its values hold `TrackedFileDigest`s, which keep a local output's blobs in the
+/// store and its CAS expirations refreshed. A reloaded entry's values hold nothing, so each
+/// file is found anew through the store: in the store, in the CAS, or out of a tracked path
+/// still holding it; a file in none of those is a miss.
+async fn outputs_are_still_available(
+    ctx: &dyn ActionExecutionCtx,
+    result: &ActionOutputs,
+    reloaded: bool,
+) -> buck2_error::Result<bool> {
+    if !ctx.materializer().is_disk_state() {
+        return outputs_are_still_present_in_materializer(ctx, result).await;
+    }
+    if !reloaded {
+        return Ok(true);
+    }
+    let store = BlobStore::global();
+    let mut files: Vec<FileMetadata> = Vec::new();
+    for (_, value) in result.iter() {
+        match value.entry() {
+            DirectoryEntry::Dir(dir) => {
+                for leaf in dir.unordered_walk_leaves().without_paths() {
+                    if let ActionDirectoryMember::File(f) = leaf {
+                        files.push(f.dupe());
+                    }
+                }
+            }
+            DirectoryEntry::Leaf(ActionDirectoryMember::File(f)) => files.push(f.dupe()),
+            DirectoryEntry::Leaf(_) => {}
+        }
+    }
+    let found = buck2_util::future::try_join_all(
+        files
+            .iter()
+            .map(|file| store.find(file.digest.data(), file.is_executable, ctx.materializer())),
+    )
+    .await?;
+    Ok(found.iter().all(|found| found.is_some()))
+}
+
+/// The deferred core's check: the outputs declared at their paths, re-declared by the match,
+/// in case a different action wrote to those paths under another cache key.
 async fn outputs_are_still_present_in_materializer(
     ctx: &dyn ActionExecutionCtx,
     result: &ActionOutputs,
 ) -> buck2_error::Result<bool> {
     let fs = ctx.fs();
-
-    // Finally, we need to make sure that the artifacts in the materializer actually
-    // match. This is necessary in case a different action wrote to those artifacts and
-    // didn't use the same cache key.
     let output_matches = result
         .iter()
         .map(|(path, value)| {
@@ -1968,11 +2017,12 @@ pub(crate) async fn read_dep_files(
     materializer: &dyn Materializer,
     re_use_case: RemoteExecutorUseCase,
 ) -> buck2_error::Result<Option<ConcreteDepFiles>> {
-    // NOTE: We only materialize if we haven't computed our signatures yet, since we know we
-    // can't have computed our signatures without having read the dep file already. In an ideal
-    // world this wouldn't be necessary, but in practice contention on the materializer makes
-    // this slower.
-    let _lease = if !has_signatures {
+    // Without computed signatures the dep files have never been read, so they may not be on disk
+    // yet. With them they have been, and the deferred materializer is left alone: contention on it
+    // makes the request slower than the read it would cover. The disk-state materializer keeps
+    // nothing on disk for a reader without a lease, and a lease is cheap there, so it is always
+    // asked.
+    let _lease = if !has_signatures || materializer.is_disk_state() {
         match declared_dep_files
             .materialize(fs, materializer, result, re_use_case)
             .await

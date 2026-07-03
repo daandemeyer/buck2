@@ -54,8 +54,10 @@ use crate::values::Trace;
 use crate::values::Tracer;
 use crate::values::UnpackValue;
 use crate::values::Value;
+use crate::values::ValueOf;
 use crate::values::list::ListRef;
-use crate::values::type_repr::StarlarkTypeRepr;
+use crate::values::type_expr::StarlarkTypeExpr;
+use crate::values::type_expr::StarlarkTypeExprStable;
 use crate::values::typing::TypeCompiled;
 use crate::values::typing::callable::param::StarlarkCallableParamAny;
 use crate::values::typing::callable::param::StarlarkCallableParamSpec;
@@ -128,8 +130,10 @@ See also [`typing.Callable` in the Python documentation][1].
 static_starlark_value!(CALLABLE: TypingCallable = TypingCallable);
 
 impl<'fv> AllocFrozenValue<'fv> for TypingCallable {
-    fn alloc_frozen_value(self, _heap: FrozenHeap<'fv>) -> Value<'fv> {
-        CALLABLE.at().to_value()
+    type Type = Self;
+
+    fn alloc_frozen_value(self, _heap: FrozenHeap<'fv>) -> ValueOf<'fv, Self::Type> {
+        CALLABLE.at().into()
     }
 }
 
@@ -161,41 +165,51 @@ impl<'v> StarlarkValue<'v> for TypingCallableAt2 {
 pub struct StarlarkCallable<
     'v,
     P: StarlarkCallableParamSpec = StarlarkCallableParamAny,
-    R: StarlarkTypeRepr = Value<'static>,
+    R: StarlarkTypeExpr<'static> = Value<'static>,
 >(pub Value<'v>, PhantomData<PhantomData<AtomicPtr<(P, R)>>>);
 
-impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Copy for StarlarkCallable<'v, P, R> {}
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> Copy
+    for StarlarkCallable<'v, P, R>
+{
+}
 
-impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Clone for StarlarkCallable<'v, P, R> {
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> Clone
+    for StarlarkCallable<'v, P, R>
+{
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Dupe for StarlarkCallable<'v, P, R> {}
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> Dupe
+    for StarlarkCallable<'v, P, R>
+{
+}
 
 // SAFETY: the static type is the same type with the heap lifetime erased; `P` and `R` only
 // describe the signature and carry no heap lifetime.
-unsafe impl<'v, P: StarlarkCallableParamSpec + 'static, R: StarlarkTypeRepr + 'static>
+unsafe impl<'v, P: StarlarkCallableParamSpec + 'static, R: StarlarkTypeExpr<'static> + 'static>
     ProvidesStaticType<'v> for StarlarkCallable<'v, P, R>
 {
     type StaticType = StarlarkCallable<'static, P, R>;
 }
 
-impl<P: StarlarkCallableParamSpec + 'static, R: StarlarkTypeRepr + 'static> IsStaticType
+impl<P: StarlarkCallableParamSpec + 'static, R: StarlarkTypeExpr<'static> + 'static> IsStaticType
     for StarlarkCallable<'static, P, R>
 {
     type Reinfect<'lt> = StarlarkCallable<'lt, P, R>;
 }
 
-impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Debug for StarlarkCallable<'v, P, R> {
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> Debug
+    for StarlarkCallable<'v, P, R>
+{
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_tuple("StarlarkCallable").field(&self.0).finish()
     }
 }
 
 // TODO(nga): implement `#[trace(bound = "")]`.
-unsafe impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Trace<'v>
+unsafe impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> Trace<'v>
     for StarlarkCallable<'v, P, R>
 {
     fn trace(&mut self, tracer: &Tracer<'v>) {
@@ -203,7 +217,7 @@ unsafe impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Trace<'v>
     }
 }
 
-impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> StarlarkCallable<'v, P, R> {
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> StarlarkCallable<'v, P, R> {
     /// Wrap the value.
     pub fn unchecked_new(value: Value<'v>) -> Self {
         StarlarkCallable(value, PhantomData)
@@ -215,37 +229,50 @@ impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> StarlarkCallable<'v,
     }
 }
 
-impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> StarlarkTypeRepr
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> StarlarkTypeExpr<'v>
     for StarlarkCallable<'v, P, R>
 {
-    type Canonical = Self;
+    type Get = Self;
 
     fn starlark_type_repr() -> Ty {
         // TODO(nga): implement the same machinery for `typing.Callable`.
         Ty::callable(P::params(), R::starlark_type_repr())
     }
-}
 
-impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> UnpackValue<'v>
-    for StarlarkCallable<'v, P, R>
-{
-    type Error = Infallible;
-
-    #[inline]
-    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        if value.vtable().starlark_value.ty.HAS_invoke {
-            Ok(Some(StarlarkCallable::unchecked_new(value)))
-        } else {
-            Ok(None)
-        }
+    fn get(value: Value<'v>) -> Option<Self> {
+        value
+            .vtable()
+            .starlark_value
+            .ty
+            .HAS_invoke
+            .then(|| StarlarkCallable::unchecked_new(value))
     }
 }
 
-impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> AllocValue<'v>
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> StarlarkTypeExprStable<'v>
     for StarlarkCallable<'v, P, R>
 {
-    fn alloc_value(self, _heap: Heap<'v>) -> Value<'v> {
-        self.0
+}
+
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> UnpackValue<'v>
+    for StarlarkCallable<'v, P, R>
+{
+    type Type = Self;
+    type Error = Infallible;
+
+    #[inline]
+    fn unpack(_value: ValueOf<'v, Self>, get: Self) -> Result<Self, Infallible> {
+        Ok(get)
+    }
+}
+
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> AllocValue<'v>
+    for StarlarkCallable<'v, P, R>
+{
+    type Type = Self;
+
+    fn alloc_value(self, _heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
+        ValueOf::new_unchecked(self.0)
     }
 }
 
@@ -257,7 +284,7 @@ fn _assert_sync_send() {
     _assert::<StarlarkCallable<'static, (Value,), Value>>();
 }
 
-impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Freeze<'v>
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> Freeze<'v>
     for StarlarkCallable<'v, P, R>
 {
     type Frozen<'fv> = StarlarkCallable<'fv, P, R>;
@@ -283,12 +310,12 @@ impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Freeze<'v>
 /// but not for code executed many times (like `partial()`).
 #[derive(Allocative)]
 #[allocative(bound = "")]
-pub struct StarlarkCallableChecked<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr>(
+pub struct StarlarkCallableChecked<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>>(
     pub Value<'v>,
     PhantomData<AtomicPtr<(P, R)>>,
 );
 
-impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Clone
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> Clone
     for StarlarkCallableChecked<'v, P, R>
 {
     fn clone(&self) -> Self {
@@ -296,30 +323,30 @@ impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Clone
     }
 }
 
-impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Copy
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> Copy
     for StarlarkCallableChecked<'v, P, R>
 {
 }
 
-impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Dupe
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> Dupe
     for StarlarkCallableChecked<'v, P, R>
 {
 }
 
 // SAFETY: as for `StarlarkCallable`.
-unsafe impl<'v, P: StarlarkCallableParamSpec + 'static, R: StarlarkTypeRepr + 'static>
+unsafe impl<'v, P: StarlarkCallableParamSpec + 'static, R: StarlarkTypeExpr<'static> + 'static>
     ProvidesStaticType<'v> for StarlarkCallableChecked<'v, P, R>
 {
     type StaticType = StarlarkCallableChecked<'static, P, R>;
 }
 
-impl<P: StarlarkCallableParamSpec + 'static, R: StarlarkTypeRepr + 'static> IsStaticType
+impl<P: StarlarkCallableParamSpec + 'static, R: StarlarkTypeExpr<'static> + 'static> IsStaticType
     for StarlarkCallableChecked<'static, P, R>
 {
     type Reinfect<'lt> = StarlarkCallableChecked<'lt, P, R>;
 }
 
-impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Debug
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> Debug
     for StarlarkCallableChecked<'v, P, R>
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -329,7 +356,7 @@ impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Debug
     }
 }
 
-unsafe impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Trace<'v>
+unsafe impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> Trace<'v>
     for StarlarkCallableChecked<'v, P, R>
 {
     fn trace(&mut self, tracer: &Tracer<'v>) {
@@ -339,29 +366,42 @@ unsafe impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Trace<'v>
     }
 }
 
-impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> AllocValue<'v>
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> AllocValue<'v>
     for StarlarkCallableChecked<'v, P, R>
 {
-    fn alloc_value(self, _heap: Heap<'v>) -> Value<'v> {
-        self.0
+    type Type = Self;
+
+    fn alloc_value(self, _heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
+        ValueOf::new_unchecked(self.0)
     }
 }
 
-impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> StarlarkCallableChecked<'v, P, R> {
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>>
+    StarlarkCallableChecked<'v, P, R>
+{
     /// Convert to [`StarlarkCallable`].
     pub fn to_unchecked(self) -> StarlarkCallable<'v, P, R> {
         StarlarkCallable::unchecked_new(self.0)
     }
 }
 
-impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> StarlarkTypeRepr
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> StarlarkTypeExpr<'v>
     for StarlarkCallableChecked<'v, P, R>
 {
-    type Canonical = <StarlarkCallable<'v, P, R> as StarlarkTypeRepr>::Canonical;
+    type Get = Self;
 
     fn starlark_type_repr() -> Ty {
-        <Self::Canonical as StarlarkTypeRepr>::starlark_type_repr()
+        StarlarkCallable::<'v, P, R>::starlark_type_repr()
     }
+
+    fn get(value: Value<'v>) -> Option<Self> {
+        Self::unpack_value(value).ok().flatten()
+    }
+}
+
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> StarlarkTypeExprStable<'v>
+    for StarlarkCallableChecked<'v, P, R>
+{
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -371,25 +411,25 @@ struct CallableSignatureMismatch {
     actual: Ty,
 }
 
-impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> UnpackValue<'v>
+/// The runtime type `typing.Callable` accepts any callable, so a signature mismatch is a
+/// conversion failure, not a type mismatch.
+impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeExpr<'static>> UnpackValue<'v>
     for StarlarkCallableChecked<'v, P, R>
 {
+    type Type = StarlarkCallable<'v, P, R>;
     type Error = crate::Error;
 
-    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        // Check it is a callable first.
-        if StarlarkCallable::<P, R>::unpack_value_opt(value).is_none() {
-            return Ok(None);
-        }
-
+    fn unpack(
+        value: ValueOf<'v, Self::Type>,
+        _get: StarlarkCallable<'v, P, R>,
+    ) -> crate::Result<Self> {
+        let value = value.to_value();
         // We need generic statics to cache this.
         let ty = Ty::callable(P::params(), R::starlark_type_repr());
 
         let actual = Ty::of_value(value);
         match actual.check_intersects(&ty)? {
-            true => Ok(Some(StarlarkCallableChecked(value, PhantomData))),
-            // The runtime type `typing.Callable` accepts any callable, so a signature mismatch
-            // is a conversion failure, not a type mismatch.
+            true => Ok(StarlarkCallableChecked(value, PhantomData)),
             false => Err(crate::Error::new_value(CallableSignatureMismatch {
                 expected: ty,
                 actual,
@@ -406,6 +446,7 @@ mod tests {
     use crate::assert;
     use crate::assert::Assert;
     use crate::environment::GlobalsBuilder;
+    use crate::values::int::IntView;
     use crate::values::none::NoneType;
     use crate::values::typing::StarlarkCallable;
     use crate::values::typing::StarlarkCallableChecked;
@@ -452,7 +493,7 @@ def bar():
     #[starlark_module]
     fn my_module(globals: &mut GlobalsBuilder) {
         fn accept_f(
-            #[starlark(require=pos)] _x: StarlarkCallable<(String,), i32>,
+            #[starlark(require=pos)] _x: StarlarkCallable<(String,), IntView<'static>>,
         ) -> anyhow::Result<NoneType> {
             Ok(NoneType)
         }

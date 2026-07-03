@@ -25,6 +25,7 @@ use serde_json::Value;
 
 // Taken from data.proto
 const ACTION_EXECUTION_KIND_LOCAL: i64 = 1;
+const ACTION_EXECUTION_KIND_REMOTE: i64 = 2;
 const ACTION_EXECUTION_KIND_ACTION_CACHE: i64 = 3;
 const ACTION_EXECUTION_KIND_SIMPLE: i64 = 4;
 // A write whose content the CAS already holds, which the disk-state core probes for.
@@ -432,7 +433,11 @@ async fn prepare_persisted_dep_file_input_after_clean(
     assert!(producer_output.exists(), "{}", producer_output.display());
 
     let clean = buck.clean(&["--stale=0s"]).await?;
-    assert!(producer_output.exists(), "{}", clean.stderr);
+    // The deferred core copies the consumer's input from this path, so the hit must have kept it
+    // from the cleanup. The disk-state core serves the input out of its store, and the path may go.
+    if !buck.disk_state_materializer() {
+        assert!(producer_output.exists(), "{}", clean.stderr);
+    }
     // Invalidate only the consumer. Its retained args file still names the producer output.
     touch(buck, "app/other.h")?;
 
@@ -702,6 +707,8 @@ async fn test_dep_file_hit_identical_action(buck: &Buck) -> anyhow::Result<()> {
     // The persisted dep-file cache is gated on a daemon-startup buckconfig (read once when the daemon
     // boots, like the materializer/incremental state dbs), so it must be set here rather than via `-c`.
     extra_buck_config = [("buck2", "sqlite_dep_file_state", "true")],
+    // The reloaded entry is served out of the outputs the previous daemon left on disk.
+    strict_leases = false,
 )]
 async fn test_dep_file_hit_persisted_across_restart(buck: &Buck) -> anyhow::Result<()> {
     let args = [
@@ -783,13 +790,24 @@ async fn test_induced_cache_miss_skips_local_dep_file_cache(
         ("buck2", "restarter", "false"),
         ("buck2", "sqlite_dep_file_state", "true"),
     ],
+    // The reloaded entry is served out of the outputs the previous daemon left on disk.
+    strict_leases = false,
 )]
 async fn test_persisted_dep_file_hit_survives_clean_stale(buck: &Buck) -> anyhow::Result<()> {
     let (target, args) = prepare_persisted_dep_file_input_after_clean(buck).await?;
 
     let result = buck.build(&args).await?;
+    // The disk-state core vouches for a reloaded entry through the CAS and serves the consumer
+    // out of its store, which the console reports as RE use the deferred core's path has none of.
+    let stderr: String = sanitize_stderr(&result.stderr)
+        .split_inclusive('\n')
+        .filter(|line| {
+            !line.starts_with("[<TIMESTAMP>] RE Session:")
+                && !line.starts_with("[<TIMESTAMP>] Network:")
+        })
+        .collect();
     golden(
-        &sanitize_stderr(&result.stderr),
+        &stderr,
         "dep_files/golden/persisted_dep_file_hit_survives_clean_stale.stderr",
     );
     assert_eq!(
@@ -1018,6 +1036,8 @@ async fn test_changed_action_is_not_served_from_persisted_cache(buck: &Buck) -> 
     data_dir = "dep_files",
     skip_for_os = ["windows"],
     extra_buck_config = [("buck2", "sqlite_dep_file_state", "true")],
+    // The reloaded entry is served out of the outputs the previous daemon left on disk.
+    strict_leases = false,
 )]
 async fn test_dir_output_dep_file_hit_persisted_across_restart(buck: &Buck) -> anyhow::Result<()> {
     let args = [
@@ -1044,6 +1064,8 @@ async fn test_dir_output_dep_file_hit_persisted_across_restart(buck: &Buck) -> a
     data_dir = "dep_files",
     skip_for_os = ["windows"],
     extra_buck_config = [("buck2", "sqlite_dep_file_state", "true")],
+    // The reloaded entry is served out of the outputs the previous daemon left on disk.
+    strict_leases = false,
 )]
 async fn test_dir_output_dep_file_hit_persisted_without_content_based_paths(
     buck: &Buck,
@@ -1642,6 +1664,58 @@ async fn test_dep_file_does_not_upload_when_allow_cache_upload_is_true(
     buck.build(&target).await?;
     let uploads = dep_file_uploads(buck).await?;
     assert_eq!(uploads.len(), 0, "{uploads:#?}");
+    Ok(())
+}
+
+/// Runs the action remotely without materializing its outputs, so they exist only in the CAS,
+/// then changes an input its dep file leaves out: the second build is a local dep-file hit.
+#[buck_test(
+    data_dir = "upload_dep_files",
+    env = [("BUCK2_TEST_SKIP_ACTION_CACHE_WRITE", "true")],
+)]
+async fn test_dep_file_hit_on_remote_outputs(buck: &Buck) -> anyhow::Result<()> {
+    let cache_buster = format!("test.cache_buster={}", random_string());
+    let args = [
+        "root//:dep_files",
+        "-c",
+        &cache_buster,
+        "--remote-only",
+        "--no-remote-cache",
+        "--materializations=none",
+    ];
+    buck.build(&args).await?;
+    check_execution_kind(buck, &[ACTION_EXECUTION_KIND_REMOTE], &WRITE_KINDS).await?;
+
+    std::fs::write(buck.cwd().join("unused.1"), "CHANGE")?;
+    buck.build(&args).await?;
+    check_execution_kind(buck, &[ACTION_EXECUTION_KIND_LOCAL_DEP_FILE], &WRITE_KINDS).await?;
+    Ok(())
+}
+
+/// As above, with the outputs of an action cache hit.
+#[buck_test(
+    data_dir = "upload_dep_files",
+    env = [("BUCK2_TEST_SKIP_ACTION_CACHE_WRITE", "true")],
+)]
+async fn test_dep_file_hit_on_action_cache_outputs(buck: &Buck) -> anyhow::Result<()> {
+    let cache_buster = format!("test.cache_buster={}", random_string());
+    let args = [
+        "root//:dep_files",
+        "-c",
+        &cache_buster,
+        "--remote-only",
+        "--materializations=none",
+    ];
+    buck.build(&args).await?;
+    check_execution_kind(buck, &[ACTION_EXECUTION_KIND_REMOTE], &WRITE_KINDS).await?;
+    buck.kill().await?;
+
+    buck.build(&args).await?;
+    check_execution_kind(buck, &[ACTION_EXECUTION_KIND_ACTION_CACHE], &WRITE_KINDS).await?;
+
+    std::fs::write(buck.cwd().join("unused.1"), "CHANGE")?;
+    buck.build(&args).await?;
+    check_execution_kind(buck, &[ACTION_EXECUTION_KIND_LOCAL_DEP_FILE], &WRITE_KINDS).await?;
     Ok(())
 }
 
@@ -2454,6 +2528,8 @@ async fn test_canonical_input_persisted_dep_file(
     setup_eden = false,
     skip_for_os = ["windows"],
     extra_buck_config = [("buck2", "sqlite_dep_file_state", "true")],
+    // The reloaded entry is served out of the outputs the previous daemon left on disk.
+    strict_leases = false,
 )]
 async fn test_canonical_input_persisted_dep_file_json(buck: &Buck) -> anyhow::Result<()> {
     test_canonical_input_persisted_dep_file(buck, "json").await
@@ -2464,6 +2540,8 @@ async fn test_canonical_input_persisted_dep_file_json(buck: &Buck) -> anyhow::Re
     setup_eden = false,
     skip_for_os = ["windows"],
     extra_buck_config = [("buck2", "sqlite_dep_file_state", "true")],
+    // The reloaded entry is served out of the outputs the previous daemon left on disk.
+    strict_leases = false,
 )]
 async fn test_canonical_input_persisted_dep_file_args(buck: &Buck) -> anyhow::Result<()> {
     test_canonical_input_persisted_dep_file(buck, "args").await

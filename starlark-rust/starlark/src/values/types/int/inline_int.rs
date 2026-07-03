@@ -30,16 +30,16 @@ use num_traits::Signed;
 use serde::Serialize;
 
 use crate::hint;
-use crate::typing::Ty;
 use crate::values::AllocFrozenValue;
 use crate::values::AllocValue;
 use crate::values::FrozenHeap;
 use crate::values::Heap;
 use crate::values::UnpackValue;
 use crate::values::Value;
-use crate::values::int::pointer_i32::PointerI32;
-use crate::values::type_repr::StarlarkTypeRepr;
+use crate::values::ValueOf;
+use crate::values::layout::value::IntegerTooBigError;
 use crate::values::types::int::int_or_big::StarlarkInt;
+use crate::values::types::int::view::IntView;
 
 /// Integer which is stored inline in `RawPointer`.
 #[derive(
@@ -342,32 +342,34 @@ impl Rem for InlineInt {
     }
 }
 
-impl StarlarkTypeRepr for InlineInt {
-    type Canonical = <StarlarkInt as StarlarkTypeRepr>::Canonical;
-
-    fn starlark_type_repr() -> Ty {
-        PointerI32::starlark_type_repr()
-    }
-}
-
 impl<'v> UnpackValue<'v> for InlineInt {
+    type Type = IntView<'v>;
     type Error = crate::Error;
 
-    fn unpack_value_impl(value: Value<'v>) -> crate::Result<Option<Self>> {
-        // TODO(nga): return error on too big integer.
-        Ok(value.0.unpack_int())
+    fn unpack(_value: ValueOf<'v, IntView<'v>>, int: IntView<'v>) -> crate::Result<Self> {
+        match int {
+            IntView::Small(x) => Ok(x.as_ref().get()),
+            IntView::Big(_) => Err(crate::Error::new_value(IntegerTooBigError {
+                integer_type: std::any::type_name::<Self>(),
+                value: int.to_string(),
+            })),
+        }
     }
 }
 
 impl<'v> AllocValue<'v> for InlineInt {
-    fn alloc_value(self, _heap: Heap<'v>) -> Value<'v> {
-        Value::new_int(self)
+    type Type = IntView<'v>;
+
+    fn alloc_value(self, _heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
+        ValueOf::new_unchecked(Value::new_int(self))
     }
 }
 
 impl<'fv> AllocFrozenValue<'fv> for InlineInt {
-    fn alloc_frozen_value(self, _heap: FrozenHeap<'fv>) -> Value<'fv> {
-        Value::new_int(self)
+    type Type = IntView<'fv>;
+
+    fn alloc_frozen_value(self, _heap: FrozenHeap<'fv>) -> ValueOf<'fv, Self::Type> {
+        ValueOf::new_unchecked(Value::new_int(self))
     }
 }
 

@@ -26,9 +26,11 @@ use crate::environment::GlobalsBuilder;
 use crate::eval::Evaluator;
 use crate::values::Value;
 use crate::values::ValueOf;
+use crate::values::ValueTyped;
 use crate::values::dict::DictType;
 use crate::values::record::field::Field;
 use crate::values::record::record_type::RecordType;
+use crate::values::types::record::record_type::RecordTypeView;
 use crate::values::types::type_instance_id::StarlarkTypeIdDomain;
 use crate::values::types::type_instance_id::TypeInstanceId;
 use crate::values::typing::type_compiled::compiled::TypeCompiled;
@@ -65,7 +67,7 @@ pub(crate) fn register_record(builder: &mut GlobalsBuilder) {
     fn record<'v>(
         #[starlark(kwargs)] kwargs: ValueOf<'v, DictType<String, Value<'v>>>,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> anyhow::Result<RecordType<'v>> {
+    ) -> anyhow::Result<ValueOf<'v, RecordTypeView<'v>>> {
         // Every Value must either be a field or a value (the type)
         let mut mp = SmallMap::with_capacity(kwargs.dict().len());
         for item in kwargs.try_items() {
@@ -78,7 +80,7 @@ pub(crate) fn register_record(builder: &mut GlobalsBuilder) {
         }
         let id = TypeInstanceId::from_def_site(StarlarkTypeIdDomain::Record, eval)
             .map_err(|e| e.into_anyhow())?;
-        Ok(RecordType::new(mp, id))
+        Ok(ValueOf::alloc(eval.heap(), RecordType::new(mp, id)))
     }
 
     /// Creates a field record. Used as an argument to the `record` function.
@@ -95,13 +97,15 @@ pub(crate) fn register_record(builder: &mut GlobalsBuilder) {
         #[starlark(require = pos)] typ: Value<'v>,
         default: Option<Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<Field<'v>> {
+    ) -> starlark::Result<ValueTyped<'v, Field<'v>>> {
         // We compile the type even if we don't have a default to raise the error sooner
         let compiled = TypeCompiled::new(typ, eval.heap())?;
         if let Some(d) = default {
             compiled.check_type(d, Some("default"))?;
         }
-        Ok(Field::new(compiled, default))
+        Ok(eval
+            .heap()
+            .alloc_representation(Field::new(compiled, default)))
     }
 }
 

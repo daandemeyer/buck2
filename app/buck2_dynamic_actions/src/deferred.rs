@@ -25,6 +25,7 @@ use buck2_build_api::dynamic::calculation::dynamic_lambda_result;
 use buck2_build_api::dynamic_value::DynamicValue;
 use buck2_build_api::interpreter::rule_defs::artifact::associated::AssociatedArtifacts;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactView;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_value::StarlarkArtifactValue;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_declared_artifact::StarlarkDeclaredArtifact;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_output_artifact::FrozenStarlarkOutputArtifact;
@@ -93,12 +94,9 @@ use crate::resolved_dynamic_value::StarlarkResolvedDynamicValue;
 
 /// The materialized inputs of a dynamic action, by artifact.
 pub type ArtifactValues<'v> =
-    ValueOf<'v, DictType<ValueTyped<'v, StarlarkArtifact>, ValueTyped<'v, StarlarkArtifactValue>>>;
+    ValueOf<'v, DictType<StarlarkArtifactView<'v>, StarlarkArtifactValue>>;
 /// The outputs of a dynamic action, declared on its own registry, by the artifact they stand for.
-pub type Outputs<'v> = ValueOf<
-    'v,
-    DictType<ValueTyped<'v, StarlarkArtifact>, ValueTyped<'v, StarlarkDeclaredArtifact<'v>>>,
->;
+pub type Outputs<'v> = ValueOf<'v, DictType<StarlarkArtifactView<'v>, StarlarkArtifactView<'v>>>;
 
 pub enum DynamicLambdaArgs<'v> {
     OldPositional {
@@ -246,7 +244,7 @@ fn execute_lambda_inner<'v>(
 
         let providers: ProviderCollection =
             invoke_dynamic_output_lambda(eval, dynamic_lambda_ctx_data.lambda.lambda(), args)?;
-        let providers = eval.heap().alloc_typed(providers);
+        let providers = eval.heap().alloc_representation(providers);
 
         ctx.assert_no_promises()?;
 
@@ -584,12 +582,9 @@ fn artifact_values<'v>(
     }
     Ok(ValueOf::alloc_dict(
         heap,
-        artifact_values_dict.into_iter().map(|(k, v)| {
-            (
-                ValueOf::from(heap.alloc_typed(k)),
-                ValueOf::from(heap.alloc_typed(v)),
-            )
-        }),
+        artifact_values_dict
+            .into_iter()
+            .map(|(k, v)| (ValueOf::alloc(heap, k), ValueOf::alloc(heap, v))),
     ))
 }
 
@@ -604,8 +599,8 @@ fn outputs<'v>(
         let declared = registry.declare_dynamic_output(x.as_ref().as_build_artifact(), heap)?;
         let v = StarlarkDeclaredArtifact::new(None, declared, AssociatedArtifacts::new());
         outputs_dict.push((
-            ValueOf::from(x.as_ref().inner()),
-            ValueOf::from(heap.alloc_typed(v)),
+            ValueOf::from_representation(x.as_ref().inner()),
+            ValueOf::alloc(heap, v),
         ));
     }
 
@@ -623,7 +618,7 @@ fn new_attr_value<'v>(
 ) -> buck2_error::Result<Value<'v>> {
     match value {
         DynamicAttrValue::Output(artifact) => {
-            let artifact = match artifact.unpack() {
+            let artifact = match artifact.get() {
                 StarlarkOutputArtifactView::Frozen(artifact) => {
                     artifact.as_ref().as_build_artifact()
                 }
@@ -634,12 +629,17 @@ fn new_attr_value<'v>(
                 }
             };
             let declared = registry.declare_dynamic_output(artifact, env.heap())?;
-            let artifact = env.heap().alloc_typed(StarlarkDeclaredArtifact::new(
-                None,
-                declared,
-                AssociatedArtifacts::new(),
-            ));
-            Ok(env.heap().alloc(StarlarkOutputArtifact::new(artifact)))
+            let artifact = env
+                .heap()
+                .alloc_representation(StarlarkDeclaredArtifact::new(
+                    None,
+                    declared,
+                    AssociatedArtifacts::new(),
+                ));
+            Ok(env
+                .heap()
+                .alloc_representation(StarlarkOutputArtifact::new(artifact))
+                .to_value())
         }
         DynamicAttrValue::ArtifactValue(artifact) => {
             let path = artifact.get_path().resolve(
@@ -659,19 +659,25 @@ fn new_attr_value<'v>(
                 .as_ref(),
             )?;
             // `InputArtifactsMaterialized` marker indicates that the artifact is materialized.
-            Ok(env.heap().alloc(StarlarkArtifactValue::new(
-                artifact.dupe(),
-                path.to_owned(),
-                artifact_fs.fs().dupe(),
-            )))
+            Ok(env
+                .heap()
+                .alloc_representation(StarlarkArtifactValue::new(
+                    artifact.dupe(),
+                    path.to_owned(),
+                    artifact_fs.fs().dupe(),
+                ))
+                .to_value())
         }
         DynamicAttrValue::DynamicValue(v) => {
             let v = resolved_dynamic_values
                 .get(v)
                 .internal_error("Missing resolved dynamic value")?;
-            Ok(env.heap().alloc(StarlarkResolvedDynamicValue {
-                value: v.add_heap_ref(env.heap()),
-            }))
+            Ok(env
+                .heap()
+                .alloc_representation(StarlarkResolvedDynamicValue {
+                    value: v.add_heap_ref(env.heap()),
+                })
+                .to_value())
         }
         DynamicAttrValue::Value(v) => Ok(*v),
         DynamicAttrValue::List(xs) => {

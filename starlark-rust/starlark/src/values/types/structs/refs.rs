@@ -31,7 +31,8 @@ use crate::values::ValueOf;
 use crate::values::starlark_type_id::StarlarkTypeId;
 use crate::values::structs::AllocStruct;
 use crate::values::structs::value::Struct;
-use crate::values::type_repr::StarlarkTypeRepr;
+use crate::values::type_expr::StarlarkTypeExpr;
+use crate::values::type_expr::StarlarkTypeExprStable;
 
 /// Reference to a struct allocated on the heap.
 ///
@@ -67,18 +68,35 @@ impl<'v> ValueOf<'v, StructRef<'v>> {
     }
 }
 
-impl<'v> StarlarkTypeRepr for StructRef<'v> {
-    type Canonical = Self;
+/// The handle to a struct, from the struct it was allocated as.
+impl<'v> From<ValueOf<'v, Struct<'v>>> for ValueOf<'v, StructRef<'v>> {
+    #[inline]
+    fn from(value: ValueOf<'v, Struct<'v>>) -> Self {
+        Self::new_unchecked(value.to_value())
+    }
+}
+
+impl<'v> StarlarkTypeExpr<'v> for StructRef<'v> {
+    type Get = Self;
 
     fn starlark_type_repr() -> Ty {
         Struct::starlark_type_repr()
     }
+
+    #[inline]
+    fn get(value: Value<'v>) -> Option<Self> {
+        StructRef::from_value(value)
+    }
 }
 
+impl<'v> StarlarkTypeExprStable<'v> for StructRef<'v> {}
+
 impl<'v> UnpackValue<'v> for StructRef<'v> {
+    type Type = Self;
     type Error = Infallible;
 
-    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        Ok(StructRef::from_value(value))
+    #[inline]
+    fn unpack(_value: ValueOf<'v, Self>, get: Self) -> Result<Self, Infallible> {
+        Ok(get)
     }
 }

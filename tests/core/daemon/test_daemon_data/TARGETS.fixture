@@ -1,4 +1,4 @@
-load(":defs.bzl", "generation", "long_running", "pwd_run", "tenant_value")
+load(":defs.bzl", "generation", "long_running", "nested_buck", "nested_run", "pwd_run", "tenant_value")
 
 trivial_build(name = "rule")
 
@@ -17,6 +17,14 @@ trivial_build(name = "tenant_two_probe")
 
 pwd_run(name = "pwd_run")
 
+nested_buck(name = "nested_buck")
+
 platform(name = "platform")
 execution_platform(name = "exec_platform", platform = ":platform", local_enabled = True)
 execution_platforms(name = "platforms", platforms = [":exec_platform"])
+
+nested_run(
+    name = "nested_run",
+    buck2_path = read_root_config("nested", "buck2_path", ""),
+    isolation_dir = read_root_config("nested", "isolation_dir", ""),
+)

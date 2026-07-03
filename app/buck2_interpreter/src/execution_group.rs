@@ -18,13 +18,10 @@ use dupe::Dupe;
 use pagable::Pagable;
 use starlark::eval::Evaluator;
 use starlark::starlark_simple_value;
-use starlark::typing::Ty;
-use starlark::values::AllocValue;
 use starlark::values::Freeze;
 use starlark::values::FreezeError;
 use starlark::values::FreezeResult;
 use starlark::values::Freezer;
-use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::ProvidesStaticType;
 use starlark::values::StarlarkPagable;
@@ -32,11 +29,8 @@ use starlark::values::StarlarkRepresentations;
 use starlark::values::StarlarkType;
 use starlark::values::StarlarkValue;
 use starlark::values::Trace;
-use starlark::values::UnpackValue;
-use starlark::values::Value;
 use starlark::values::ValueTyped;
 use starlark::values::starlark_value;
-use starlark::values::type_repr::StarlarkTypeRepr;
 
 #[derive(
     Debug,
@@ -106,12 +100,6 @@ impl StarlarkExecutionGroup {
     }
 }
 
-impl<'v> AllocValue<'v> for StarlarkExecutionGroup {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_complex(self)
-    }
-}
-
 #[derive(
     derive_more::Display,
     Debug,
@@ -175,36 +163,10 @@ impl<'v> StarlarkType<'v> for StarlarkExecutionGroupView<'v> {
 }
 
 impl StarlarkExecutionGroupView<'_> {
-    fn expect_bound(&self) -> buck2_error::Result<ExecutionGroup> {
+    pub fn expect_bound(&self) -> buck2_error::Result<ExecutionGroup> {
         match self {
             StarlarkExecutionGroupView::Unfrozen(v) => Ok(ExecutionGroup::Named(v.expect_bound()?)),
             StarlarkExecutionGroupView::Frozen(v) => Ok(v.0.dupe()),
         }
-    }
-}
-
-#[derive(ProvidesStaticType)]
-pub struct ExecutionGroupArg {
-    pub group: ExecutionGroup,
-}
-
-impl StarlarkTypeRepr for ExecutionGroupArg {
-    type Canonical = <StarlarkExecutionGroupView<'static> as StarlarkTypeRepr>::Canonical;
-
-    fn starlark_type_repr() -> Ty {
-        StarlarkExecutionGroupView::starlark_type_repr()
-    }
-}
-
-impl<'v> UnpackValue<'v> for ExecutionGroupArg {
-    type Error = starlark::Error;
-
-    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        let Some(group) = StarlarkExecutionGroupView::unpack_value_opt(value) else {
-            return Ok(None);
-        };
-        Ok(Some(ExecutionGroupArg {
-            group: group.expect_bound()?,
-        }))
     }
 }

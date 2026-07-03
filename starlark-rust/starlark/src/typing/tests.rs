@@ -43,14 +43,13 @@ use crate::typing::Ty;
 use crate::typing::callable_param::ParamIsRequired;
 use crate::typing::interface::Interface;
 use crate::util::ArcStr;
-use crate::values::AllocValue;
-use crate::values::Heap;
 use crate::values::StarlarkValue;
 use crate::values::Value;
 use crate::values::ValueOf;
 use crate::values::dict::DictType;
 use crate::values::layout::heap::name::StarlarkTestHeapName;
 use crate::values::none::NoneType;
+use crate::values::types::int::view::IntView;
 use crate::values::typing::StarlarkCallable;
 use crate::values::typing::StarlarkCallableParamSpec;
 use crate::values::typing::StarlarkIter;
@@ -83,12 +82,6 @@ struct MyCustomType;
 
 #[starlark_value(type = "my_custom_type")]
 impl<'v> StarlarkValue<'v> for MyCustomType {}
-
-impl<'v> AllocValue<'v> for MyCustomType {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_simple(self)
-    }
-}
 
 struct NamedXy;
 
@@ -124,7 +117,7 @@ fn register_typecheck_globals(globals: &mut GlobalsBuilder) {
     }
 
     fn accepts_typed_kwargs<'v>(
-        #[starlark(kwargs)] x: ValueOf<'v, DictType<String, u32>>,
+        #[starlark(kwargs)] x: ValueOf<'v, DictType<String, IntView<'v>>>,
     ) -> anyhow::Result<NoneType> {
         let _ignore = x;
         Ok(NoneType)

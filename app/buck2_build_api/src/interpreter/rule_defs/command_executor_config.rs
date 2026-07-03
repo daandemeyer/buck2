@@ -43,6 +43,7 @@ use derive_more::Display;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::values::Freeze;
+use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkPagable;
 use starlark::values::StarlarkValue;
@@ -220,19 +221,20 @@ pub fn register_command_executor_config(builder: &mut GlobalsBuilder) {
         #[starlark(default = ValueOf::empty_list(), require = named)]
         remote_execution_dependencies: ValueOf<
             'v,
-            ListType<ValueOf<'v, DictType<&'v str, &'v str>>>,
+            ListType<DictType<&'v str, &'v str>>,
         >,
         #[starlark(default = ValueOf::empty_list(), require = named)]
         remote_execution_gang_workers: ValueOf<
             'v,
-            ListType<ValueOf<'v, DictType<&'v str, &'v str>>>,
+            ListType<DictType<&'v str, &'v str>>,
         >,
         #[starlark(default = NoneType, require = named)] remote_execution_dynamic_image: Value<'v>,
         #[starlark(default = NoneOr::None, require = named)] meta_internal_extra_params: NoneOr<
             DictRef<'v>,
         >,
         #[starlark(default = NoneOr::None, require = named)] priority: NoneOr<i32>,
-    ) -> starlark::Result<StarlarkCommandExecutorConfig> {
+        heap: Heap<'v>,
+    ) -> starlark::Result<ValueOf<'v, StarlarkCommandExecutorConfig>> {
         let command_executor_config = {
             let remote_execution_max_input_files_mebibytes: Option<i32> =
                 remote_execution_max_input_files_mebibytes.into_option();
@@ -248,7 +250,7 @@ pub fn register_command_executor_config(builder: &mut GlobalsBuilder) {
                 parse_remote_execution_properties(remote_execution_properties.to_value())?;
 
             let re_dependencies = remote_execution_dependencies
-                .try_items()
+                .iter()
                 .map(|d| {
                     RemoteExecutorDependency::parse(
                         d?.try_items().collect::<starlark::Result<_>>()?,
@@ -257,7 +259,7 @@ pub fn register_command_executor_config(builder: &mut GlobalsBuilder) {
                 .collect::<buck2_error::Result<Vec<RemoteExecutorDependency>>>()?;
 
             let re_gang_workers = remote_execution_gang_workers
-                .try_items()
+                .iter()
                 .map(|w| ReGangWorker::parse(w?.try_items().collect::<starlark::Result<_>>()?))
                 .collect::<buck2_error::Result<Vec<ReGangWorker>>>()?;
 
@@ -447,9 +449,10 @@ pub fn register_command_executor_config(builder: &mut GlobalsBuilder) {
             }
         };
 
-        Ok(StarlarkCommandExecutorConfig(Arc::new(
-            command_executor_config,
-        )))
+        Ok(ValueOf::alloc(
+            heap,
+            StarlarkCommandExecutorConfig(Arc::new(command_executor_config)),
+        ))
     }
 }
 

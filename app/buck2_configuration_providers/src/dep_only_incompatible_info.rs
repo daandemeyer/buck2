@@ -26,12 +26,12 @@ use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::values::Freeze;
 use starlark::values::StarlarkPagable;
-use starlark::values::StringValue;
 use starlark::values::Trace;
 use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
 use starlark::values::dict::DictType;
 use starlark::values::list::ListType;
+use starlark::values::string::StarlarkStr;
 
 use crate::dep_only_incompatible_rollout::DepOnlyIncompatibleRollout;
 
@@ -73,8 +73,7 @@ use crate::dep_only_incompatible_rollout::DepOnlyIncompatibleRollout;
 )]
 #[repr(C)]
 pub struct DepOnlyIncompatibleInfo<'v> {
-    pub custom_soft_errors:
-        ValueOf<'v, DictType<StringValue<'v>, ValueTyped<'v, DepOnlyIncompatibleRollout<'v>>>>,
+    pub custom_soft_errors: ValueOf<'v, DictType<StarlarkStr, DepOnlyIncompatibleRollout<'v>>>,
 }
 
 #[starlark_module]
@@ -83,21 +82,21 @@ fn dep_only_incompatible_info_creator(globals: &mut GlobalsBuilder) {
     fn DepOnlyIncompatibleInfo<'v>(
         #[starlark(require = named)] custom_soft_errors: ValueOf<
             'v,
-            DictType<StringValue<'v>, ValueTyped<'v, DepOnlyIncompatibleRollout<'v>>>,
+            DictType<StarlarkStr, DepOnlyIncompatibleRollout<'v>>,
         >,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<DepOnlyIncompatibleInfo<'v>> {
+    ) -> starlark::Result<ValueTyped<'v, DepOnlyIncompatibleInfo<'v>>> {
         // The provider's own copy, so that mutating the caller's dict cannot add a category that
         // was not validated.
         let mut entries = Vec::with_capacity(custom_soft_errors.dict().len());
         for entry in custom_soft_errors.iter() {
             let (category, rollout) = entry?;
-            validate_logview_category(category.unpack().as_str())?;
+            validate_logview_category(category.get().as_str())?;
             entries.push((category, rollout));
         }
-        Ok(DepOnlyIncompatibleInfo {
+        Ok(eval.heap().alloc_representation(DepOnlyIncompatibleInfo {
             custom_soft_errors: ValueOf::alloc_dict(eval.heap(), entries),
-        })
+        }))
     }
 }
 
@@ -133,12 +132,12 @@ impl<'v> DepOnlyIncompatibleInfo<'v> {
         cell_resolver: &CellResolver,
         cell_alias_resolver: &CellAliasResolver,
     ) -> buck2_error::Result<DepOnlyIncompatibleCustomSoftErrors> {
-        let patterns = |patterns: ValueOf<'v, ListType<StringValue<'v>>>| {
+        let patterns = |patterns: ValueOf<'v, ListType<StarlarkStr>>| {
             patterns
                 .iter()
                 .map(|pattern| {
                     ParsedPattern::parse_precise(
-                        pattern?.unpack().as_str(),
+                        pattern?.get().as_str(),
                         root_cell.dupe(),
                         cell_resolver,
                         cell_alias_resolver,
@@ -150,9 +149,8 @@ impl<'v> DepOnlyIncompatibleInfo<'v> {
             .iter()
             .map(|entry| {
                 let (category, rollout) = entry?;
-                let rollout = rollout.unpack();
                 Ok((
-                    ArcStr::from(category.unpack().as_str()),
+                    ArcStr::from(category.get().as_str()),
                     DepOnlyIncompatibleRolloutPatterns {
                         target_patterns: patterns(rollout.target_patterns)?,
                         exclusions: patterns(rollout.exclusions)?,

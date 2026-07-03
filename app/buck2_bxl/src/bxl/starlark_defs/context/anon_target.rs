@@ -56,14 +56,14 @@ use starlark::starlark_module;
 use starlark::typing::ParamIsRequired;
 use starlark::typing::ParamSpec;
 use starlark::util::ArcStr;
-use starlark::values::StringValue;
+use starlark::values::StarlarkTypeExpr;
 use starlark::values::Value;
 use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
 use starlark::values::dict::DictType;
 use starlark::values::list::ListType;
+use starlark::values::string::StarlarkStr;
 use starlark::values::structs::StructRef;
-use starlark::values::type_repr::StarlarkTypeRepr;
 use starlark::values::typing::StarlarkCallable;
 use starlark::values::typing::StarlarkCallableChecked;
 use starlark::values::typing::StarlarkCallableParamSpec;
@@ -113,26 +113,26 @@ pub(crate) fn register_anon_rule(globals: &mut GlobalsBuilder) {
             BxlAnonCallbackParamSpec,
             ListType<AbstractProvider>,
         >,
-        #[starlark(require = named)] attrs: ValueOf<'v, DictType<&'v str, &'v StarlarkAttribute>>,
+        #[starlark(require = named)] attrs: ValueOf<'v, DictType<&'v str, StarlarkAttribute>>,
         #[starlark(require = named, default = "")] doc: &str,
         #[starlark(require = named, default = ValueOf::empty_dict())]
         artifact_promise_mappings: ValueOf<
             'v,
             DictType<
-                StringValue<'v>,
+                StarlarkStr,
                 StarlarkCallable<'v, (Value<'static>,), ListType<Value<'static>>>,
             >,
         >,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<StarlarkRuleCallable<'v>> {
-        StarlarkRuleCallable::new_bxl_anon(
+    ) -> starlark::Result<ValueTyped<'v, StarlarkRuleCallable<'v>>> {
+        let rule = StarlarkRuleCallable::new_bxl_anon(
             StarlarkCallable::unchecked_new(r#impl.0),
             attrs,
             doc,
             artifact_promise_mappings,
             eval,
-        )
-        .map_err(Into::into)
+        )?;
+        Ok(eval.heap().alloc_representation(rule))
     }
 }
 
@@ -299,7 +299,7 @@ async fn eval_bxl_for_anon_target_inner(
                 analysis_registry,
                 attributes,
             )?;
-            let bxl_ctx = ValueTyped::<BxlContext>::new_err(env.heap().alloc(bxl_anon_ctx))?;
+            let bxl_ctx = env.heap().alloc_representation(bxl_anon_ctx);
 
             let list_res = tokio::task::block_in_place(|| -> buck2_error::Result<Value<'_>> {
                 anon_impl.invoke(eval, bxl_ctx, attributes)
@@ -316,7 +316,7 @@ async fn eval_bxl_for_anon_target_inner(
         })?;
 
         let res_typed = ProviderCollection::try_from_value(list_res)?;
-        let res = env.heap().alloc(res_typed);
+        let res = env.heap().alloc_representation(res_typed).to_value();
 
         let fulfilled_artifact_mappings = reentrant_eval.with_evaluator(|eval| {
             let promise_artifact_mappings = anon_impl.promise_artifact_mappings(eval)?;

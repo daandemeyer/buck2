@@ -17,10 +17,12 @@ import com.facebook.buck.jvm.cd.command.kotlin.KotlinExtraParams;
 import com.facebook.buck.jvm.java.ActionMetadata;
 import com.facebook.buck.jvm.kotlin.kotlinc.incremental.KotlinSourceChanges;
 import com.facebook.buck.jvm.kotlin.kotlinc.incremental.KotlincMode;
+import com.facebook.infer.annotation.Nullsafe;
 import com.google.common.collect.ImmutableList;
 import java.util.Optional;
-import javax.annotation.Nullable;
+import org.jspecify.annotations.Nullable;
 
+@Nullsafe(Nullsafe.Mode.LOCAL)
 public class KotlincModeFactory {
   private static final Logger LOG = Logger.get(KotlincModeFactory.class);
 
@@ -51,10 +53,10 @@ public class KotlincModeFactory {
       LOG.info("Non-incremental mode applied: source-only build requested");
       return KotlincMode.NonIncremental.INSTANCE;
     } else {
-      @Nullable
-      AbsPath depFile = isTrackClassUsageEnabled ? rootProjectDir.resolve(depFilePath) : null;
-      @Nullable
-      AbsPath usedJars = isTrackClassUsageEnabled ? rootProjectDir.resolve(usedJarsPath) : null;
+      @Nullable AbsPath depFile =
+          isTrackClassUsageEnabled ? rootProjectDir.resolve(depFilePath) : null;
+      @Nullable AbsPath usedJars =
+          isTrackClassUsageEnabled ? rootProjectDir.resolve(usedJarsPath) : null;
 
       AbsPath kotlicWorkingDir =
           extraParams

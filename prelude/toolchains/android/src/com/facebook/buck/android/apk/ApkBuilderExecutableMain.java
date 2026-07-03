@@ -13,6 +13,7 @@ package com.facebook.buck.android.apk;
 import com.android.apksig.ApkSigner;
 import com.facebook.buck.android.apk.sdk.ApkCreationException;
 import com.facebook.buck.android.apk.sdk.DuplicateFileException;
+import com.facebook.buck.android.apk.sdk.FastPackaging;
 import com.facebook.buck.android.apk.sdk.SealedApkException;
 import com.facebook.buck.android.zipalign.ZipAlign;
 import com.facebook.buck.util.zip.RepackZipEntries;
@@ -42,6 +43,10 @@ import org.kohsuke.args4j.Option;
 /** Main entry point for executing {@link ApkBuilderUtils} calls. */
 @Nullsafe(Nullsafe.Mode.LOCAL)
 public class ApkBuilderExecutableMain {
+  private static final int MAX_COMPRESSION_THREADS = 16;
+  private static final String V1_SIGNING_ALWAYS = "always";
+  private static final String V1_SIGNING_MIN_SDK = "min-sdk";
+
   @Option(name = "--output-apk", required = true)
   private String outputApk;
 
@@ -90,6 +95,25 @@ public class ApkBuilderExecutableMain {
   @Nullable
   private String buildInfoGeneratorArgs = null;
 
+  @Option(
+      name = "--fast-packaging",
+      usage =
+          "Copy deflated entries of zip inputs without recompressing them, and deflate files on"
+              + " --compression-threads threads")
+  private boolean fastPackaging;
+
+  @Option(
+      name = "--compression-threads",
+      usage = "Threads that deflate files with --fast-packaging")
+  private int compressionThreads = 4;
+
+  @Option(
+      name = "--v1-signing-policy",
+      usage =
+          "always: sign with v1 and v2. min-sdk: sign with v1 only when the manifest's"
+              + " minSdkVersion is below 24")
+  private String v1SigningPolicy = V1_SIGNING_ALWAYS;
+
   public static void main(String[] args) throws IOException {
     ApkBuilderExecutableMain main = new ApkBuilderExecutableMain();
     CmdLineParser parser = new CmdLineParser(main);
@@ -105,6 +129,19 @@ public class ApkBuilderExecutableMain {
   }
 
   private void run() throws IOException {
+    if (compressionThreads < 1 || compressionThreads > MAX_COMPRESSION_THREADS) {
+      throw new IllegalArgumentException(
+          String.format(
+              "--compression-threads must be between 1 and %d, but was %d",
+              MAX_COMPRESSION_THREADS, compressionThreads));
+    }
+    if (!V1_SIGNING_ALWAYS.equals(v1SigningPolicy) && !V1_SIGNING_MIN_SDK.equals(v1SigningPolicy)) {
+      throw new IllegalArgumentException(
+          String.format(
+              "--v1-signing-policy must be %s or %s, but was %s",
+              V1_SIGNING_ALWAYS, V1_SIGNING_MIN_SDK, v1SigningPolicy));
+    }
+
     String scratchPath = System.getenv("BUCK_SCRATCH_PATH");
     if (scratchPath == null || scratchPath.isEmpty()) {
       throw new IllegalStateException(
@@ -174,7 +211,11 @@ public class ApkBuilderExecutableMain {
           packageMetaInfVersionFiles,
           null,
           excludedResources,
-          archivePath -> matchesAny(uncompressedFilePatterns, archivePath));
+          archivePath -> matchesAny(uncompressedFilePatterns, archivePath),
+          fastPackaging
+              ? FastPackaging.withCompressionThreads(
+                  Math.min(compressionThreads, Runtime.getRuntime().availableProcessors()))
+              : null);
 
       if (compressResourcesDotArsc) {
         Path intermediateApkWithCompressedResources =
@@ -208,8 +249,11 @@ public class ApkBuilderExecutableMain {
 
       ImmutableList<ApkSigner.SignerConfig> signerConfigs =
           ApkSignerUtils.getSignerConfigs(keystoreProperties, Files.newInputStream(keystorePath));
+      boolean v1SigningEnabled =
+          V1_SIGNING_ALWAYS.equals(v1SigningPolicy)
+              || ApkSignerUtils.needsV1Signature(zipalignApk.toFile());
       ApkSignerUtils.signApkFile(
-          zipalignApk.toFile(), Paths.get(outputApk).toFile(), signerConfigs);
+          zipalignApk.toFile(), Paths.get(outputApk).toFile(), signerConfigs, v1SigningEnabled);
     } catch (UnrecoverableKeyException
         | NoSuchAlgorithmException
         | ApkCreationException

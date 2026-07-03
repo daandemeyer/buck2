@@ -24,13 +24,12 @@ use std::ops::Deref;
 use dupe::Dupe;
 use either::Either;
 
-use crate::typing::Ty;
 use crate::values::UnpackValue;
 use crate::values::Value;
 use crate::values::ValueError;
+use crate::values::ValueOf;
 use crate::values::dict::Dict;
 use crate::values::dict::value::DictGen;
-use crate::values::type_repr::StarlarkTypeRepr;
 use crate::values::types::dict::dict_type::DictType;
 
 /// Borrowed `Dict`.
@@ -114,18 +113,15 @@ impl<'v> Deref for DictRef<'v> {
     }
 }
 
-impl<'v> StarlarkTypeRepr for DictRef<'v> {
-    type Canonical = <DictType<Value<'static>, Value<'static>> as StarlarkTypeRepr>::Canonical;
-
-    fn starlark_type_repr() -> Ty {
-        DictType::<Value<'static>, Value<'static>>::starlark_type_repr()
-    }
-}
-
 impl<'v> UnpackValue<'v> for DictRef<'v> {
+    type Type = DictType<Value<'v>, Value<'v>>;
     type Error = Infallible;
 
-    fn unpack_value_impl(value: Value<'v>) -> Result<Option<DictRef<'v>>, Infallible> {
-        Ok(DictRef::from_value(value))
+    #[inline]
+    fn unpack(
+        _value: ValueOf<'v, Self::Type>,
+        get: ValueOf<'v, Self::Type>,
+    ) -> Result<Self, Infallible> {
+        Ok(get.dict())
     }
 }

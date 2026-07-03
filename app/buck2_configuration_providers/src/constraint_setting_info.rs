@@ -27,8 +27,10 @@ use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::starlark_module;
 use starlark::values::Freeze;
+use starlark::values::Heap;
 use starlark::values::StarlarkPagable;
 use starlark::values::Trace;
+use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
 use starlark::values::none::NoneOr;
 
@@ -46,17 +48,17 @@ use starlark::values::none::NoneOr;
 )]
 #[repr(C)]
 pub(crate) struct ConstraintSettingInfo<'v> {
-    label: ValueTyped<'v, StarlarkTargetLabel>,
+    label: ValueOf<'v, StarlarkTargetLabel>,
     // TODO(nero): Remove NoneOr when we migrate to unified constraint
-    default: Option<ValueTyped<'v, StarlarkProvidersLabel>>,
+    default: Option<ValueOf<'v, StarlarkProvidersLabel>>,
 }
 
 impl<'v> ConstraintSettingInfo<'v> {
-    pub(crate) fn label(&self) -> ValueTyped<'v, StarlarkTargetLabel> {
+    pub(crate) fn label(&self) -> ValueOf<'v, StarlarkTargetLabel> {
         self.label
     }
 
-    pub(crate) fn default(&self) -> Option<ValueTyped<'v, StarlarkProvidersLabel>> {
+    pub(crate) fn default(&self) -> Option<ValueOf<'v, StarlarkProvidersLabel>> {
         self.default
     }
 
@@ -72,8 +74,8 @@ impl<'v> ConstraintSettingInfo<'v> {
     }
 
     pub(crate) fn new(
-        label: ValueTyped<'v, StarlarkTargetLabel>,
-        default: Option<ValueTyped<'v, StarlarkProvidersLabel>>,
+        label: ValueOf<'v, StarlarkTargetLabel>,
+        default: Option<ValueOf<'v, StarlarkProvidersLabel>>,
     ) -> ConstraintSettingInfo<'v> {
         ConstraintSettingInfo { label, default }
     }
@@ -83,11 +85,12 @@ impl<'v> ConstraintSettingInfo<'v> {
 fn constraint_info_creator(globals: &mut GlobalsBuilder) {
     #[starlark(as_type = ConstraintSettingInfo<'static>)]
     fn ConstraintSettingInfo<'v>(
-        #[starlark(require = named)] label: ValueTyped<'v, StarlarkTargetLabel>,
+        #[starlark(require = named)] label: ValueOf<'v, StarlarkTargetLabel>,
         #[starlark(require = named, default = NoneOr::None)] default: NoneOr<
-            ValueTyped<'v, StarlarkProvidersLabel>,
+            ValueOf<'v, StarlarkProvidersLabel>,
         >,
-    ) -> starlark::Result<ConstraintSettingInfo<'v>> {
-        Ok(ConstraintSettingInfo::new(label, default.into_option()))
+        heap: Heap<'v>,
+    ) -> starlark::Result<ValueTyped<'v, ConstraintSettingInfo<'v>>> {
+        Ok(heap.alloc_representation(ConstraintSettingInfo::new(label, default.into_option())))
     }
 }

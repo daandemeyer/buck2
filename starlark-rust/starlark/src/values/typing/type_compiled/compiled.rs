@@ -56,11 +56,11 @@ use crate::values::StaticValueRegistered;
 use crate::values::StringValue;
 use crate::values::Trace;
 use crate::values::Value;
+use crate::values::ValueOf;
 use crate::values::ValueTyped;
 use crate::values::dict::DictRef;
 use crate::values::list::ListRef;
 use crate::values::none::NoneType;
-use crate::values::type_repr::StarlarkTypeRepr;
 use crate::values::types::tuple::value::Tuple;
 use crate::values::typing::type_compiled::factory::TYPE_COMPILED_BOOL;
 use crate::values::typing::type_compiled::factory::TYPE_COMPILED_INT;
@@ -215,6 +215,19 @@ starlark::methods_static!(TYPE_COMPILED_METHODS = type_compiled_methods);
 /// The behaviour of a compiled type, whose representations are one per matcher.
 #[starlark_value(type = "type")]
 impl<'v> StarlarkType<'v> for TypeCompiled<'v> {
+    type Get = Self;
+
+    fn get_type_starlark_repr() -> Ty {
+        Ty::starlark_value::<TypeCompiledImplAsStarlarkValue<DummyTypeMatcher>>()
+    }
+
+    fn get(value: Value<'v>) -> Option<Self> {
+        value
+            .request_value::<&dyn TypeCompiledDyn>()
+            .is_some()
+            .then_some(TypeCompiled(value))
+    }
+
     fn write_hash(&self, hasher: &mut StarlarkHasher) -> crate::Result<()> {
         Hash::hash(self.as_ty(), hasher);
         Ok(())
@@ -318,17 +331,11 @@ impl<'v> Display for TypeCompiled<'v> {
     }
 }
 
-impl<'v> StarlarkTypeRepr for TypeCompiled<'v> {
-    type Canonical = TypeCompiledImplAsStarlarkValue<DummyTypeMatcher>;
-
-    fn starlark_type_repr() -> Ty {
-        TypeCompiledImplAsStarlarkValue::<DummyTypeMatcher>::starlark_type_repr()
-    }
-}
-
 impl<'v> AllocValue<'v> for TypeCompiled<'v> {
-    fn alloc_value(self, _heap: Heap<'v>) -> Value<'v> {
-        self.0
+    type Type = Self;
+
+    fn alloc_value(self, _heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
+        ValueOf::new_unchecked(self.0)
     }
 }
 

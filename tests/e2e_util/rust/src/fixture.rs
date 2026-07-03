@@ -28,6 +28,9 @@ use sha2::Digest;
 use sha2::Sha256;
 
 use crate::buck::Buck;
+use crate::buck::daemon_routing_config;
+use crate::eden::Eden;
+use crate::eden::run;
 use crate::macro_support::BoxFuture;
 use crate::macro_support::Fixture;
 use crate::macro_support::TestResult;
@@ -44,11 +47,13 @@ pub struct BuckTest {
     skip_for_materializer: Vec<String>,
     allow_soft_errors: bool,
     allow_daemon_panics: bool,
+    strict_leases: bool,
     extra_buck_config: Vec<(String, String, String)>,
     skip_final_kill: bool,
     setup_eden: bool,
     disable_daemon_cgroup: bool,
     write_invocation_record: bool,
+    share_daemon: bool,
     env: Vec<(String, String)>,
 }
 
@@ -64,11 +69,13 @@ impl BuckTest {
             skip_for_materializer: Vec::new(),
             allow_soft_errors: false,
             allow_daemon_panics: false,
+            strict_leases: true,
             extra_buck_config: Vec::new(),
             skip_final_kill: false,
             setup_eden: false,
             disable_daemon_cgroup: true,
             write_invocation_record: false,
+            share_daemon: false,
             env: Vec::new(),
         }
     }
@@ -117,6 +124,15 @@ impl BuckTest {
         self
     }
 
+    /// Whether a disk-state twin takes a root off disk the moment its last lease drops, so that a
+    /// reader without one fails here rather than by chance in use. On by default; off for a test
+    /// whose premise is that unleased outputs stay on disk, such as a persisted cache entry served
+    /// across a daemon restart.
+    pub fn strict_leases(mut self, strict_leases: bool) -> Self {
+        self.strict_leases = strict_leases;
+        self
+    }
+
     /// Extra buckconfig values, as `(section, key, value)`.
     pub fn extra_buck_config<'a>(
         mut self,
@@ -149,6 +165,13 @@ impl BuckTest {
     }
 
     /// Has every command write an invocation record; see [`crate::BuckOutput::invocation_record`].
+    /// Routes the test's `buck` to the shared daemon of its repository; see
+    /// [`Buck::set_daemon_routing`].
+    pub fn share_daemon(mut self, share_daemon: bool) -> Self {
+        self.share_daemon = share_daemon;
+        self
+    }
+
     pub fn write_invocation_record(mut self, write_invocation_record: bool) -> Self {
         self.write_invocation_record = write_invocation_record;
         self
@@ -328,7 +351,6 @@ impl BuckTest {
             env.insert(key.into(), value.into());
         };
 
-        set("BUCK2_SHARE_DAEMON", "false");
         if cfg!(windows) {
             set("CI", "true");
         } else {
@@ -362,7 +384,10 @@ impl BuckTest {
             set("BUCK2_TEST_DISABLE_DAEMON_CGROUP", "true");
         }
         set("BUCK2_TEST_SKIP_DEFAULT_EXTERNAL_CONFIG", "true");
-        env.remove(OsStr::new("BUCK2_DAEMON_GROUP"));
+        // The buck2 running this test exports its own daemon to the test's environment; the
+        // clients a test runs are not run by that daemon's actions and must not be nested in it.
+        env.remove(OsStr::new("BUCK2_DAEMON_UUID"));
+        env.remove(OsStr::new("BUCK2_DAEMON_USER_VERSION"));
         // Windows uses blocking threads for subprocess I/O, so buck2 gets no limit.
         env.remove(OsStr::new("BUCK2_MAX_BLOCKING_THREADS"))
             .context("`BUCK2_MAX_BLOCKING_THREADS` is not set; the buck e2e test macros set it")?;
@@ -385,17 +410,13 @@ impl BuckTest {
             ensure_fseventsd_running(base_dir.parent().unwrap_or(base_dir));
         }
         if self.setup_eden {
-            let eden = Eden {
-                dir: base_dir.join("eden"),
-                project_dir: project_dir.clone(),
-                env: env.clone(),
-            };
+            let eden = Eden::new(base_dir.join("eden"), env.clone());
             LEFTOVERS.with_borrow_mut(|leftovers| {
                 if let Some(leftovers) = leftovers {
-                    leftovers.eden = Some(eden.clone());
+                    leftovers.eden = Some((eden.clone(), project_dir.clone()));
                 }
             });
-            eden.mount()?;
+            eden.start(&project_dir)?;
         }
         let (cwd, isolation_prefix) = if self.inplace == Some(true) {
             // Not true of every Linux host, but the tests rely on it.
@@ -430,19 +451,23 @@ impl BuckTest {
 
         // Core tests run with read-only outputs, under either materializer.
         extra_config.push_str("[buck2]\nreadonly_outputs = true\n");
+        // Each test gets its own daemons unless it opts into sharing with `share_daemon`.
+        extra_config.push_str(&daemon_routing_config(false));
         // A target variant can run its suite against another materializer implementation; see
         // `buck2_core_tests`.
-        match std::env::var("BUCK2_TEST_MATERIALIZER").ok().as_deref() {
-            None => {}
+        let disk_state_materializer = match std::env::var("BUCK2_TEST_MATERIALIZER").ok().as_deref()
+        {
+            None => false,
             Some("v2") => {
                 // Every `ROLLOUT_VERSION` is at least 0.
                 extra_config.push_str("[buck2]\nmaterializer_v2_version = 0\n");
-                // The disk-state twins run strict: a root leaves disk the moment its last lease
-                // does, so a reader without one fails here rather than by chance in use.
-                extra_config.push_str("[buck2]\nmaterializer_strict_leases = true\n");
+                if self.strict_leases {
+                    extra_config.push_str("[buck2]\nmaterializer_strict_leases = true\n");
+                }
+                true
             }
             Some(other) => anyhow::bail!("Unknown `BUCK2_TEST_MATERIALIZER` value `{other}`"),
-        }
+        };
         for (section, key, value) in &self.extra_buck_config {
             extra_config.push_str(&format!("[{section}]\n{key} = {value}\n"));
         }
@@ -465,12 +490,16 @@ impl BuckTest {
             cwd,
             env,
             self.write_invocation_record,
+            disk_state_materializer,
         );
         if let Some(isolation_prefix) = isolation_prefix {
             buck.set_isolation_prefix(isolation_prefix);
         }
         for (key, value) in &self.env {
             buck.set_env(key, value);
+        }
+        if self.share_daemon {
+            buck.set_daemon_routing(true)?;
         }
         Ok(buck)
     }
@@ -502,94 +531,6 @@ impl BuckTest {
             ),
         }
     }
-}
-
-/// An EdenFS checkout of an empty repository, with a daemon of its own.
-#[derive(Clone)]
-struct Eden {
-    dir: PathBuf,
-    project_dir: PathBuf,
-    env: BTreeMap<OsString, OsString>,
-}
-
-impl Eden {
-    /// Starts the daemon in `dir` and mounts the checkout at `project_dir`.
-    fn mount(&self) -> anyhow::Result<()> {
-        for sub in ["config", "etc", "home"] {
-            fs::create_dir_all(self.dir.join(sub))?;
-        }
-        run(&mut self.eden(["start"]))?;
-
-        let repo = self.dir.join("temp_repo");
-        run(self.command("hg").arg("init").arg(&repo))?;
-        // The redirection is set up when the checkout is mounted. The number of APFS volumes macOS
-        // can have is limited, and cleaning disk image redirections up is not trivial, so it is a
-        // symlink there.
-        let redirection = if cfg!(target_os = "macos") {
-            "symlink"
-        } else {
-            "bind"
-        };
-        fs::write(
-            repo.join(".eden-redirections"),
-            format!("[redirections]\n\"buck-out\" = \"{redirection}\"\n"),
-        )?;
-        // Keeps the repository clean when EdenFS creates the redirection.
-        fs::write(repo.join(".gitignore"), "/buck-out\n")?;
-        run(self
-            .command("hg")
-            .args(["commit", "--addremove", "-m", "init"])
-            .current_dir(&repo))?;
-
-        let mut clone = self.eden(["clone"]);
-        clone
-            .arg(&repo)
-            .arg(&self.project_dir)
-            .args(["--allow-empty-repo", "--case-insensitive"]);
-        if cfg!(windows) {
-            clone.arg("--enable-windows-symlinks");
-        }
-        run(&mut clone)
-    }
-
-    /// Unmounts the checkout and stops the daemon, as well as they go.
-    fn remove(&self) {
-        let mut remove = self.eden(["remove"]);
-        remove.arg(&self.project_dir).arg("-y");
-        let _ignored = remove.status();
-        let _ignored = self.eden(["shutdown"]).status();
-    }
-
-    fn command(&self, program: &str) -> std::process::Command {
-        let mut command = std::process::Command::new(program);
-        command
-            .env_clear()
-            .envs(&self.env)
-            .stdout(std::io::stderr())
-            .stderr(std::io::stderr());
-        command
-    }
-
-    fn eden<'a>(&self, args: impl IntoIterator<Item = &'a str>) -> std::process::Command {
-        let mut command = self.command("eden");
-        command
-            .arg("--config-dir")
-            .arg(self.dir.join("config"))
-            .arg("--home-dir")
-            .arg(self.dir.join("home"))
-            .arg("--etc-eden-dir")
-            .arg(self.dir.join("etc"))
-            .args(args);
-        command
-    }
-}
-
-fn run(command: &mut std::process::Command) -> anyhow::Result<()> {
-    let status = command
-        .status()
-        .with_context(|| format!("Running {command:?}"))?;
-    anyhow::ensure!(status.success(), "{command:?} failed: {status}");
-    Ok(())
 }
 
 /// Sandcastle Mac VMs boot with fseventsd disabled and ship a script that starts it, which sudo
@@ -669,7 +610,8 @@ struct Leftovers {
     base_dir: PathBuf,
     /// `buck2 kill`, unless the test keeps its daemon.
     kill: Option<std::process::Command>,
-    eden: Option<Eden>,
+    /// The EdenFS daemon and the project mounted on it.
+    eden: Option<(Eden, PathBuf)>,
 }
 
 thread_local! {
@@ -696,8 +638,8 @@ impl Leftovers {
             );
             return;
         }
-        if let Some(eden) = &self.eden {
-            eden.remove();
+        if let Some((eden, project_dir)) = &self.eden {
+            eden.shutdown(project_dir);
         }
         remove_dir_all(&self.base_dir);
     }

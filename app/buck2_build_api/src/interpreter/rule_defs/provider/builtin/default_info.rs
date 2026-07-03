@@ -9,7 +9,6 @@
  */
 
 use std::fmt::Debug;
-use std::iter;
 use std::ptr;
 
 use allocative::Allocative;
@@ -26,7 +25,6 @@ use starlark::values::FreezeError;
 use starlark::values::FrozenHeap;
 use starlark::values::Heap;
 use starlark::values::StarlarkPagable;
-use starlark::values::StringValue;
 use starlark::values::Trace;
 use starlark::values::Value;
 use starlark::values::ValueOf;
@@ -36,6 +34,7 @@ use starlark::values::dict::DictType;
 use starlark::values::list::AllocList;
 use starlark::values::list::ListType;
 use starlark::values::none::NoneOr;
+use starlark::values::string::StarlarkStr;
 
 use crate as buck2_build_api;
 use crate::artifact_groups::ArtifactGroup;
@@ -133,7 +132,7 @@ pub struct DefaultInfo<'v> {
     /// `ProviderCollection`, this collection must include at least a `DefaultInfo` provider. The
     /// subtargets can have their own subtargets as well, which can be accessed by chaining them,
     /// e.g.: `buck2 build cell//foo:bar[baz][qux]`.
-    sub_targets: ValueOf<'v, DictType<StringValue<'v>, ValueTyped<'v, ProviderCollection<'v>>>>,
+    sub_targets: ValueOf<'v, DictType<StarlarkStr, ProviderCollection<'v>>>,
     /// A list of `Artifact`s that are built by default if this rule is requested
     /// explicitly (via CLI or `$(location)` etc), or depended on as as a "source"
     /// (i.e., `attrs.source()`).
@@ -168,10 +167,8 @@ impl<'v> DefaultInfo<'v> {
     }
 
     pub(crate) fn testing_empty(heap: FrozenHeap<'v>) -> ValueTyped<'v, DefaultInfo<'v>> {
-        heap.alloc_simple_typed(DefaultInfo {
-            sub_targets: ValueOf::new_unchecked(
-                heap.alloc(AllocDict(iter::empty::<(String, ProviderCollection)>())),
-            ),
+        heap.alloc_representation(DefaultInfo {
+            sub_targets: ValueOf::new_unchecked(heap.alloc(AllocDict::EMPTY)),
             default_outputs: ValueOf::new_unchecked(heap.alloc(AllocList::EMPTY)),
             other_outputs: ValueOf::new_unchecked(heap.alloc(AllocList::EMPTY)),
         })
@@ -181,7 +178,7 @@ impl<'v> DefaultInfo<'v> {
         &self,
         name: &str,
     ) -> buck2_error::Result<Option<ValueTyped<'v, ProviderCollection<'v>>>> {
-        Ok(self.sub_targets.get_str(name)?.map(|v| v.unpack()))
+        Ok(self.sub_targets.lookup_str(name)?.map(|v| v.get()))
     }
 
     fn default_outputs_impl(
@@ -190,7 +187,7 @@ impl<'v> DefaultInfo<'v> {
         self.default_outputs
             .iter()
             .map(|v| -> buck2_error::Result<StarlarkArtifact> {
-                v?.unpack()
+                v?.get()
                     .as_input_artifact_like()
                     .get_bound_starlark_artifact()
             })
@@ -200,8 +197,8 @@ impl<'v> DefaultInfo<'v> {
         self.default_outputs_impl().collect()
     }
 
-    pub fn default_outputs_raw(&self) -> Value<'v> {
-        self.default_outputs.to_value()
+    pub fn default_outputs_raw(&self) -> ValueOf<'v, ListType<StarlarkArtifactView<'v>>> {
+        self.default_outputs
     }
 
     pub fn sub_targets(
@@ -212,7 +209,7 @@ impl<'v> DefaultInfo<'v> {
             .iter()
             .map(|entry| {
                 let (k, v) = entry?;
-                Ok((k.unpack().as_str(), v.unpack()))
+                Ok((k.get().as_str(), v.get()))
             })
             .collect()
     }
@@ -228,7 +225,7 @@ impl<'v> DefaultInfo<'v> {
         for output in self.default_outputs.iter() {
             processor(
                 output?
-                    .unpack()
+                    .get()
                     .as_input_artifact_like()
                     .get_bound_artifact()?,
             );
@@ -242,7 +239,7 @@ impl<'v> DefaultInfo<'v> {
     ) -> buck2_error::Result<()> {
         for output in self.default_outputs.iter() {
             let others = output?
-                .unpack()
+                .get()
                 .as_input_artifact_like()
                 .get_associated_artifacts();
             others
@@ -280,10 +277,7 @@ impl<'v> DefaultInfo<'v> {
         }
 
         for output in self.other_outputs.iter() {
-            output?
-                .unpack()
-                .0
-                .visit_artifacts(&mut Visitor(processor))?;
+            output?.get().0.visit_artifacts(&mut Visitor(processor))?;
         }
         Ok(())
     }
@@ -327,10 +321,10 @@ fn default_info_creator(builder: &mut GlobalsBuilder) {
         other_outputs: ValueOf<'v, ListType<ValueAsCommandLineLike<'v>>>,
         #[starlark(default = ValueOf::empty_dict())] sub_targets: ValueOf<
             'v,
-            DictType<StringValue<'v>, Value<'v>>,
+            DictType<StarlarkStr, Value<'v>>,
         >,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<DefaultInfo<'v>> {
+    ) -> starlark::Result<ValueTyped<'v, DefaultInfo<'v>>> {
         let heap = eval.heap();
 
         // support both list and singular options for now until we migrate all the rules.
@@ -346,21 +340,18 @@ fn default_info_creator(builder: &mut GlobalsBuilder) {
         };
 
         let sub_targets = sub_targets
-            .try_items()
+            .iter()
             .map(|entry| {
                 let (k, v) = entry?;
-                let collection = ProviderCollection::try_from_value_subtarget(v, heap)?;
-                buck2_error::Ok((
-                    ValueOf::from(k),
-                    ValueOf::from(heap.alloc_typed(collection)),
-                ))
+                let collection = ProviderCollection::try_from_value_subtarget(v.to_value(), heap)?;
+                buck2_error::Ok((k, ValueOf::alloc(heap, collection)))
             })
             .collect::<buck2_error::Result<Vec<_>>>()?;
 
-        Ok(DefaultInfo {
+        Ok(heap.alloc_representation(DefaultInfo {
             default_outputs,
             other_outputs,
             sub_targets: ValueOf::alloc_dict(heap, sub_targets),
-        })
+        }))
     }
 }

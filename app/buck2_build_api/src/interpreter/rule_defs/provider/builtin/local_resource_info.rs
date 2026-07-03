@@ -13,6 +13,7 @@ use std::time::Duration;
 use allocative::Allocative;
 use buck2_build_api_derive::internal_provider;
 use buck2_hash::BuckMutInsertionMap;
+use either::Either;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::eval::Evaluator;
@@ -20,13 +21,14 @@ use starlark::values::Freeze;
 use starlark::values::FreezeError;
 use starlark::values::OwnedFrozen;
 use starlark::values::StarlarkPagable;
-use starlark::values::StringValue;
 use starlark::values::Trace;
 use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
 use starlark::values::dict::DictType;
-use starlark::values::float::UnpackFloat;
+use starlark::values::float::StarlarkFloat;
+use starlark::values::int::IntView;
 use starlark::values::none::NoneOr;
+use starlark::values::string::StarlarkStr;
 
 use crate as buck2_build_api;
 use crate::interpreter::rule_defs::cmd_args::CommandLineArgLike;
@@ -72,9 +74,9 @@ pub struct LocalResourceInfo<'v> {
     setup: ValueOf<'v, StarlarkCmdArgsView<'v>>,
     /// Mapping from environment variable (appended to an execution command which is dependent on this local resource)
     /// to keys in setup command JSON output.
-    resource_env_vars: ValueOf<'v, DictType<StringValue<'v>, StringValue<'v>>>,
+    resource_env_vars: ValueOf<'v, DictType<StarlarkStr, StarlarkStr>>,
     /// Timeout in seconds for `setup` command.
-    setup_timeout_seconds: Option<ValueOf<'v, UnpackFloat>>,
+    setup_timeout_seconds: Option<ValueOf<'v, Either<IntView<'v>, StarlarkFloat>>>,
 }
 
 fn validate_local_resource_info<'v>(info: &LocalResourceInfo<'v>) -> buck2_error::Result<()> {
@@ -86,7 +88,7 @@ fn validate_local_resource_info<'v>(info: &LocalResourceInfo<'v>) -> buck2_error
         ));
     }
 
-    if info.setup.unpack().is_empty() {
+    if info.setup.get().is_empty() {
         return Err(buck2_error::buck2_error!(
             buck2_error::ErrorTag::Input,
             "Value for `setup` field is an empty command line: `{}`",
@@ -104,13 +106,13 @@ fn local_resource_info_creator(globals: &mut GlobalsBuilder) {
         #[starlark(require = named)] setup: StarlarkCommandLineValueUnpack<'v>,
         #[starlark(require = named)] resource_env_vars: ValueOf<
             'v,
-            DictType<StringValue<'v>, StringValue<'v>>,
+            DictType<StarlarkStr, StarlarkStr>,
         >,
         #[starlark(require = named, default = NoneOr::None)] setup_timeout_seconds: NoneOr<
-            ValueOf<'v, UnpackFloat>,
+            ValueOf<'v, Either<IntView<'v>, StarlarkFloat>>,
         >,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> starlark::Result<LocalResourceInfo<'v>> {
+    ) -> starlark::Result<ValueTyped<'v, LocalResourceInfo<'v>>> {
         let setup = StarlarkCmdArgs::try_from_value_typed(setup)?;
         let result = LocalResourceInfo {
             setup: ValueOf::alloc(eval.heap(), setup),
@@ -118,7 +120,7 @@ fn local_resource_info_creator(globals: &mut GlobalsBuilder) {
             setup_timeout_seconds: setup_timeout_seconds.into_option(),
         };
         validate_local_resource_info(&result)?;
-        Ok(result)
+        Ok(eval.heap().alloc_representation(result))
     }
 }
 
@@ -133,20 +135,21 @@ impl<'v> LocalResourceInfo<'v> {
             .iter()
             .map(|entry| {
                 let (k, v) = entry?;
-                Ok((
-                    k.unpack().as_str().to_owned(),
-                    v.unpack().as_str().to_owned(),
-                ))
+                Ok((k.get().as_str().to_owned(), v.get().as_str().to_owned()))
             })
             .collect()
     }
 
     pub fn setup_command_line(&self) -> &'v dyn CommandLineArgLike<'v> {
-        self.setup.unpack().as_command_line_arg_like()
+        self.setup.get().as_command_line_arg_like()
     }
 
     pub fn setup_timeout(&self) -> Option<Duration> {
-        self.setup_timeout_seconds
-            .map(|f| Duration::from_secs_f64(f.unpack().0))
+        self.setup_timeout_seconds.map(|f| {
+            Duration::from_secs_f64(match f.get() {
+                Either::Left(i) => i.as_int_ref().to_f64(),
+                Either::Right(f) => f.0,
+            })
+        })
     }
 }

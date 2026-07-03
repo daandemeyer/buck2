@@ -102,10 +102,13 @@ impl ConfiguredStringWithMacrosExt for ConfiguredStringWithMacros {
             None
         };
 
-        Ok(ctx.heap().alloc(ResolvedStringWithMacros::new(
-            resolved_parts,
-            configured_macros,
-        )))
+        Ok(ctx
+            .heap()
+            .alloc_representation(ResolvedStringWithMacros::new(
+                resolved_parts,
+                configured_macros,
+            ))
+            .to_value())
     }
 }
 
@@ -135,7 +138,7 @@ fn resolve_configured_macro<'v>(
                 }
             };
             // A RunInfo is an arg-like value.
-            Ok(ResolvedMacro::ArgLike(CommandLineArg::new(run_info)?))
+            Ok(ResolvedMacro::ArgLike(CommandLineArg::new_err(run_info)?))
         }
         ConfiguredMacro::InGroup(box (inner, _)) => resolve_configured_macro(inner, ctx, pkg),
         ConfiguredMacro::Source(p) => {

@@ -25,9 +25,9 @@ use starlark::values::StarlarkValue;
 use starlark::values::StringValue;
 use starlark::values::Trace;
 use starlark::values::ValueOf;
+use starlark::values::ValueTyped;
 use starlark::values::starlark_value;
 
-use crate::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
 use crate::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactView;
 use crate::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkInputArtifactLike;
 
@@ -109,7 +109,7 @@ impl<'v> StarlarkValidationSpec<'v> {
     }
 
     pub fn validation_result(&self) -> &'v dyn StarlarkInputArtifactLike<'v> {
-        self.validation_result.unpack().as_input_artifact_like()
+        self.validation_result.get().as_input_artifact_like()
     }
 
     pub fn optional(&self) -> bool {
@@ -205,8 +205,12 @@ fn validation_spec_methods(builder: &mut MethodsBuilder) {
     /// in the Validations guide for end-to-end examples.
     fn validation_result<'v>(
         this: &'v StarlarkValidationSpec,
-    ) -> starlark::Result<StarlarkArtifact> {
-        Ok(this.validation_result().get_bound_starlark_artifact()?)
+        heap: Heap<'v>,
+    ) -> starlark::Result<ValueOf<'v, StarlarkArtifactView<'v>>> {
+        Ok(ValueOf::alloc(
+            heap,
+            this.validation_result().get_bound_starlark_artifact()?,
+        ))
     }
 }
 
@@ -217,13 +221,14 @@ pub fn register_validation_spec(builder: &mut GlobalsBuilder) {
         #[starlark(require = named)] name: StringValue<'v>,
         #[starlark(require = named)] validation_result: ValueOf<'v, StarlarkArtifactView<'v>>,
         #[starlark(require = named, default = false)] optional: bool,
-    ) -> starlark::Result<StarlarkValidationSpec<'v>> {
+        heap: Heap<'v>,
+    ) -> starlark::Result<ValueTyped<'v, StarlarkValidationSpec<'v>>> {
         let result = StarlarkValidationSpec {
             name,
             validation_result,
             optional,
         };
         validate_validation_spec(&result)?;
-        Ok(result)
+        Ok(heap.alloc_representation(result))
     }
 }

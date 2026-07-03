@@ -21,7 +21,6 @@ use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
 use starlark::starlark_module;
 use starlark::typing::Ty;
-use starlark::values::AllocValue;
 use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::ProvidesStaticType;
@@ -30,17 +29,16 @@ use starlark::values::Trace;
 use starlark::values::Value;
 use starlark::values::ValueError;
 use starlark::values::ValueOf;
-use starlark::values::ValueTyped;
 use starlark::values::dict::DictType;
 use starlark::values::list::ListType;
 use starlark::values::list_or_tuple::ListOrTupleType;
 use starlark::values::none::NoneOr;
 use starlark::values::starlark_value;
 
-use crate::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
+use crate::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactView;
 use crate::interpreter::rule_defs::artifact::starlark_artifact_value::StarlarkArtifactValue;
 
-pub(crate) type ActionSubErrorResult<'a> = ValueOf<'a, ListType<&'a StarlarkActionSubError>>;
+pub(crate) type ActionSubErrorResult<'a> = ValueOf<'a, ListType<StarlarkActionSubError>>;
 
 #[derive(Debug, buck2_error::Error)]
 #[buck2(tag = Tier0)]
@@ -63,7 +61,7 @@ pub struct StarlarkActionErrorContext<'v> {
 
 /// The outputs an error handler may read, by artifact.
 pub type OutputArtifacts<'v> =
-    ValueOf<'v, DictType<ValueTyped<'v, StarlarkArtifact>, ValueTyped<'v, StarlarkArtifactValue>>>;
+    ValueOf<'v, DictType<StarlarkArtifactView<'v>, StarlarkArtifactValue>>;
 
 impl<'v> StarlarkActionErrorContext<'v> {
     pub(crate) fn new_from_command_execution(
@@ -89,15 +87,9 @@ impl<'v> StarlarkActionErrorContext<'v> {
     }
 }
 
-impl<'v> AllocValue<'v> for StarlarkActionErrorContext<'v> {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_complex_no_freeze(self)
-    }
-}
-
 starlark::methods_static!(ACTION_ERROR_CONTEXT_METHODS = action_error_context_methods);
 
-#[starlark_value(type = "ActionErrorCtx", StarlarkTypeRepr, UnpackValue)]
+#[starlark_value(type = "ActionErrorCtx", no_freeze)]
 impl<'v> StarlarkValue<'v> for StarlarkActionErrorContext<'v> {
     fn get_methods() -> Option<&'static Methods> {
         Some(ACTION_ERROR_CONTEXT_METHODS.methods())
@@ -229,8 +221,9 @@ fn action_error_context_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = named, default = false)] show_in_stderr: bool,
         #[starlark(require = named, default = NoneOr::None)] subcategory: NoneOr<String>,
         #[starlark(require = named, default = NoneOr::None)] remediation: NoneOr<String>,
-    ) -> starlark::Result<StarlarkActionSubError> {
-        Ok(StarlarkActionSubError {
+        heap: Heap<'v>,
+    ) -> starlark::Result<ValueOf<'v, StarlarkActionSubError>> {
+        let sub_error = StarlarkActionSubError {
             category: RefCell::new(category),
             message: message.into_option(),
             file: file.into_option(),
@@ -243,7 +236,8 @@ fn action_error_context_methods(builder: &mut MethodsBuilder) {
             show_in_stderr: RefCell::new(show_in_stderr),
             subcategory: RefCell::new(subcategory.into_option()),
             remediation: RefCell::new(remediation.into_option()),
-        })
+        };
+        Ok(ValueOf::alloc(heap, sub_error))
     }
 
     /// Parse error text using vim errorformat patterns to create structured error information.
@@ -267,15 +261,20 @@ fn action_error_context_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = named)] category: String,
         #[starlark(require = named)] error: String,
         #[starlark(require = named)] errorformats: ValueOf<'v, ListOrTupleType<String>>,
-        _heap: Heap<'v>,
-    ) -> starlark::Result<Vec<StarlarkActionSubError>> {
+        heap: Heap<'v>,
+    ) -> starlark::Result<Vec<ValueOf<'v, StarlarkActionSubError>>> {
         let error_lines = buck2_errorformat::split_lines(&error);
         let error_entries =
             buck2_errorformat::parse_error_format(errorformats.try_to_vec()?, error_lines)
                 .map_err(buck2_error::Error::from)?;
         let res = error_entries
             .into_iter()
-            .map(|e| StarlarkActionSubError::from_errorformat_entry(e, category.clone()))
+            .map(|e| {
+                ValueOf::alloc(
+                    heap,
+                    StarlarkActionSubError::from_errorformat_entry(e, category.clone()),
+                )
+            })
             .collect();
         Ok(res)
     }
@@ -399,20 +398,9 @@ impl StarlarkActionSubError {
     }
 }
 
-impl<'v> AllocValue<'v> for StarlarkActionSubError {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_complex_no_freeze(self)
-    }
-}
-
 starlark::methods_static!(ACTION_SUB_ERROR_METHODS = action_sub_error_methods);
 
-#[starlark_value(
-    type = "ActionSubError",
-    StarlarkTypeRepr,
-    UnpackValue,
-    ty_vtable_no_freeze
-)]
+#[starlark_value(type = "ActionSubError", no_freeze)]
 impl<'v> StarlarkValue<'v> for StarlarkActionSubError {
     fn get_methods() -> Option<&'static Methods> {
         Some(ACTION_SUB_ERROR_METHODS.methods())
@@ -581,11 +569,15 @@ pub(crate) fn register_action_error_handler_for_testing(builder: &mut GlobalsBui
     fn new_test_action_error_ctx<'v>(
         #[starlark(require=named, default = "")] stderr: &str,
         #[starlark(require=named, default = "")] stdout: &str,
-    ) -> starlark::Result<StarlarkActionErrorContext<'v>> {
-        Ok(StarlarkActionErrorContext {
-            stderr: stderr.to_owned(),
-            stdout: stdout.to_owned(),
-            output_artifacts: None,
-        })
+        heap: Heap<'v>,
+    ) -> starlark::Result<ValueOf<'v, StarlarkActionErrorContext<'v>>> {
+        Ok(ValueOf::alloc(
+            heap,
+            StarlarkActionErrorContext {
+                stderr: stderr.to_owned(),
+                stdout: stdout.to_owned(),
+                output_artifacts: None,
+            },
+        ))
     }
 }

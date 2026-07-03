@@ -40,6 +40,8 @@ use crate::values::Heap;
 use crate::values::StarlarkValue;
 use crate::values::UnpackValue;
 use crate::values::Value;
+use crate::values::ValueOf;
+use crate::values::ValueTyped;
 
 /// Define the None type, use [`NoneType`] in Rust.
 #[derive(
@@ -97,8 +99,10 @@ impl<'v> StarlarkValue<'v> for NoneType {
 }
 
 impl<'v> AllocValue<'v> for NoneType {
-    fn alloc_value(self, _heap: Heap<'v>) -> Value<'v> {
-        Value::new_none()
+    type Type = NoneType;
+
+    fn alloc_value(self, _heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
+        ValueOf::new_unchecked(Value::new_none())
     }
 }
 
@@ -114,19 +118,22 @@ impl Serialize for NoneType {
 static_starlark_value!(pub(crate) VALUE_NONE: NoneType = NoneType);
 
 impl<'fv> AllocFrozenValue<'fv> for NoneType {
-    fn alloc_frozen_value(self, _heap: FrozenHeap<'fv>) -> Value<'fv> {
-        Value::new_none()
+    type Type = NoneType;
+
+    fn alloc_frozen_value(self, _heap: FrozenHeap<'fv>) -> ValueOf<'fv, Self::Type> {
+        ValueOf::new_unchecked(Value::new_none())
     }
 }
 
 impl<'v> UnpackValue<'v> for NoneType {
+    type Type = NoneType;
     type Error = Infallible;
 
-    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        if value.is_none() {
-            Ok(Some(NoneType))
-        } else {
-            Ok(None)
-        }
+    #[inline]
+    fn unpack(
+        _value: ValueOf<'v, NoneType>,
+        _get: ValueTyped<'v, NoneType>,
+    ) -> Result<Self, Infallible> {
+        Ok(NoneType)
     }
 }
