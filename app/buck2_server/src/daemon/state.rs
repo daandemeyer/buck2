@@ -80,6 +80,7 @@ use buck2_file_watcher::file_watcher::FileWatcher;
 use buck2_fs::cwd::WorkingDirectory;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::file_name::FileNameBuf;
+use buck2_fs::paths::init_allow_backslashes_in_paths;
 use buck2_hash::StdBuckHashMap;
 use buck2_http::HttpClient;
 use buck2_http::HttpClientBuilder;
@@ -1100,6 +1101,9 @@ impl DaemonState {
         // Owned, because tenant construction happens in the spawned initialization future.
         let tenant_state_rt = rt.clone();
         let init_fut = async move {
+            init_allow_backslashes_in_paths(
+                init_ctx.daemon_startup_config.allow_backslashes_in_paths,
+            )?;
             let invocation_paths = paths;
             let paths = invocation_paths.tenant_paths();
             let fs = paths.project_root().clone();

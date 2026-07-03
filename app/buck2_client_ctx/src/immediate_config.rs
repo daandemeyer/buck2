@@ -35,6 +35,7 @@ use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::abs_path::AbsPath;
 use buck2_fs::paths::abs_path::AbsPathBuf;
+use buck2_fs::paths::init_allow_backslashes_in_paths;
 use buck2_fs::working_dir::AbsWorkingDir;
 use prost::Message;
 
@@ -127,7 +128,7 @@ impl<'a> ImmediateConfigContext<'a> {
         })?;
 
         self.daemon_startup_config
-            .get_or_try_init(|| {
+            .get_or_try_init(|| -> buck2_error::Result<DaemonStartupConfig> {
                 let data = self.data()?;
                 let buck_settings = parse_settings(&data.project_filesystem, setting_arg_layers)?;
                 let paranoid = match is_paranoid_enabled(&data.paranoid_info_path) {
@@ -142,8 +143,11 @@ impl<'a> ImmediateConfigContext<'a> {
                     }
                 };
 
-                DaemonStartupConfig::new(&data.root_config, &buck_settings, paranoid)
-                    .buck_error_context("Error loading daemon startup config")
+                let daemon_startup_config =
+                    DaemonStartupConfig::new(&data.root_config, &buck_settings, paranoid)
+                        .buck_error_context("Error loading daemon startup config")?;
+                init_allow_backslashes_in_paths(daemon_startup_config.allow_backslashes_in_paths)?;
+                Ok(daemon_startup_config)
             })
             .buck_error_context("Error creating daemon startup config")
     }
