@@ -13,7 +13,6 @@ use std::process::Command as StdCommand;
 use std::process::ExitStatus;
 use std::time::Duration;
 
-use buck2_common::kill_util::try_terminate_process_gracefully;
 use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
 use buck2_resource_control::ActionFreezeEvent;
@@ -141,7 +140,7 @@ impl ProcessGroupImpl {
     // Kill the process tree. Uses process-group-based signaling (killpg or
     // graceful SIGTERM+SIGKILL).
     pub(crate) async fn kill(
-        &self,
+        &mut self,
         graceful_shutdown_timeout_s: Option<u32>,
     ) -> buck2_error::Result<()> {
         let pid: i32 = self
@@ -151,16 +150,31 @@ impl ProcessGroupImpl {
             .internal_error("PID does not fit a i32")?;
 
         // Always use process-group-based signaling first.
-        if let Some(graceful_shutdown_timeout_s) = graceful_shutdown_timeout_s {
-            try_terminate_process_gracefully(
-                pid,
-                Duration::from_secs(graceful_shutdown_timeout_s as u64),
-            )
-            .await
-            .with_buck_error_context(|| format!("Failed to terminate process {pid} gracefully"))?;
-        } else {
+        let Some(graceful_shutdown_timeout_s) = graceful_shutdown_timeout_s else {
             signal::killpg(Pid::from_raw(pid), Signal::SIGKILL)
                 .with_buck_error_context(|| format!("Failed to kill process {pid}"))?;
+            return Ok(());
+        };
+
+        signal::killpg(Pid::from_raw(pid), Signal::SIGTERM)
+            .with_buck_error_context(|| format!("Failed to terminate process {pid}"))?;
+
+        // Reaping the child is what makes its exit observable: it stays a zombie until waited on,
+        // and while we are its parent no amount of probing reports it gone.
+        let graceful = Duration::from_secs(graceful_shutdown_timeout_s as u64);
+        match tokio::time::timeout(graceful, self.inner.wait()).await {
+            Ok(exited) => {
+                exited.with_buck_error_context(|| format!("Failed to await process {pid}"))?;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Failed to gracefully terminate process `{}` within {}s, sending SIGKILL.",
+                    pid,
+                    graceful_shutdown_timeout_s,
+                );
+                signal::killpg(Pid::from_raw(pid), Signal::SIGKILL)
+                    .with_buck_error_context(|| format!("Failed to kill process {pid}"))?;
+            }
         }
 
         Ok(())

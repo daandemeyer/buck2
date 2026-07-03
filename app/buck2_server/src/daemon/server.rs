@@ -241,6 +241,8 @@ pub struct BuckdServerInitPreferences {
     pub daemon_startup_config: DaemonStartupConfig,
     pub daemon_originating_cgroup: Option<String>,
     pub started_for_clean_stale: bool,
+    /// This daemon runs as a thread inside its only client (`--no-buckd`).
+    pub in_process: bool,
 }
 
 #[derive(Allocative)]
@@ -249,6 +251,7 @@ pub(crate) struct TenantStateInitPreferences {
     pub(crate) enable_trace_io: bool,
     pub(crate) reject_materializer_state: Option<SqliteIdentity>,
     pub(crate) daemon_startup_config: DaemonStartupConfig,
+    pub(crate) in_process: bool,
 }
 
 impl BuckdServerInitPreferences {
@@ -259,6 +262,7 @@ impl BuckdServerInitPreferences {
             reject_materializer_state,
             daemon_startup_config,
             daemon_originating_cgroup,
+            in_process,
             ..
         } = self;
         (
@@ -267,6 +271,7 @@ impl BuckdServerInitPreferences {
                 enable_trace_io,
                 reject_materializer_state,
                 daemon_startup_config,
+                in_process,
             },
             daemon_originating_cgroup,
         )
@@ -370,6 +375,7 @@ impl BuckdServer {
         listener: Pin<Box<dyn Stream<Item = Result<tokio::net::TcpStream, io::Error>> + Send>>,
         rt: Handle,
         daemon_id: DaemonId,
+        ready: Box<dyn FnOnce() + Send>,
     ) -> buck2_error::Result<()> {
         let now = SystemTime::now();
         let now = now.duration_since(SystemTime::UNIX_EPOCH)?;
@@ -481,6 +487,9 @@ impl BuckdServer {
             tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
         }
 
+        // The listener accepted connections since before the daemon state existed, but answers
+        // them only from here on.
+        ready();
         let server_result = server.await;
 
         let shutdown_deadline = shutdown_deadline
