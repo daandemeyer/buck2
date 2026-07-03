@@ -143,3 +143,36 @@ An explicit duration or adaptive low-disk flag selects an explicit command-line
 policy instead. The equivalent explicit manual escalation is
 `--adaptive-unmaterialize-active`, which requires
 `--adaptive-low-disk-threshold` and the same TTL-refresh support.
+
+### Clean before the first command
+
+With on-disk state and deferred write actions enabled, you can make Buck2 check
+free disk space before the first build, query, or other command that loads
+project state:
+
+```ini
+[buck2]
+clean_stale_on_startup = true
+clean_stale_enabled = false
+clean_stale_low_disk_threshold = 10.0
+clean_stale_low_disk_adaptive_enabled = true
+```
+
+When free disk space is at or below 10%, the first command runs the configured
+cleanup policy and waits for it to finish before starting its work. Commands
+that start while the cleanup runs wait for it as well, and they don't interrupt
+it. Above the threshold, Buck2 skips the cleanup scan.
+
+`buck2 clean --stale` doesn't start the cleanup, so `--dry-run` and the explicit
+policy flags of that command decide what gets deleted. `buck2 lsp`,
+`buck2 subscribe`, `buck2 debug trace-io` and `buck2 debug file-status` neither
+start the cleanup nor wait for it.
+
+`--no-buckd` performs this check on every invocation. A resident daemon performs
+it at most once per project and isolation directory during its lifetime.
+
+`clean_stale_on_startup` defaults to false and works independently of periodic
+cleanup. Without `clean_stale_low_disk_threshold`, startup cleanup uses the
+configured artifact TTL on every startup. `clean_stale_dry_run` also applies.
+If the cleanup fails, Buck2 prints a warning and the command continues. The
+daemon doesn't retry a failed startup cleanup.

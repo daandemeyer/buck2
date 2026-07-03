@@ -224,7 +224,7 @@ impl DaemonCommand {
         log_reload_handle: Arc<dyn LogConfigurationReloadHandle>,
         paths: InvocationPaths,
         in_process: bool,
-        listener_created: Box<dyn FnOnce() + Send>,
+        ready: Box<dyn FnOnce() + Send>,
     ) -> buck2_error::Result<()> {
         let prepped_cgroups = if self.has_cgroup {
             // Note: It's important that we do this before daemonizing, as otherwise there may be
@@ -253,6 +253,7 @@ impl DaemonCommand {
             daemon_startup_config: self.daemon_startup_config,
             daemon_originating_cgroup: self.daemon_originating_cgroup,
             started_for_clean_stale: self.started_for_clean_stale,
+            in_process,
         };
 
         let span = tracing::info_span!("daemon_listener");
@@ -342,8 +343,6 @@ impl DaemonCommand {
         tracing::info!("PID: {}", process::id());
         tracing::info!("ID: {}", daemon_id);
         tracing::info!("Endpoint: {}", endpoint);
-
-        listener_created();
 
         terminate_on_panic();
 
@@ -500,6 +499,7 @@ impl DaemonCommand {
                 Box::pin(listener),
                 handle,
                 daemon_id,
+                ready,
             )
             .fuse();
             let shutdown_future = async move { hard_shutdown_receiver.next().await }.fuse();
@@ -615,14 +615,14 @@ impl DaemonCommand {
         log_reload_handle: Arc<dyn LogConfigurationReloadHandle>,
         paths: InvocationPaths,
         in_process: bool,
-        listener_created: Box<dyn FnOnce() + Send>,
+        ready: Box<dyn FnOnce() + Send>,
     ) -> buck2_error::Result<()> {
         let daemon_dir = paths.daemon_dir()?;
         if !daemon_dir.path.is_dir() {
             fs_util::create_dir_all(&daemon_dir.path)?;
         }
 
-        let res = self.run(log_reload_handle, paths, in_process, listener_created);
+        let res = self.run(log_reload_handle, paths, in_process, ready);
         if let Err(err) = res.as_ref() {
             fs_util::write(
                 daemon_dir.buckd_error_log(),
@@ -810,6 +810,7 @@ mod tests {
                 daemon_startup_config: DaemonStartupConfig::testing_empty(),
                 daemon_originating_cgroup: None,
                 started_for_clean_stale: false,
+                in_process: true,
             },
             process_info.clone(),
             // In process: there is no daemon here, just the test binary's own process, and a
@@ -820,6 +821,7 @@ mod tests {
             Box::pin(listener),
             Handle::current(),
             daemon_id,
+            Box::new(|| {}),
         ));
 
         let mut client = new_daemon_api_client(endpoint.clone(), process_info.auth_token)

@@ -308,7 +308,13 @@ impl fmt::Debug for WriteLease {
 #[async_trait]
 pub trait Materializer: Allocative + Send + Sync + 'static {
     /// Prevent background cleanup until the returned guard is dropped.
-    async fn prevent_background_cleanup(&self) -> MaterializerBackgroundCleanupGuard {
+    ///
+    /// If `run_startup_cleanup` is true and the startup cleanup hasn't run yet, this call starts
+    /// it. Every call waits until a running startup cleanup finishes.
+    async fn prevent_background_cleanup(
+        &self,
+        _run_startup_cleanup: bool,
+    ) -> MaterializerBackgroundCleanupGuard {
         MaterializerBackgroundCleanupGuard::new(())
     }
 
@@ -585,6 +591,8 @@ pub struct CopiedArtifact {
     pub dest_entry: ActionDirectoryEntry<ActionImmutableDirectory>,
     // Override the destination executable bit to +x (true) or -x (false)
     pub executable_bit_override: Option<bool>,
+    /// Carry the modification times of `src` over to `dest`.
+    pub preserve_mtimes: bool,
 }
 
 impl CopiedArtifact {
@@ -593,12 +601,14 @@ impl CopiedArtifact {
         dest: ProjectRelativePathBuf,
         dest_entry: ActionDirectoryEntry<ActionImmutableDirectory>,
         executable_bit_override: Option<bool>,
+        preserve_mtimes: bool,
     ) -> Self {
         Self {
             src,
             dest,
             dest_entry,
             executable_bit_override,
+            preserve_mtimes,
         }
     }
 }

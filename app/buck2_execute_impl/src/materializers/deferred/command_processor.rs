@@ -119,7 +119,7 @@ pub(super) struct DeferredMaterializerCommandProcessor<T: 'static> {
     pub(super) stats: Arc<DeferredMaterializerStats>,
     access_times_buffer: Option<BuckMutSet<ProjectRelativePathBuf>>,
     verbose_materializer_log: bool,
-    daemon_dispatcher: EventDispatcher,
+    pub(super) daemon_dispatcher: EventDispatcher,
     /// Filesystem root used for clean-stale `disk_space_stats` lookups.
     pub(super) root_abs_path: Option<Arc<AbsPathBuf>>,
     pub(super) clean_stale_config: CleanStaleConfig,

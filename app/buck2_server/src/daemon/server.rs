@@ -241,6 +241,8 @@ pub struct BuckdServerInitPreferences {
     pub daemon_startup_config: DaemonStartupConfig,
     pub daemon_originating_cgroup: Option<String>,
     pub started_for_clean_stale: bool,
+    /// This daemon runs as a thread inside its only client (`--no-buckd`).
+    pub in_process: bool,
 }
 
 #[derive(Allocative)]
@@ -248,6 +250,7 @@ pub(crate) struct TenantStateInitPreferences {
     pub(crate) enable_trace_io: bool,
     pub(crate) reject_materializer_state: Option<SqliteIdentity>,
     pub(crate) daemon_startup_config: DaemonStartupConfig,
+    pub(crate) in_process: bool,
 }
 
 impl BuckdServerInitPreferences {
@@ -257,6 +260,7 @@ impl BuckdServerInitPreferences {
             reject_materializer_state,
             daemon_startup_config,
             daemon_originating_cgroup,
+            in_process,
             ..
         } = self;
         (
@@ -264,6 +268,7 @@ impl BuckdServerInitPreferences {
                 enable_trace_io,
                 reject_materializer_state,
                 daemon_startup_config,
+                in_process,
             },
             daemon_originating_cgroup,
         )
@@ -368,6 +373,7 @@ impl BuckdServer {
         listener: Pin<Box<dyn Stream<Item = Result<tokio::net::TcpStream, io::Error>> + Send>>,
         rt: Handle,
         daemon_id: DaemonId,
+        ready: Box<dyn FnOnce() + Send>,
     ) -> buck2_error::Result<()> {
         let now = SystemTime::now();
         let now = now.duration_since(SystemTime::UNIX_EPOCH)?;
@@ -479,6 +485,9 @@ impl BuckdServer {
             tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
         }
 
+        // The listener accepted connections since before the daemon state existed, but answers
+        // them only from here on.
+        ready();
         let server_result = server.await;
 
         let shutdown_deadline = shutdown_deadline
@@ -592,6 +601,7 @@ impl BuckdServer {
             // debug commands opt out (see `triggers_idle_page_out`).
             let triggers_idle_page_out = command.triggers_idle_page_out();
             let prevents_background_cleanup = command.prevents_background_cleanup();
+            let runs_startup_cleanup = command.runs_startup_cleanup();
             if triggers_idle_page_out {
                 cancel_active_page_out();
             }
@@ -703,7 +713,11 @@ impl BuckdServer {
                 move |cancellations| {
                     async move {
                         let _background_cleanup_guard = if prevents_background_cleanup {
-                            Some(repo.materializer.prevent_background_cleanup().await)
+                            Some(
+                                repo.materializer
+                                    .prevent_background_cleanup(runs_startup_cleanup)
+                                    .await,
+                            )
                         } else {
                             None
                         };
@@ -1953,6 +1967,13 @@ trait StreamingCommandOptions<Req>: OneshotCommandOptions {
     fn prevents_background_cleanup(&self) -> bool {
         true
     }
+
+    /// Whether this command starts the `buck2.clean_stale_on_startup` cleanup when it is the
+    /// first one to prevent background cleanup. Only applies if `prevents_background_cleanup`
+    /// is true.
+    fn runs_startup_cleanup(&self) -> bool {
+        true
+    }
 }
 
 /// A streaming command with its request, result and partial result types erased.
@@ -1971,6 +1992,8 @@ trait ErasedStreamingCommand: Send + 'static {
     fn triggers_idle_page_out(&self) -> bool;
 
     fn prevents_background_cleanup(&self) -> bool;
+
+    fn runs_startup_cleanup(&self) -> bool;
 
     fn starlark_profiler_configuration(
         &self,
@@ -2026,6 +2049,10 @@ where
 
     fn prevents_background_cleanup(&self) -> bool {
         self.opts.prevents_background_cleanup()
+    }
+
+    fn runs_startup_cleanup(&self) -> bool {
+        self.opts.runs_startup_cleanup()
     }
 
     fn starlark_profiler_configuration(
@@ -2274,6 +2301,12 @@ impl OneshotCommandOptions for CleanStaleCommandOptions {}
 impl<Req> StreamingCommandOptions<Req> for CleanStaleCommandOptions {
     fn daemon_activity(&self) -> DaemonActivity {
         DaemonActivity::CleanStale
+    }
+
+    /// A startup cleanup deletes artifacts before `clean --stale --dry-run` reports them. It also
+    /// ignores `--keep-since-time` and `--tracked-only`.
+    fn runs_startup_cleanup(&self) -> bool {
+        false
     }
 }
 
