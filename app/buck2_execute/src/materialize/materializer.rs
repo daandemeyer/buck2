@@ -308,7 +308,13 @@ impl fmt::Debug for WriteLease {
 #[async_trait]
 pub trait Materializer: Allocative + Send + Sync + 'static {
     /// Prevent background cleanup until the returned guard is dropped.
-    async fn prevent_background_cleanup(&self) -> MaterializerBackgroundCleanupGuard {
+    ///
+    /// If `run_startup_cleanup` is true and the startup cleanup hasn't run yet, this call starts
+    /// it. Every call waits until a running startup cleanup finishes.
+    async fn prevent_background_cleanup(
+        &self,
+        _run_startup_cleanup: bool,
+    ) -> MaterializerBackgroundCleanupGuard {
         MaterializerBackgroundCleanupGuard::new(())
     }
 

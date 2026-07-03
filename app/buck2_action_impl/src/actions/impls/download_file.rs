@@ -46,6 +46,7 @@ use buck2_execute::materialize::materializer::CasDownloadInfo;
 use buck2_execute::materialize::materializer::DeclareArtifactPayload;
 use buck2_execute::materialize::materializer::DeclareMatchOutcome;
 use buck2_execute::re::presence::NegativeCache;
+use buck2_fs::fs_util;
 use buck2_hash::BuckIndexSet;
 use buck2_http::HttpClient;
 use dupe::Dupe;
@@ -244,15 +245,15 @@ impl DownloadFileAction {
 
     /// Declares the output as a CAS download when the CAS already holds the content, which
     /// leaves nothing to fetch from the origin server or to write to disk now. `None` when the
-    /// content is not there, is about to expire, or there is no CAS to ask. Asked under
-    /// `--local-only` and `--no-remote-cache` too, unlike a write's or copy's probe
+    /// content is not there, is about to expire, there is no CAS to ask, or under
+    /// `--no-remote-cache`. Asked under `--local-only` too, unlike a write's or copy's probe
     /// (`ActionExecutionCtx::may_probe_cas`): the CAS stands in for the URL here, not for a cache.
     async fn declare_from_cas(
         &self,
         ctx: &dyn ActionExecutionCtx,
         metadata: &FileMetadata,
     ) -> buck2_error::Result<Option<ArtifactValue>> {
-        if !ctx.cas_configured() {
+        if !ctx.cas_configured() || ctx.skip_cache_read() {
             return Ok(None);
         }
         let use_case = ctx.invocation_re_use_case();
@@ -346,14 +347,25 @@ impl DownloadFileAction {
         // the materializer's record of it, so the disk has to be cleared to match. The lease is
         // held until that report is in.
         let output_lease = materializer.prepare_outputs(vec![path.clone()]).await?;
-        ctx.blocking_executor()
-            .execute_io(
-                Box::new(CleanOutputPaths {
-                    paths: vec![path.clone()],
-                }),
-                ctx.cancellation_context(),
-            )
-            .await?;
+        // Except for a plain file, which may be another configuration's download of the same
+        // content-based path that its consumers are reading: `http_download` replaces it
+        // atomically. Nothing at all needs no clearing, and clearing it anyway could remove such
+        // a download that lands in between.
+        let obstructed = match fs_util::symlink_metadata_if_exists(ctx.fs().fs().resolve(&path)) {
+            Ok(metadata) => metadata.is_some_and(|metadata| !metadata.is_file()),
+            // Such as a file in a parent position, which clearing repairs.
+            Err(_) => true,
+        };
+        if obstructed {
+            ctx.blocking_executor()
+                .execute_io(
+                    Box::new(CleanOutputPaths {
+                        paths: vec![path.clone()],
+                    }),
+                    ctx.cancellation_context(),
+                )
+                .await?;
+        }
 
         let digest = http_download(
             client,

@@ -4,6 +4,7 @@
 backtrace = { git = "https://github.com/rust-lang/backtrace-rs", rev = "df979dcf80027eb047d7bb9e0874710c15009f31" }
 bindgen = { git = "https://github.com/jsgf/rust-bindgen", rev = "4d385d21c160e6ee1f443aeb7e00528a1dc7fd44" }
 darwin-libproc = { git = "https://github.com/fbsource/darwin-libproc", rev = "f73ddb1002d51ae74c1b41670fae56bd5896b7a3" }
+notify = { git = "https://github.com/daandemeyer/notify.git", rev = "a42db353439561a9498c3a2fafe8556b550f3118" }
 perf-event = { version = "0.4", git = "https://github.com/Nero5023/perf-event.git", rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4" }
 perf-event-open-sys = { version = "5.0", git = "https://github.com/Nero5023/perf-event.git", rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4" }
 rustls-native-certs = { git = "https://github.com/rustls/rustls-native-certs", rev = "9734b4cc0bfa88224e0fc49867abafa1c56fa28d" }
@@ -333,6 +334,7 @@ buck2_wrapper_common = { path = "app/buck2_wrapper_common" }
 bumpalo = { version = "3.20.3", features = ["allocator_api", "collections"] }
 bytes = { version = "1.12.1", features = ["serde"] }
 bytesize = "2.7.0"
+bzip2 = "0.6.1"
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 clap_complete = { version = "4.6.11", features = ["unstable-dynamic"] }
 cmp_any = { version = "0.8.1", path = "gazebo/cmp_any" }
@@ -420,6 +422,7 @@ logos = "0.16.1"
 lru = { version = "0.18.5", default-features = false }
 lsp-server = "0.10.0"
 lsp-types = "0.97"
+lzma-rust2 = { version = "0.22.0", features = ["optimization", "std", "xz"], default-features = false }
 maplit = "1.0"
 memchr = "2.8.3"
 memmap2 = "0.9.11"
@@ -429,7 +432,7 @@ multimap = "0.10.1"
 nix = { version = "0.31.3", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 nom = "8"
 nom-language = "0.1"
-notify = "8.2.0"
+notify = "9.0.0-rc.4"
 num-bigint = { version = "0.5.1", features = ["rand_0_10", "serde"] }
 num-traits = { version = "0.2.19", default-features = false }
 num_cpus = "1.16"
@@ -554,6 +557,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globa
 winver = "1"
 x509-parser = "0.18.1"
 xattr = "1.6.1"
+zip = { version = "8.6.0", features = ["bzip2", "deflate-flate2", "deflate64"], default-features = false }
 zstd = { version = "0.14.0", features = ["experimental", "zstdmt"] }
 
 [workspace.lints.clippy]

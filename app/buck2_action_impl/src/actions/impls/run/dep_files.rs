@@ -1252,6 +1252,14 @@ pub(crate) async fn match_if_identical_action(
             if outputs_are_still_present_in_materializer(ctx, live).await? {
                 tracing::trace!("Dep files are a hit");
                 stats.hit_live();
+                if previous_state.was_produced_locally
+                    && let Some(store) = ctx.dep_file_store()
+                {
+                    store.touch(
+                        encode_logical_key(&key.to_logical()),
+                        encode_config_key(key.configuration()),
+                    );
+                }
                 return Ok((Some(live.dupe()), false));
             }
             // Outputs no longer present; not a hit. Don't evict -- we didn't fully check dep files.
@@ -1300,10 +1308,6 @@ pub(crate) async fn match_if_identical_action(
     // Nothing built this session matched. Consult the persisted store, loading just this logical
     // action's rows on demand rather than holding the whole db in memory. On a hit we promote the
     // entry into the live `map` so subsequent same-configuration lookups take the fast path.
-    //
-    // Promotion does not write to the store, so a row's `last_write_time` tracks when the action
-    // last *executed*, not when it was last served. An action that keeps hitting this path without
-    // re-executing is therefore pruned once it passes `sqlite_dep_file_state_ttl_days`.
     if let Some(store) = ctx.dep_file_store() {
         let logical_key = encode_logical_key(&logical);
         // Two phases: reject on the scalar row alone, and only fetch a candidate's outputs and
@@ -1387,6 +1391,7 @@ pub(crate) async fn match_if_identical_action(
                     );
                     tracing::trace!("Persisted local action cache hit");
                     store.note_persisted_hit();
+                    store.touch(logical_key.clone(), digests.config_key);
                     stats.hit_persisted();
                     return Ok((Some(outputs), false));
                 }
@@ -1682,6 +1687,7 @@ pub(crate) async fn match_or_clear_dep_file(
         .await?
     {
         tracing::trace!("Dep files are a hit");
+        persist_filtered_hit(ctx, key, &previous_state, input_directory_digest);
         return Ok(Some(outputs));
     }
 
@@ -1694,6 +1700,37 @@ pub(crate) async fn match_or_clear_dep_file(
     }
 
     Ok(None)
+}
+
+/// A dep-file-filtered hit serves the outputs of `previous_state` for an input directory that
+/// differs from the one `previous_state` was executed with. The persisted row still holds the old
+/// directory digest. A restarted daemon serves only identical actions from disk. Rewrite the row
+/// with the current directory digest, or the same action executes again after a restart.
+fn persist_filtered_hit(
+    ctx: &dyn ActionExecutionCtx,
+    key: &RunActionKey,
+    previous_state: &DepFileState,
+    input_directory_digest: &FileDigest,
+) {
+    // Only locally produced entries are persisted, the same as in `populate_dep_files`.
+    if !previous_state.was_produced_locally {
+        return;
+    }
+    let Some(store) = ctx.dep_file_store() else {
+        return;
+    };
+    match previous_state.to_stored() {
+        Ok(Some(mut stored)) => {
+            stored.directory_digest = input_directory_digest.dupe();
+            store.insert(
+                encode_logical_key(&key.to_logical()),
+                encode_config_key(key.configuration()),
+                stored,
+            );
+        }
+        Ok(None) => {}
+        Err(e) => tracing::debug!("Not persisting dep-file entry: {}", e),
+    }
 }
 
 /// What a lookup did, reported on `MatchDepFilesEnd`. The persisted timings stay `None` when the
