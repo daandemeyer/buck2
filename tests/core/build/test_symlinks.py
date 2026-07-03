@@ -9,12 +9,14 @@
 # pyre-strict
 
 
+import asyncio
 import os
 import shutil
 import tempfile
 from pathlib import Path
 
 from buck2.tests.e2e_util.api.buck import Buck
+from buck2.tests.e2e_util.asserts import expect_failure
 from buck2.tests.e2e_util.buck_workspace import buck_test
 from buck2.tests.e2e_util.helper.utils import expect_exec_count
 
@@ -28,6 +30,11 @@ def setup_symlink(symlink_path: Path, target: Path) -> None:
         symlink_path.unlink(missing_ok=True)
 
     os.symlink(target, symlink_path)
+
+
+# Digest computation used to hang forever on the symlinks below, so bound the builds instead of
+# stalling the suite.
+SYMLINK_BUILD_TIMEOUT_S = 200
 
 
 @buck_test(extra_buck_config={"buck2": {"use_correct_source_symlink_reading": "true"}})
@@ -185,3 +192,108 @@ async def test_eden_io_read_symlink_dir_list_target(buck: Buck) -> None:
     setup_symlink(buck.cwd / "testlink", buck.cwd / "symdir")
 
     await buck.targets("//testlink/dir:")
+
+
+@buck_test()
+async def test_source_dir_symlinks_to_ancestors(buck: Buck) -> None:
+    setup_symlink(buck.cwd / "ancestors" / "sub" / "self", Path("."))
+    setup_symlink(buck.cwd / "ancestors" / "sub" / "deeper" / "up", Path(".."))
+
+    result = await asyncio.wait_for(
+        buck.build("//:ancestors"), timeout=SYMLINK_BUILD_TIMEOUT_S
+    )
+    await expect_exec_count(buck, 1)
+
+    out = result.get_build_report().output_for_target("root//:ancestors")
+    assert (out / "sub" / "deeper" / "file").read_text() == "deeper\n"
+    # Copying re-points symlinks at their original targets, so both still lead to the source dir.
+    source = (buck.cwd / "ancestors" / "sub").resolve()
+    for link in (out / "sub" / "self", out / "sub" / "deeper" / "up"):
+        assert os.path.islink(link)
+        assert link.resolve() == source
+
+    await asyncio.wait_for(buck.build("//:ancestors"), timeout=SYMLINK_BUILD_TIMEOUT_S)
+    await expect_exec_count(buck, 0)
+
+
+@buck_test(skip_for_os=["windows"])
+async def test_copy_dir_relative_symlinks_are_relocatable(buck: Buck) -> None:
+    source = buck.cwd / "relocatable"
+    setup_symlink(source / "dir" / "link", Path("real"))
+    setup_symlink(source / "sub" / "up", Path(".."))
+
+    relative_result = await asyncio.wait_for(
+        buck.build("//:relocatable_copy"), timeout=SYMLINK_BUILD_TIMEOUT_S
+    )
+    relative_output = relative_result.get_build_report().output_for_target(
+        "root//:relocatable_copy"
+    )
+
+    assert (relative_output / "dir" / "link").readlink() == Path("real")
+    assert (relative_output / "sub" / "up").readlink() == Path("..")
+    assert (relative_output / "dir" / "link").read_text() == "real\n"
+    assert (relative_output / "sub" / "up" / "dir" / "real").read_text() == "real\n"
+
+    relocated = buck.cwd / "relocated"
+    shutil.copytree(relative_output, relocated, symlinks=True)
+    assert (relocated / "dir" / "link").readlink() == Path("real")
+    assert (relocated / "sub" / "up").readlink() == Path("..")
+    assert (relocated / "dir" / "link").read_text() == "real\n"
+    assert (relocated / "sub" / "up" / "dir" / "real").read_text() == "real\n"
+
+    default_result = await asyncio.wait_for(
+        buck.build("//:default_copy"), timeout=SYMLINK_BUILD_TIMEOUT_S
+    )
+    default_output = default_result.get_build_report().output_for_target(
+        "root//:default_copy"
+    )
+    default_file_link = default_output / "dir" / "link"
+    default_up_link = default_output / "sub" / "up"
+
+    assert default_file_link.readlink() != Path("real")
+    assert default_file_link.readlink().parts[0] == ".."
+    assert default_file_link.resolve() == (source / "dir" / "real").resolve()
+    assert default_up_link.readlink() != Path("..")
+    assert default_up_link.readlink().parts[0] == ".."
+    assert default_up_link.resolve() == source.resolve()
+
+
+@buck_test()
+async def test_source_dir_symlink_cycle(buck: Buck) -> None:
+    setup_symlink(buck.cwd / "cycle" / "a" / "link", Path("..") / "b")
+    setup_symlink(buck.cwd / "cycle" / "b" / "link", Path("..") / "a")
+
+    failure = await asyncio.wait_for(
+        expect_failure(buck.build("//:cycle"), stderr_regex="Symlink cycle detected"),
+        timeout=SYMLINK_BUILD_TIMEOUT_S,
+    )
+    assert "root//cycle/a ->" in failure.stderr
+    assert "root//cycle/b ->" in failure.stderr
+
+
+@buck_test()
+async def test_source_symlink_loop(buck: Buck) -> None:
+    setup_symlink(buck.cwd / "loop" / "a" / "l1", Path("..") / "b" / "l2")
+    setup_symlink(buck.cwd / "loop" / "b" / "l2", Path("..") / "a" / "l1")
+
+    failure = await asyncio.wait_for(
+        expect_failure(buck.build("//:loop"), stderr_regex="Symlink cycle detected"),
+        timeout=SYMLINK_BUILD_TIMEOUT_S,
+    )
+    assert "root//loop/a/l1 ->" in failure.stderr
+    assert "root//loop/b/l2 ->" in failure.stderr
+
+
+@buck_test()
+async def test_source_symlink_chain_that_grows(buck: Buck) -> None:
+    # Resolving `a/l` goes `deep/er/path` -> `a/l/path` -> `deep/er/path/path` -> ... forever.
+    setup_symlink(buck.cwd / "grow" / "a" / "l", Path("..") / "deep" / "er" / "path")
+    setup_symlink(buck.cwd / "grow" / "deep" / "er", Path("..") / "a" / "l")
+
+    await asyncio.wait_for(
+        expect_failure(
+            buck.build("//:grow"),
+            stderr_regex="Too many levels of symlinks while reading `root//grow/a/l`",
+        ),
+        timeout=SYMLINK_BUILD_TIMEOUT_S,
+    )

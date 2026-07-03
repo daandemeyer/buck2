@@ -9,6 +9,7 @@
 # pyre-strict
 
 from buck2.tests.e2e_util.api.buck import Buck
+from buck2.tests.e2e_util.asserts import expect_failure
 from buck2.tests.e2e_util.buck_workspace import buck_test
 from buck2.tests.e2e_util.helper.utils import random_string, read_what_ran
 
@@ -81,6 +82,7 @@ async def test_remote_test_execution_cached(buck: Buck) -> None:
     ]
 
     await buck.test(*args)
+    await buck.kill()
 
     await buck.test(*args)
     second_what_ran = await read_what_ran(buck, "--emit-cache-queries")
@@ -127,7 +129,7 @@ async def test_remote_test_execution_not_cached_for_stress_runs(buck: Buck) -> N
 
 
 @buck_test()
-async def test_local_test_execution_not_cached(buck: Buck) -> None:
+async def test_local_test_execution_cached_on_dice(buck: Buck) -> None:
     seed = random_string()
     args = [
         "-c",
@@ -146,16 +148,93 @@ async def test_local_test_execution_not_cached(buck: Buck) -> None:
     second_test_runs = [
         entry for entry in second_what_ran if entry["reason"] == "test.run"
     ]
-    assert len(second_test_runs) == 1, (
-        f"Expected exactly one test.run entry, got {len(second_test_runs)}"
+    assert len(second_test_runs) == 0, (
+        f"Expected test execution to be skipped, got {len(second_test_runs)} test.run entries"
     )
-    assert second_test_runs[0]["reproducer"]["executor"] == "Local", (
-        "Expected test to run locally, not be cached!"
+
+    await buck.kill()
+    await buck.test(*args)
+    third_what_ran = await read_what_ran(buck)
+    third_test_runs = [
+        entry for entry in third_what_ran if entry["reason"] == "test.run"
+    ]
+    assert len(third_test_runs) == 1, (
+        "Expected local test execution to run again after restarting the daemon"
     )
+    assert third_test_runs[0]["reproducer"]["executor"] == "Local"
 
 
 @buck_test()
-async def test_remote_test_execution_not_cached_with_no_remote_cache(
+async def test_local_test_execution_not_cached_without_opt_in(buck: Buck) -> None:
+    args = [
+        "-c",
+        "test.local_enabled=true",
+        "-c",
+        "test.remote_enabled=false",
+        "//:test",
+    ]
+
+    await buck.test(*args)
+    await buck.test(*args)
+
+    what_ran = await read_what_ran(buck)
+    test_runs = [entry for entry in what_ran if entry["reason"] == "test.run"]
+    assert len(test_runs) == 1
+    assert test_runs[0]["reproducer"]["executor"] == "Local"
+
+
+@buck_test()
+async def test_failed_local_test_execution_not_cached_on_dice(buck: Buck) -> None:
+    args = [
+        "-c",
+        "test.local_enabled=true",
+        "-c",
+        "test.remote_enabled=false",
+        "//:failing_cacheable_test",
+    ]
+
+    await expect_failure(buck.test(*args))
+    await expect_failure(buck.test(*args))
+
+    what_ran = await read_what_ran(buck)
+    test_runs = [entry for entry in what_ran if entry["reason"] == "test.run"]
+    assert len(test_runs) == 1
+    assert test_runs[0]["reproducer"]["executor"] == "Local"
+
+
+@buck_test()
+async def test_local_test_execution_dice_cache_invalidated(buck: Buck) -> None:
+    def args(seed: str) -> list[str]:
+        return [
+            "-c",
+            "test.local_enabled=true",
+            "-c",
+            "test.remote_enabled=false",
+            "-c",
+            f"test.seed={seed}",
+            "//:cacheable_test",
+        ]
+
+    await buck.test(*args("first"))
+    await buck.test(*args("first"))
+    assert not [
+        entry
+        for entry in await read_what_ran(buck)
+        if entry["reason"] == "test.run"
+    ]
+
+    await buck.test(*args("second"))
+    test_runs = [
+        entry
+        for entry in await read_what_ran(buck)
+        if entry["reason"] == "test.run"
+    ]
+    assert len(test_runs) == 1
+    assert test_runs[0]["reproducer"]["executor"] == "Local"
+
+
+@buck_test()
+async def test_test_execution_dice_cached_with_no_remote_cache(
     buck: Buck,
 ) -> None:
     args = [
@@ -174,11 +253,8 @@ async def test_remote_test_execution_not_cached_with_no_remote_cache(
     second_test_runs = [
         entry for entry in second_what_ran if entry["reason"] == "test.run"
     ]
-    assert len(second_test_runs) == 1, (
-        f"Expected exactly one test.run entry, got {len(second_test_runs)}"
-    )
-    assert second_test_runs[0]["reproducer"]["executor"] == "Re", (
-        "Expected test to run remotely, not be cached!"
+    assert len(second_test_runs) == 0, (
+        f"Expected DICE to skip test execution, got {len(second_test_runs)} test.run entries"
     )
 
 

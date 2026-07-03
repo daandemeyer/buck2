@@ -452,8 +452,18 @@ impl<'a> BuckTestOrchestrator<'a> {
 
         let test_target = self.session.get(test_target)?;
 
-        let fs = self.dice.ctx().get_artifact_fs().await?;
+        let dice_transaction = self.dice.dupe();
+        let mut dice = dice_transaction.ctx();
+        let fs = dice.get_artifact_fs().await?;
         let pre_create_dirs = Arc::new(pre_create_dirs);
+        let test_execution_caching_enabled =
+            if matches!(&stage, TestStage::Testing { .. }) && !disable_test_execution_caching {
+                Self::get_test_info(&mut dice, &test_target, &self.internal_runner_config)
+                    .await?
+                    .supports_test_execution_caching()
+            } else {
+                false
+            };
 
         let ExecuteData {
             stdout,
@@ -464,7 +474,7 @@ impl<'a> BuckTestOrchestrator<'a> {
             outputs,
             command_execution,
         } = prepare_and_execute(
-            &mut self.dice.dupe().ctx(),
+            &mut dice,
             self.cancellations,
             TestExecutionKey {
                 test_target,
@@ -477,7 +487,7 @@ impl<'a> BuckTestOrchestrator<'a> {
                 options: self.session.options(),
                 timeout,
                 host_sharing_requirements: host_sharing_requirements.into(),
-                disable_test_execution_caching,
+                test_execution_caching_enabled,
             },
             self.liveliness_observer.dupe(),
             &self.internal_runner_config,
@@ -578,12 +588,10 @@ impl<'a> BuckTestOrchestrator<'a> {
             options,
             timeout,
             host_sharing_requirements,
-            disable_test_execution_caching,
+            test_execution_caching_enabled,
         } = key;
         let fs = dice.get_artifact_fs().await?;
         let test_info = Self::get_test_info(dice, &test_target, internal_runner_config).await?;
-        let effective_test_execution_caching =
-            test_info.supports_test_execution_caching() && !disable_test_execution_caching;
         let disable_local_network_isolation =
             Self::disable_local_network_isolation(stage.as_ref(), &test_info);
         let test_executor = Self::get_test_executor(
@@ -593,7 +601,7 @@ impl<'a> BuckTestOrchestrator<'a> {
             executor_override,
             fs,
             &stage,
-            effective_test_execution_caching,
+            test_execution_caching_enabled,
         )
         .await?;
         let test_executable_expanded = Self::expand_test_executable(
@@ -691,7 +699,7 @@ impl<'a> BuckTestOrchestrator<'a> {
             execution_request,
             liveliness_observer.dupe(),
             test_executor.re_cache_enabled(),
-            effective_test_execution_caching,
+            test_execution_caching_enabled,
         )
         .boxed()
         .await?;
@@ -747,7 +755,7 @@ struct TestExecutionKey {
     options: TestSessionOptions,
     timeout: Duration,
     host_sharing_requirements: Arc<HostSharingRequirements>,
-    disable_test_execution_caching: bool,
+    test_execution_caching_enabled: bool,
 }
 
 #[async_trait]
@@ -794,7 +802,7 @@ impl Key for TestExecutionKey {
     }
 
     fn validity(x: &Self::Value) -> bool {
-        // We don't want to cache any failed listings
+        // Failed listings and test executions should always be retried.
         x.as_ref()
             .is_ok_and(|f| f.status == ExecutionStatus::Finished { exitcode: 0 })
     }
@@ -813,7 +821,7 @@ async fn prepare_and_execute(
 ) -> Result<ExecuteData, ExecuteError> {
     let execute_on_dice = match key.stage.as_ref() {
         TestStage::Listing { cacheable, .. } => *cacheable,
-        TestStage::Testing { .. } => false,
+        TestStage::Testing { .. } => key.test_execution_caching_enabled,
     };
     if execute_on_dice {
         let result = tokio::select! {
@@ -867,11 +875,12 @@ impl Display for TestExecutionKey {
         fmt_container(f, "pre_create_dirs = [", "], ", self.pre_create_dirs.iter())?;
         write!(
             f,
-            "stage = {}, options = {}, timeout = {}, host_sharing_requirements = {}",
+            "stage = {}, options = {}, timeout = {}, host_sharing_requirements = {}, test_execution_caching_enabled = {}",
             self.stage,
             self.options,
             self.timeout.as_millis(),
-            self.host_sharing_requirements
+            self.host_sharing_requirements,
+            self.test_execution_caching_enabled,
         )
     }
 }

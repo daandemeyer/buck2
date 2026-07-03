@@ -92,13 +92,14 @@ impl<'a> ArtifactValueBuilder<'a> {
         src: &ProjectRelativePath,
         dest: &ProjectRelativePath,
         executable_bit_override: Option<bool>,
+        relative_symlinks: bool,
     ) -> buck2_error::Result<ActionDirectoryEntry<ActionSharedDirectory>> {
         insert_artifact(&mut self.builder, src.to_buf(), src_value)?;
 
         let entry = match src_value.entry() {
             DirectoryEntry::Dir(directory) => {
                 let mut builder = directory.dupe().into_builder();
-                relativize_directory(&mut builder, src, dest)?;
+                relativize_directory(&mut builder, src, dest, relative_symlinks)?;
                 if let Some(executable_bit_override) = executable_bit_override {
                     override_executable_bit(&mut builder, executable_bit_override)?;
                 }
@@ -108,14 +109,17 @@ impl<'a> ArtifactValueBuilder<'a> {
             }
             DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(s)) => {
                 // TODO: This seems like it normally shouldn't need to be normalizing anything.
-                let reldest = self.project_fs.relative_path(
-                    src.parent().internal_error("Symlink has no dir parent")?,
-                    dest,
-                );
-                // RelativePathBuf::from_system_path converts platform-specific path separators.
-                let reldest = RelativePathBuf::from_system_path(&reldest)?;
-                let s = s.relativized(reldest);
-                DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(Arc::new(s)))
+                let src_parent = src.parent().internal_error("Symlink has no dir parent")?;
+                let orig_dest = src_parent.join_normalized(s.target())?;
+                if relative_symlinks && orig_dest.starts_with(src) {
+                    DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(s.dupe()))
+                } else {
+                    let reldest = self.project_fs.relative_path(src_parent, dest);
+                    // RelativePathBuf::from_system_path converts platform-specific path separators.
+                    let reldest = RelativePathBuf::from_system_path(&reldest)?;
+                    let s = s.relativized(reldest);
+                    DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(Arc::new(s)))
+                }
             }
             DirectoryEntry::Leaf(ActionDirectoryMember::ExternalSymlink(s)) => {
                 DirectoryEntry::Leaf(ActionDirectoryMember::ExternalSymlink(
@@ -156,10 +160,16 @@ impl<'a> ArtifactValueBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
+    use buck2_common::file_ops::metadata::FileMetadata;
     use buck2_common::file_ops::metadata::Symlink;
     use buck2_core::fs::project::ProjectRootTemp;
+    use buck2_directory::directory::directory::Directory;
+    use buck2_directory::directory::find::find;
+    use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 
     use super::*;
+    use crate::directory::insert_file;
+    use crate::directory::insert_symlink;
 
     fn path(s: &str) -> &ProjectRelativePath {
         ProjectRelativePath::new(s).unwrap()
@@ -172,6 +182,85 @@ mod tests {
     fn get_symlink_artifact_value(s: &str) -> ArtifactValue {
         let symlink = DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(get_symlink(s)));
         ArtifactValue::new(symlink, None)
+    }
+
+    fn get_symlink_directory_artifact_value() -> buck2_error::Result<ArtifactValue> {
+        let digest_config = DigestConfig::testing_default();
+        let mut builder = ActionDirectoryBuilder::empty_non_exhaustive();
+        insert_file(
+            &mut builder,
+            path("dir/real").to_buf(),
+            FileMetadata::empty(digest_config.cas_digest_config()),
+        )?;
+        insert_symlink(&mut builder, path("dir/link").to_buf(), get_symlink("real"))?;
+        insert_symlink(&mut builder, path("sub/up").to_buf(), get_symlink(".."))?;
+        insert_symlink(
+            &mut builder,
+            path("escape").to_buf(),
+            get_symlink("../outside/target"),
+        )?;
+        builder.mark_uniformly_exhaustive();
+
+        Ok(ArtifactValue::dir(
+            builder
+                .fingerprint(digest_config.as_directory_serializer())
+                .shared(&*INTERNER),
+        ))
+    }
+
+    fn copied_symlink_directory(
+        relative_symlinks: bool,
+    ) -> buck2_error::Result<ActionDirectoryEntry<ActionSharedDirectory>> {
+        let fs = ProjectRootTemp::new().unwrap();
+        let mut builder = ArtifactValueBuilder::new(fs.path(), DigestConfig::testing_default());
+        builder.add_copied(
+            &get_symlink_directory_artifact_value()?,
+            path("source"),
+            path("buck-out/copied"),
+            None,
+            relative_symlinks,
+        )
+    }
+
+    fn symlink_target(
+        entry: &ActionDirectoryEntry<ActionSharedDirectory>,
+        path: &str,
+    ) -> buck2_error::Result<String> {
+        let directory = match entry {
+            DirectoryEntry::Dir(directory) => directory,
+            _ => panic!("Directory type is expected!"),
+        };
+        let path = ForwardRelativePath::new(path)?;
+        let symlink = match find(directory.as_ref(), path)? {
+            Some(DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(symlink))) => symlink,
+            _ => panic!("Symlink type is expected at `{path}`!"),
+        };
+        Ok(symlink.target().as_str().to_owned())
+    }
+
+    #[test]
+    fn copy_directory_relativizes_all_symlinks_by_default() -> buck2_error::Result<()> {
+        let entry = copied_symlink_directory(false)?;
+
+        assert_eq!(
+            symlink_target(&entry, "dir/link")?,
+            "../../../source/dir/real"
+        );
+        assert_eq!(symlink_target(&entry, "sub/up")?, "../../../source");
+        assert_eq!(symlink_target(&entry, "escape")?, "../../outside/target");
+
+        Ok(())
+    }
+
+    #[test]
+    fn copy_directory_preserves_internal_relative_symlinks() -> buck2_error::Result<()> {
+        let entry = copied_symlink_directory(true)?;
+
+        assert_eq!(symlink_target(&entry, "dir/link")?, "real");
+        assert_eq!(symlink_target(&entry, "sub/up")?, "..");
+        assert_eq!(symlink_target(&entry, "escape")?, "../../outside/target");
+
+        Ok(())
     }
 
     #[test]
@@ -187,27 +276,28 @@ mod tests {
         // |-d6/
         // | |-target
 
-        let entry = {
+        for relative_symlinks in [false, true] {
             let fs = ProjectRootTemp::new().unwrap();
             let mut builder = ArtifactValueBuilder::new(fs.path(), DigestConfig::testing_default());
-            builder.add_copied(
+            let entry = builder.add_copied(
                 &get_symlink_artifact_value("../../../d6/target"),
                 path("d1/d2/d3/d4/link"),
                 path("d1/d5/new_link"),
                 None,
-            )?
-        };
+                relative_symlinks,
+            )?;
 
-        let new_symlink = match entry.as_ref() {
-            DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(s)) => s,
-            _ => panic!("Symlink type is expected!"),
-        };
+            let new_symlink = match entry.as_ref() {
+                DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(s)) => s,
+                _ => panic!("Symlink type is expected!"),
+            };
 
-        assert_eq!(
-            new_symlink,
-            &get_symlink("../d6/target"),
-            "Symlinks are different"
-        );
+            assert_eq!(
+                new_symlink,
+                &get_symlink("../d6/target"),
+                "Symlinks are different"
+            );
+        }
 
         Ok(())
     }
