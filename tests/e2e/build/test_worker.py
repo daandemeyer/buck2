@@ -47,6 +47,23 @@ async def test_worker(buck: Buck) -> None:
     assert len(await _read_what_ran_for_executor(buck, "Worker")) == 1
 
 
+# cell_execution_paths is daemon startup config: it must come from a buckconfig
+# file (extra_buck_config), not `-c`, which never reaches DaemonStartupConfig.
+@buck_test(
+    inplace=True,
+    skip_for_os=["darwin", "windows"],
+    extra_buck_config={"buck2": {"cell_execution_paths": "canonical_v1"}},
+)
+async def test_worker_with_canonical_cell_execution_paths(buck: Buck) -> None:
+    res = await buck.build(
+        *worker_args,
+        package + ":gen_worker_run_out",
+    )
+    output = res.get_build_report().output_for_target(package + ":gen_worker_run_out")
+    assert output.read_text() == "hello worker"
+    assert len(await _read_what_ran_for_executor(buck, "Worker")) == 1
+
+
 @buck_test(inplace=True, skip_for_os=["darwin", "windows"])
 async def test_worker_disabled(buck: Buck) -> None:
     # Check non-worker exe runs if workers are disabled.

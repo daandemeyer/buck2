@@ -8,6 +8,7 @@
  * above-listed licenses.
  */
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -451,8 +452,52 @@ impl Drop for CleanProgressHandle {
     }
 }
 
+/// Every cell forest must be removed before the `.owners` directory that owns them: an
+/// interrupted clean that took them the other way around would leave a forest with no owner
+/// record, the one state `Namespace::ensure` refuses to adopt.
+fn view_removal_order(mut entries: Vec<PathBuf>) -> Vec<PathBuf> {
+    entries.sort_by_key(|entry| entry.file_name().is_some_and(|name| name == ".owners"));
+    entries
+}
+
+/// Nothing here may follow a link into the physical cell sources: [`is_plain_dir`] rejects reparse
+/// points before `read_dir`, and `fs_util::remove_all` unlinks a planted forest rather than
+/// descending into it.
+fn clean_execution_view(buck_out: &AbsNormPathBuf) -> buck2_error::Result<()> {
+    let view_root = buck_out.as_path().join("cell_sources");
+    if is_plain_dir(&view_root) {
+        for version in read_dir_if_exists(&view_root)? {
+            if !is_plain_dir(&version) {
+                continue;
+            }
+            for entry in view_removal_order(read_dir_if_exists(&version)?) {
+                fs_util::remove_all(AbsPath::new(&entry)?).categorize_internal()?;
+            }
+        }
+    }
+    fs_util::remove_all(AbsPath::new(&view_root)?).categorize_internal()
+}
+
+fn read_dir_if_exists(path: &std::path::Path) -> buck2_error::Result<Vec<PathBuf>> {
+    match std::fs::read_dir(path) {
+        Ok(entries) => Ok(entries
+            .map(|entry| Ok(entry?.path()))
+            .collect::<Result<Vec<_>, std::io::Error>>()?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `symlink_metadata` is required: a followed stat of a symlink reports a plain directory.
+fn is_plain_dir(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| fs_util::is_plain_directory(&metadata))
+}
+
 fn clean_buck_out(path: &AbsNormPathBuf, console_type: ConsoleType) -> buck2_error::Result<()> {
-    let walk = WalkDir::new(path);
+    // Canonical cell execution roots are links to the user's checkout, so they must go before the
+    // parallel pass, whose `follow_links` is kept explicit for the same reason.
+    clean_execution_view(path)?;
+    let walk = WalkDir::new(path).follow_links(false);
     let thread_pool = ThreadPool::new(buck2_util::threads::available_parallelism());
     let error = Arc::new(Mutex::new(None));
 
@@ -486,7 +531,7 @@ fn clean_buck_out(path: &AbsNormPathBuf, console_type: ConsoleType) -> buck2_err
             thread_pool.execute(move || {
                 // The wlak gives us back absolute paths since we give it absolute paths.
                 let res = AbsPath::new(dir_entry.path()).and_then(|p| {
-                    fs_util::remove_file(p)
+                    fs_util::remove_file_harder(p)
                         .categorize_internal()
                         .map_err(Into::into)
                 });
@@ -525,4 +570,202 @@ fn clean_buck_out(path: &AbsNormPathBuf, console_type: ConsoleType) -> buck2_err
         fs_util::remove_dir_all(path).categorize_internal()?;
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    /// Entered at `buck-out/<isolation>`, the shape production passes and the only one under which
+    /// `clean_execution_view` finds the view at all.
+    #[test]
+    fn clean_does_not_follow_canonical_cell_view_link() -> buck2_error::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let iso_buck_out = temp.path().join("buck-out/v2");
+        let generated = iso_buck_out.join("gen/output");
+        let owners = iso_buck_out.join("cell_sources/v1/.owners");
+        let canonical_cell = iso_buck_out.join("cell_sources/v1/c_73616d706c65");
+        let canonical_entry = canonical_cell.join("src");
+        let physical_cell = temp.path().join("physical-sample");
+        let physical_source = physical_cell.join("src/source.cpp");
+
+        fs::create_dir_all(generated.parent().unwrap())?;
+        fs::write(&generated, b"generated")?;
+        fs::create_dir_all(&canonical_cell)?;
+        fs::create_dir_all(&owners)?;
+        fs::write(owners.join("c_73616d706c65"), b"owner")?;
+        // Leftover record for a vanished cell.
+        fs::write(owners.join("c_6f6c64"), b"stale owner")?;
+        fs::create_dir_all(physical_source.parent().unwrap())?;
+        fs::write(&physical_source, b"source")?;
+        symlink(physical_cell.join("src"), &canonical_entry)?;
+
+        clean_buck_out(
+            &AbsNormPathBuf::new(iso_buck_out.clone())?,
+            ConsoleType::None,
+        )?;
+
+        assert!(
+            physical_source.exists(),
+            "planted link must not be followed"
+        );
+        assert!(!generated.exists());
+        assert!(!iso_buck_out.join("cell_sources").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn view_removal_order_puts_owners_last() {
+        for entries in [
+            vec![".owners", "c_73616d706c65", "c_6f6c64"],
+            vec!["c_73616d706c65", ".owners", "c_6f6c64"],
+            vec!["c_73616d706c65", "c_6f6c64", ".owners"],
+        ] {
+            let ordered = view_removal_order(
+                entries
+                    .iter()
+                    .map(|name| PathBuf::from("v1").join(name))
+                    .collect(),
+            );
+            assert_eq!(
+                ordered.last().unwrap().file_name().unwrap(),
+                ".owners",
+                "input order {entries:?} must still remove `.owners` last"
+            );
+            assert_eq!(ordered.len(), entries.len(), "no entry may be dropped");
+        }
+    }
+
+    #[test]
+    fn clean_execution_view_removes_forests_before_owners() -> buck2_error::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let iso_buck_out = temp.path().join("buck-out/v2");
+        let version = iso_buck_out.join("cell_sources/v1");
+        let owners = version.join(".owners");
+        let forest = version.join("c_73616d706c65");
+
+        fs::create_dir_all(&owners)?;
+        fs::create_dir_all(&forest)?;
+        fs::write(owners.join("c_73616d706c65"), b"owner")?;
+        fs::write(forest.join("child"), b"x")?;
+
+        // Standing in for an interrupted clean. The read-only bit goes on the parent because
+        // `remove_dir_all`'s permission retry only chmods the tree it was handed.
+        let restore = fs::metadata(&version)?.permissions();
+        let mut readonly = restore.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&version, readonly)?;
+        // Root ignores the permission bits this relies on.
+        if fs::write(version.join(".probe"), b"").is_ok() {
+            fs::set_permissions(&version, restore)?;
+            return Ok(());
+        }
+
+        let result = clean_execution_view(&AbsNormPathBuf::new(iso_buck_out.clone())?);
+        let owner_survived = owners.join("c_73616d706c65").exists();
+        fs::set_permissions(&version, restore)?;
+
+        assert!(result.is_err(), "removal should have failed on the forest");
+        assert!(
+            owner_survived,
+            "the owner record must outlive the forest it owns; recovery is another `buck2 clean`, \
+             which is useless once the daemon is left refusing to adopt an unowned forest"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn clean_execution_view_does_not_follow_namespace_root_link() -> buck2_error::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let iso_buck_out = temp.path().join("buck-out/v2");
+        let target = temp.path().join("victim");
+        let target_file = target.join("v1/c_73616d706c65/precious.txt");
+
+        // The victim needs a real view's shape (`<root>/v1/c_*/file`), or a regression that
+        // follows the link would find nothing to delete.
+        fs::create_dir_all(target_file.parent().unwrap())?;
+        fs::create_dir_all(&iso_buck_out)?;
+        fs::write(&target_file, b"precious")?;
+        symlink(&target, iso_buck_out.join("cell_sources"))?;
+
+        clean_execution_view(&AbsNormPathBuf::new(iso_buck_out.clone())?)?;
+
+        assert!(target_file.exists());
+        assert!(
+            fs::symlink_metadata(iso_buck_out.join("cell_sources")).is_err(),
+            "the planted link itself must be removed"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::fs;
+
+    use super::*;
+
+    /// Mirrors the unix `clean_does_not_follow_canonical_cell_view_link`. The junction sits inside
+    /// a forest, below anything `is_plain_dir` inspects, so this covers `remove_dir_all` unlinking
+    /// it rather than descending.
+    #[test]
+    fn clean_does_not_follow_canonical_cell_view_junction() -> buck2_error::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let iso_buck_out = temp.path().join("buck-out/v2");
+        let generated = iso_buck_out.join("gen/output");
+        let owners = iso_buck_out.join("cell_sources/v1/.owners");
+        let canonical_cell = iso_buck_out.join("cell_sources/v1/c_73616d706c65");
+        let canonical_entry = canonical_cell.join("src");
+        let physical_cell = temp.path().join("physical-sample");
+        let physical_source = physical_cell.join("src/source.cpp");
+
+        fs::create_dir_all(generated.parent().unwrap())?;
+        fs::write(&generated, b"generated")?;
+        fs::create_dir_all(&canonical_cell)?;
+        fs::create_dir_all(&owners)?;
+        fs::write(owners.join("c_73616d706c65"), b"owner")?;
+        fs::write(owners.join("c_6f6c64"), b"stale owner")?;
+        fs::create_dir_all(physical_source.parent().unwrap())?;
+        fs::write(&physical_source, b"source")?;
+        junction::create(physical_cell.join("src"), &canonical_entry)?;
+
+        clean_buck_out(
+            &AbsNormPathBuf::new(iso_buck_out.clone())?,
+            ConsoleType::None,
+        )?;
+
+        assert!(
+            physical_source.exists(),
+            "the planted junction must be unlinked, not descended into"
+        );
+        assert!(!generated.exists());
+        assert!(!iso_buck_out.join("cell_sources").exists());
+        Ok(())
+    }
+
+    /// A junction at the namespace root, the case that goes through `is_plain_dir`.
+    #[test]
+    fn clean_execution_view_does_not_follow_namespace_root_junction() -> buck2_error::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let iso_buck_out = temp.path().join("buck-out/v2");
+        let target = temp.path().join("victim");
+        let target_file = target.join("v1/c_73616d706c65/precious.txt");
+
+        fs::create_dir_all(target_file.parent().unwrap())?;
+        fs::create_dir_all(&iso_buck_out)?;
+        fs::write(&target_file, b"precious")?;
+        junction::create(&target, iso_buck_out.join("cell_sources"))?;
+
+        clean_execution_view(&AbsNormPathBuf::new(iso_buck_out.clone())?)?;
+
+        assert!(target_file.exists());
+        assert!(
+            fs::symlink_metadata(iso_buck_out.join("cell_sources")).is_err(),
+            "the planted junction itself must be removed"
+        );
+        Ok(())
+    }
 }

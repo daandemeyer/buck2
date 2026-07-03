@@ -28,11 +28,13 @@ use buck2_common::legacy_configs::key::BuckconfigKeyRef;
 use buck2_common::package_listing::dice::DicePackageListingResolver;
 use buck2_core::build_file_path::BuildFilePath;
 use buck2_core::cells::cell_path::CellPath;
+use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
 use buck2_core::package::PackageLabel;
 use buck2_directory::directory::directory_data::DirectoryData;
 use buck2_error::BuckErrorContext;
 use buck2_error::internal_error;
 use buck2_execute::artifact_value::ArtifactValue;
+use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::digest_config::HasDigestConfig;
 use buck2_execute::directory::ActionDirectoryBuilder;
 use buck2_execute::directory::ActionDirectoryEntry;
@@ -42,6 +44,8 @@ use buck2_execute::directory::INTERNER;
 use buck2_execute::directory::extract_artifact_value;
 use buck2_execute::directory::insert_artifact;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
+use buck2_fs::paths::relative_path::Component;
+use buck2_fs::paths::relative_path::RelativePath;
 use buck2_util::size_assert;
 use buck2_util::time_span::TimeSpan;
 use derive_more::Display;
@@ -287,12 +291,39 @@ async fn dir_artifact_value(
             ctx: &mut DiceComputations,
             _cancellation: &CancellationContext,
         ) -> Self::Value {
+            let artifact_fs = ctx.get_artifact_fs().await?;
+            artifact_fs.validate_canonical_cell(self.0.cell())?;
             let files = DiceFileComputations::read_dir(ctx, self.0.as_ref().as_ref())
                 .await?
                 .included;
+            let files = if artifact_fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1
+                && self.0.path().is_empty()
+            {
+                // Only the byte-exact entry is omitted. Case variants are reserved
+                // host-dependently, so dropping them silently would diverge this fingerprint
+                // across hosts for byte-identical checkouts; reject them instead.
+                let mut included = Vec::with_capacity(files.len());
+                for entry in files.iter() {
+                    if entry.file_name.as_str() == "buck-out" {
+                        continue;
+                    }
+                    if artifact_fs.is_reserved_buck_out_top_level_name(&entry.file_name) {
+                        return Err(buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::Input,
+                            "Source directory entry `{}` in cell `{}` is a case variant of the reserved top-level `buck-out` name in `canonical_v1`",
+                            entry.file_name,
+                            self.0.cell(),
+                        ));
+                    }
+                    included.push(entry.clone());
+                }
+                included
+            } else {
+                files.to_vec()
+            };
 
             let entry_values = ctx
-                .try_compute_join(files.iter(), async |ctx, x| {
+                .try_compute_join(files, async |ctx, x| {
                     // TODO(scottcao): This current creates a `DirArtifactValueKey` for each subdir of a source directory.
                     // Instead, this should be 1 key for the entire top-level directory since there's almost
                     // no chance of getting cache hit with a sub-directory.
@@ -302,7 +333,7 @@ async fn dir_artifact_value(
                         None,
                     )
                     .await?;
-                    buck2_error::Ok((x.file_name.clone(), value))
+                    buck2_error::Ok((x.file_name, value))
                 })
                 .await?;
 
@@ -372,6 +403,17 @@ async fn path_artifact_value(
     cell_path: Arc<CellPath>,
     label: Option<PackageLabel>,
 ) -> buck2_error::Result<ArtifactValue> {
+    let artifact_fs = ctx.get_artifact_fs().await?;
+    artifact_fs.validate_canonical_cell(cell_path.cell())?;
+    if artifact_fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1
+        && artifact_fs.is_reserved_buck_out_source_path(cell_path.path())
+    {
+        return Err(buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "Source path `{cell_path}` is beneath the reserved top-level `buck-out` subtree in `canonical_v1`",
+        ));
+    }
+
     let raw = match DiceFileComputations::read_path_metadata(ctx, cell_path.as_ref().as_ref()).await
     {
         Ok(raw) => Ok(raw),
@@ -397,12 +439,22 @@ async fn path_artifact_value(
 
     match raw {
         RawPathMetadata::Symlink {
-            at: _,
+            at,
             to: RawSymlink::External(external_symlink),
-        } => Ok(ArtifactValue::new(
-            ActionDirectoryEntry::Leaf(ActionDirectoryMember::ExternalSymlink(external_symlink)),
-            None,
-        )),
+        } => {
+            if artifact_fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
+                return Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "Source symlink `{at}` has an absolute or external target; canonical_v1 only supports relative source symlinks that remain inside one cell",
+                ));
+            }
+            Ok(ArtifactValue::new(
+                ActionDirectoryEntry::Leaf(ActionDirectoryMember::ExternalSymlink(
+                    external_symlink,
+                )),
+                None,
+            ))
+        }
         RawPathMetadata::File(metadata) => Ok(ArtifactValue::new(
             ActionDirectoryEntry::Leaf(ActionDirectoryMember::File(metadata)),
             None,
@@ -412,6 +464,14 @@ async fn path_artifact_value(
             at,
             to: RawSymlink::Relative(target, target_rel),
         } => {
+            if artifact_fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
+                validate_canonical_source_symlink(
+                    &artifact_fs,
+                    at.as_ref(),
+                    target.as_ref(),
+                    target_rel.target(),
+                )?;
+            }
             // TODO (T126181780): This should have a limit on recursion.
             let target_artifact_value = path_artifact_value(ctx, target.dupe(), label).await?;
             let root_cell = ctx.get_cell_resolver().await?.root_cell();
@@ -430,26 +490,160 @@ async fn path_artifact_value(
             // thing that'd require, so we read through the symlink instead. We could enhance
             // `ArtifactValue` to make that possible, but Jakob isn't sure that's a good idea
             let dont_read_through_symlink = use_correct_source_symlink_reading && at == cell_path;
-            if dont_read_through_symlink {
-                let artifact_fs = ctx.get_artifact_fs().await?;
-                let target_path = artifact_fs.resolve_cell_path((*target).as_ref())?;
-                let mut builder = ActionDirectoryBuilder::empty();
-                insert_artifact(&mut builder, target_path, &target_artifact_value)?;
-                let deps = builder
-                    .fingerprint(
-                        ctx.global_data()
-                            .get_digest_config()
-                            .as_directory_serializer(),
-                    )
-                    .shared(&*INTERNER);
-                Ok(ArtifactValue::new(
-                    ActionDirectoryEntry::Leaf(ActionDirectoryMember::Symlink(target_rel.dupe())),
-                    Some(deps),
-                ))
+            let canonical = artifact_fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1;
+            if !dont_read_through_symlink && !canonical {
+                return Ok(target_artifact_value);
+            }
+
+            // Reading through a symlink still has to name the target as a dependency, so that the
+            // canonical view publishes it and the Merkle tree contains its bytes.
+            let deps = canonical_source_symlink_deps(
+                artifact_fs.resolve_cell_path_for_execution((*target).as_ref())?,
+                &target_artifact_value,
+                ctx.global_data().get_digest_config(),
+            )?;
+            let entry = if dont_read_through_symlink {
+                ActionDirectoryEntry::Leaf(ActionDirectoryMember::Symlink(target_rel.dupe()))
             } else {
-                Ok(target_artifact_value)
+                target_artifact_value.entry().dupe()
+            };
+            Ok(ArtifactValue::new(entry, Some(deps)))
+        }
+    }
+}
+
+fn canonical_source_symlink_deps(
+    target_path: buck2_core::fs::project_rel_path::ProjectRelativePathBuf,
+    target_value: &ArtifactValue,
+    digest_config: DigestConfig,
+) -> buck2_error::Result<ActionSharedDirectory> {
+    let mut builder = ActionDirectoryBuilder::empty();
+    // `insert_artifact` also merges `target_value.deps()`, which is what makes the returned tree
+    // transitively closed over read-through chains.
+    insert_artifact(&mut builder, target_path, target_value)?;
+    Ok(builder
+        .fingerprint(digest_config.as_directory_serializer())
+        .shared(&*INTERNER))
+}
+
+fn validate_canonical_source_symlink(
+    artifact_fs: &buck2_core::fs::artifact_path_resolver::ArtifactFs,
+    at: &CellPath,
+    target: &CellPath,
+    raw_target: &RelativePath,
+) -> buck2_error::Result<()> {
+    if at.cell() != target.cell() {
+        return Err(buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "Relative source symlink `{at}` crosses from canonical cell `{}` into `{}`; canonical_v1 requires relative source symlinks to stay within one cell",
+            at.cell(),
+            target.cell(),
+        ));
+    }
+    if artifact_fs.is_reserved_buck_out_source_path(target.path()) {
+        return Err(buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "Relative source symlink `{at}` resolves beneath the reserved top-level `buck-out` subtree in `canonical_v1`",
+        ));
+    }
+
+    // Only the depth matters: `..` must not underflow the cell root, and the component landing at
+    // depth 1 must not be the reserved top-level name.
+    let mut depth = at.path().parent().map_or(0, |parent| parent.iter().count());
+    let mut saw_target_name = false;
+    for component in raw_target.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if saw_target_name {
+                    return Err(buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Input,
+                        "Relative source symlink `{at}` has non-canonical target `{raw_target}`: `..` may not cancel a component introduced by the symlink target",
+                    ));
+                }
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Input,
+                        "Relative source symlink `{at}` target `{raw_target}` escapes canonical cell `{}`",
+                        at.cell(),
+                    )
+                })?;
+            }
+            Component::Normal(name) => {
+                saw_target_name = true;
+                depth += 1;
+                if depth == 1 && artifact_fs.is_reserved_buck_out_top_level_name(name) {
+                    return Err(buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Input,
+                        "Relative source symlink `{at}` target `{raw_target}` traverses the reserved top-level `buck-out` subtree in `canonical_v1`",
+                    ));
+                }
             }
         }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod canonical_source_symlink_tests {
+    use buck2_core::fs::artifact_path_resolver::ArtifactFs;
+    use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+
+    use super::*;
+
+    fn artifact_fs() -> buck2_error::Result<ArtifactFs> {
+        Ok(ArtifactFs::testing_new_with_mode(
+            CellSourcePathMode::CanonicalV1,
+            &[("sample", "")],
+        ))
+    }
+
+    fn validate(at: &str, target: &str, raw: &str) -> buck2_error::Result<()> {
+        validate_canonical_source_symlink(
+            &artifact_fs()?,
+            &CellPath::testing_new(at),
+            &CellPath::testing_new(target),
+            RelativePath::new(raw)?,
+        )
+    }
+
+    #[test]
+    fn permits_only_unambiguous_in_cell_relative_targets() -> buck2_error::Result<()> {
+        validate("sample//dir/link", "sample//sibling", "../sibling")?;
+        validate("sample//dir/link", "sample//dir/child", "child")?;
+
+        assert!(
+            validate(
+                "sample//dir/link",
+                "sample//dir/sibling",
+                "child/../sibling"
+            )
+            .is_err()
+        );
+        assert!(validate("sample//link", "sample//outside", "../outside").is_err());
+        assert!(validate("sample//link", "sample//buck-out/file", "buck-out/file").is_err());
+        assert!(validate("sample//link", "other//file", "file").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn read_through_symlink_dependencies_are_transitively_closed() -> buck2_error::Result<()> {
+        let digest_config = DigestConfig::testing_default();
+        let leaf = ArtifactValue::file(digest_config.empty_file());
+        let leaf_path = ProjectRelativePathBuf::unchecked_new(
+            "buck-out/v2/cell_sources/v1/c_73616d706c65/leaf".into(),
+        );
+        let inner_deps = canonical_source_symlink_deps(leaf_path.clone(), &leaf, digest_config)?;
+        let inner = ArtifactValue::new(leaf.entry().dupe(), Some(inner_deps));
+        let inner_path = ProjectRelativePathBuf::unchecked_new(
+            "buck-out/v2/cell_sources/v1/c_73616d706c65/inner".into(),
+        );
+        let outer_deps = canonical_source_symlink_deps(inner_path.clone(), &inner, digest_config)?;
+        let builder = outer_deps.into_builder();
+
+        assert!(extract_artifact_value(&builder, &leaf_path, digest_config)?.is_some());
+        assert!(extract_artifact_value(&builder, &inner_path, digest_config)?.is_some());
+        Ok(())
     }
 }
 
@@ -497,7 +691,9 @@ impl Key for EnsureProjectedArtifactKey {
             BaseArtifactKind::Build(built) => {
                 artifact_fs.resolve_build(built.get_path(), Some(&base_content_based_path_hash))?
             }
-            BaseArtifactKind::Source(source) => artifact_fs.resolve_source(source.get_path())?,
+            BaseArtifactKind::Source(source) => {
+                artifact_fs.resolve_source_for_execution(source.get_path())?
+            }
         };
 
         let projected_path = base_path.join(path);

@@ -287,6 +287,7 @@ impl HasActionExecutor for DiceComputations<'_> {
             remote_dep_file_cache_checker,
             cache_uploader,
             output_trees_download_config,
+            cell_execution_view,
         } = self.get_command_executor_from_dice(executor_config).await?;
         let blocking_executor = self.get_blocking_executor();
         let materializer = self.per_transaction_data().get_materializer();
@@ -307,6 +308,7 @@ impl HasActionExecutor for DiceComputations<'_> {
                 artifact_fs,
                 executor_config.options,
                 platform,
+                cell_execution_view,
             ),
             blocking_executor,
             materializer,
@@ -867,6 +869,7 @@ mod tests {
     use buck2_execute::digest_config::DigestConfig;
     use buck2_execute::execute::blocking::testing::DummyBlockingExecutor;
     use buck2_execute::execute::cache_uploader::NoOpCacheUploader;
+    use buck2_execute::execute::cell_execution_view::NoopCellExecutionView;
     use buck2_execute::execute::clean_output_paths::cleanup_path;
     use buck2_execute::execute::command_executor::ActionExecutionTimingData;
     use buck2_execute::execute::command_executor::CommandExecutor;
@@ -936,6 +939,7 @@ mod tests {
                     network_access: None,
                 },
                 Default::default(),
+                Arc::new(NoopCellExecutionView),
             ),
             Arc::new(DummyBlockingExecutor {
                 fs: project_fs.dupe(),

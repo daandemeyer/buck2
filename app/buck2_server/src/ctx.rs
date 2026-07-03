@@ -17,6 +17,7 @@ use std::time::Instant;
 
 use allocative::Allocative;
 use async_trait::async_trait;
+use buck2_build_api::actions::execute::dice_data::SetCellExecutionView;
 use buck2_build_api::actions::execute::dice_data::SetCommandExecutor;
 use buck2_build_api::actions::execute::dice_data::SetReClient;
 use buck2_build_api::actions::execute::dice_data::set_fallback_executor_config;
@@ -106,7 +107,9 @@ use buck2_interpreter_for_build::interpreter::cycles::LoadCycleDescriptor;
 use buck2_interpreter_for_build::interpreter::interpreter_setup::setup_interpreter;
 use buck2_resource_control::HasResourceControl;
 use buck2_server_ctx::bxl::InitBxlStreamingTracker;
+use buck2_server_ctx::concurrency::CommandCleanup;
 use buck2_server_ctx::concurrency::DiceUpdater;
+use buck2_server_ctx::concurrency::SetCommandCleanup;
 use buck2_server_ctx::ctx::DiceAccessor;
 use buck2_server_ctx::ctx::LockedPreviousCommandData;
 use buck2_server_ctx::ctx::PrivateStruct;
@@ -588,6 +591,15 @@ impl ServerCommandContext<'_> {
     }
 }
 
+struct WorkerPoolCleanup(Arc<WorkerPool>);
+
+#[async_trait]
+impl CommandCleanup for WorkerPoolCleanup {
+    async fn cleanup(&self) {
+        self.0.shutdown_and_wait().await;
+    }
+}
+
 struct DiceCommandUpdater<'s, 'a: 's> {
     cmd_ctx: &'s ServerCommandContext<'a>,
     execution_strategy: ExecutionStrategy,
@@ -677,7 +689,10 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
             Arc::new(ConcurrentTargetLabelInterner::default()),
         )?;
 
-        ctx.set_buck_out_path(Some(self.cmd_ctx.buck_out_dir.clone()))?;
+        ctx.set_build_context_data(
+            Some(self.cmd_ctx.buck_out_dir.clone()),
+            self.cmd_ctx.base_context.daemon.cell_source_path_mode,
+        )?;
 
         let optional_validations = self
             .cmd_ctx
@@ -907,6 +922,7 @@ impl DiceCommandUpdater<'_, '_> {
         data.set_detailed_aggregated_metrics_events_holder();
 
         let worker_pool = Arc::new(WorkerPool::new(persistent_worker_shutdown_timeout_s));
+        data.set_command_cleanup(Arc::new(WorkerPoolCleanup(worker_pool.dupe())));
 
         let critical_path_backend = root_config
             .parse(BuckconfigKeyRef {
@@ -951,7 +967,9 @@ impl DiceCommandUpdater<'_, '_> {
             run_action_knobs.deduplicate_get_digests_ttl_calls,
             output_trees_download_config.dupe(),
             self.cmd_ctx.base_context.daemon.daemon_id.dupe(),
+            self.cmd_ctx.base_context.daemon.cell_execution_view.dupe(),
         )));
+        data.set_cell_execution_view(self.cmd_ctx.base_context.daemon.cell_execution_view.dupe());
         data.set_blocking_executor(self.cmd_ctx.base_context.daemon.blocking_executor.dupe());
         data.set_http_client(self.cmd_ctx.base_context.daemon.http_client.dupe());
         data.set_materializer(self.cmd_ctx.base_context.daemon.materializer.dupe());

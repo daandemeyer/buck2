@@ -70,6 +70,10 @@ use crate::executors::local::ForkserverAccess;
 // for the request/response.
 const MAX_MESSAGE_SIZE_BYTES: usize = usize::MAX;
 
+/// Allowed on top of a worker's graceful shutdown timeout before its exit is reported as
+/// unconfirmed.
+const WORKER_EXIT_CONFIRMATION_SLACK: Duration = Duration::from_secs(30);
+
 #[derive(buck2_error::Error, Debug)]
 #[buck2(tag = WorkerInit)]
 pub enum WorkerInitError {
@@ -83,6 +87,8 @@ pub enum WorkerInitError {
     },
     #[error("Worker failed to connect within `{0:.2}` seconds: {1}")]
     ConnectionTimeout(f64, String),
+    #[error("Worker pool is shutting down")]
+    PoolStopped,
     /// Any error not related to worker behavior
     #[error("Error initializing worker `{0}`")]
     InternalError(buck2_error::Error),
@@ -123,6 +129,12 @@ impl WorkerInitError {
                     None,
                 )
             }
+            // Only a task whose result is already discarded can reach a stopped pool, so reporting
+            // an error here would fail a build over work nobody is waiting on.
+            WorkerInitError::PoolStopped => manager.cancel_claim(
+                execution_kind,
+                CommandExecutionMetadata::empty(TimeSpan::empty_now()),
+            ),
             // TODO(ctolliday) as above, use a new failure type (worker_init_failure) that indicates this is a worker initialization error.
             WorkerInitError::ConnectionTimeout(..) | WorkerInitError::SpawnFailed(..) => manager
                 .failure(
@@ -227,6 +239,8 @@ async fn spawn_worker(
     forkserver: ForkserverAccess,
     dispatcher: EventDispatcher,
     graceful_shutdown_timeout_s: Option<u32>,
+    process: Arc<WorkerProcess>,
+    exited_guard: LivelinessGuard,
 ) -> Result<WorkerHandle, WorkerInitError> {
     // Use fixed length path at /tmp to avoid 108 character limit for unix domain sockets
     let dir_name = format!("{}-{}", dispatcher.trace_id(), worker_id);
@@ -259,15 +273,13 @@ async fn spawn_worker(
         .map(|(k, v)| (OsString::from(k), OsString::from(v)));
     let env: Vec<(OsString, OsString)> = env.into_iter().chain(worker_env).collect();
 
-    let (liveliness_observer, liveliness_guard) = LivelinessGuard::create();
-
     let spawn_fut = spawn_via_forkserver(
         forkserver,
         OsString::from(args[0].clone()),
         args[1..].iter().map(OsString::from).collect(),
         env.clone(),
         root.clone(),
-        liveliness_observer,
+        process.cancellation_observer.dupe(),
         &std_redirects,
         &socket_path,
         graceful_shutdown_timeout_s,
@@ -277,7 +289,7 @@ async fn spawn_worker(
     let max_delay = Duration::from_millis(500);
     // Might want to make this configurable, and/or measure impact of worker initialization on critical path
     let timeout = Duration::from_mins(1);
-    let (channel, check_exit) = {
+    let (channel, check_exit, exited_guard) = {
         let socket_path = &socket_path;
 
         let connect = retrying(initial_delay, max_delay, timeout, move || {
@@ -297,50 +309,73 @@ async fn spawn_worker(
         match futures::future::select(connect, check_exit).await {
             futures::future::Either::Left((connection_result, check_exit)) => {
                 match connection_result {
-                    Ok(channel) => Ok((channel, check_exit)),
-                    Err(e) => Err(WorkerInitError::ConnectionTimeout(
-                        timeout.as_secs_f64(),
-                        e.to_string(),
-                    )),
-                }
-            }
-            futures::future::Either::Right((command_result, _)) => Err(match command_result {
-                Ok(GatherOutputStatus::SpawnFailed(e)) => WorkerInitError::SpawnFailed(e),
-                Ok(GatherOutputStatus::Finished { exit_code, .. }) => {
-                    let stdout = fs_util::read_to_string(&std_redirects.stdout)
-                        .categorize_internal()
-                        .map_err(|e| WorkerInitError::InternalError(e.into()))?;
-                    let stderr = fs_util::read_to_string(&std_redirects.stderr)
-                        .categorize_internal()
-                        .map_err(|e| WorkerInitError::InternalError(e.into()))?;
-                    WorkerInitError::EarlyExit {
-                        exit_code: Some(exit_code),
-                        stdout,
-                        stderr,
+                    Ok(channel) => Ok((channel, check_exit, exited_guard)),
+                    Err(e) => {
+                        // The forkserver request is still live, so the exit guard must be held
+                        // until it confirms process-group shutdown and socket cleanup.
+                        process.cancel();
+                        tokio::spawn(async move {
+                            drop(check_exit.await);
+                            drop(exited_guard);
+                        });
+                        Err(WorkerInitError::ConnectionTimeout(
+                            timeout.as_secs_f64(),
+                            e.to_string(),
+                        ))
                     }
                 }
-                Ok(GatherOutputStatus::Cancelled | GatherOutputStatus::TimedOut(_)) => {
-                    WorkerInitError::InternalError(buck2_error!(
-                        buck2_error::ErrorTag::WorkerCancelled,
-                        "Worker cancelled by buck"
-                    ))
+            }
+            futures::future::Either::Right((command_result, _)) => {
+                if command_result.is_ok() {
+                    // `check_exit` completing with a status includes socket cleanup, so the
+                    // process really is gone. An `Err` is a forkserver RPC failure, which says
+                    // nothing about the process, so its guard is left to the task below.
+                    drop(exited_guard);
                 }
-                Err(e) => WorkerInitError::InternalError(e),
-            }),
+                Err(match command_result {
+                    Ok(GatherOutputStatus::SpawnFailed(e)) => WorkerInitError::SpawnFailed(e),
+                    Ok(GatherOutputStatus::Finished { exit_code, .. }) => {
+                        let stdout = fs_util::read_to_string(&std_redirects.stdout)
+                            .categorize_internal()
+                            .map_err(|e| WorkerInitError::InternalError(e.into()))?;
+                        let stderr = fs_util::read_to_string(&std_redirects.stderr)
+                            .categorize_internal()
+                            .map_err(|e| WorkerInitError::InternalError(e.into()))?;
+                        WorkerInitError::EarlyExit {
+                            exit_code: Some(exit_code),
+                            stdout,
+                            stderr,
+                        }
+                    }
+                    Ok(GatherOutputStatus::Cancelled | GatherOutputStatus::TimedOut(_)) => {
+                        WorkerInitError::InternalError(buck2_error!(
+                            buck2_error::ErrorTag::WorkerCancelled,
+                            "Worker cancelled by buck"
+                        ))
+                    }
+                    Err(e) => WorkerInitError::InternalError(e),
+                })
+            }
         }?
     };
 
-    let (child_exited_observer, child_exited_guard) = LivelinessGuard::create();
+    let child_exited_observer = process.exited_observer.dupe();
     tokio::spawn(async move {
         drop(check_exit.await);
-        drop(child_exited_guard);
+        drop(exited_guard);
     });
 
     tracing::info!("Connected to socket for spawned worker: {}", socket_path);
     let client = if streaming {
-        WorkerClient::stream(channel)
-            .await
-            .map_err(|e| WorkerInitError::SpawnFailed(e.to_string()))?
+        match WorkerClient::stream(channel).await {
+            Ok(client) => client,
+            Err(e) => {
+                // The worker is running but unusable, and the pool entry that owns its
+                // cancellation handle is never handed out on this path.
+                process.cancel();
+                return Err(WorkerInitError::SpawnFailed(e.to_string()));
+            }
+        }
     } else {
         WorkerClient::single(channel)
     };
@@ -349,14 +384,49 @@ async fn spawn_worker(
         client,
         child_exited_observer,
         std_redirects,
-        liveliness_guard,
     ))
 }
 
 type WorkerFuture = Shared<BoxFuture<'static, Result<Arc<WorkerHandle>, Arc<WorkerInitError>>>>;
 
+struct WorkerProcess {
+    cancellation_guard: parking_lot::Mutex<Option<LivelinessGuard>>,
+    cancellation_observer: Arc<dyn LivelinessObserver>,
+    exited_observer: Arc<dyn LivelinessObserver>,
+}
+
+impl WorkerProcess {
+    fn new() -> (Arc<Self>, LivelinessGuard) {
+        let (cancellation_observer, cancellation_guard) = LivelinessGuard::create();
+        let (exited_observer, exited_guard) = LivelinessGuard::create();
+        (
+            Arc::new(Self {
+                cancellation_guard: parking_lot::Mutex::new(Some(cancellation_guard)),
+                cancellation_observer,
+                exited_observer,
+            }),
+            exited_guard,
+        )
+    }
+
+    fn cancel(&self) {
+        self.cancellation_guard.lock().take();
+    }
+}
+
+struct WorkerEntry {
+    worker: WorkerFuture,
+    process: Arc<WorkerProcess>,
+}
+
+enum WorkerPoolState {
+    Running(StdBuckHashMap<WorkerId, WorkerEntry>),
+    /// Resolves once the forkserver has confirmed exit and socket cleanup for every worker.
+    Stopped(Shared<BoxFuture<'static, ()>>),
+}
+
 pub struct WorkerPool {
-    workers: Arc<parking_lot::Mutex<StdBuckHashMap<WorkerId, WorkerFuture>>>,
+    state: parking_lot::Mutex<WorkerPoolState>,
     brokers: Arc<parking_lot::Mutex<StdBuckHashMap<WorkerId, Arc<HostSharingBroker>>>>,
     graceful_shutdown_timeout_s: Option<u32>,
 }
@@ -365,7 +435,7 @@ impl WorkerPool {
     pub fn new(graceful_shutdown_timeout_s: Option<u32>) -> WorkerPool {
         tracing::info!("Creating new WorkerPool");
         WorkerPool {
-            workers: Arc::new(parking_lot::Mutex::new(StdBuckHashMap::default())),
+            state: parking_lot::Mutex::new(WorkerPoolState::Running(StdBuckHashMap::default())),
             brokers: Arc::new(parking_lot::Mutex::new(StdBuckHashMap::default())),
             graceful_shutdown_timeout_s,
         }
@@ -394,39 +464,107 @@ impl WorkerPool {
         forkserver: ForkserverAccess,
         dispatcher: EventDispatcher,
     ) -> (bool, WorkerFuture) {
-        let mut workers = self.workers.lock();
-        if let Some(worker_fut) = workers.get(&worker_spec.id) {
-            (false, worker_fut.clone())
-        } else {
-            let worker_id = worker_spec.id;
-            let args = worker_spec.exe.to_vec();
-            let streaming = worker_spec.streaming;
-            let root = root.clone();
-            let env: Vec<(OsString, OsString)> = env.into_iter().collect();
-            let graceful_shutdown_timeout_s = self.graceful_shutdown_timeout_s;
-            let fut = async move {
-                match spawn_worker(
-                    worker_id,
-                    args,
-                    env,
-                    streaming,
-                    &root,
-                    forkserver,
-                    dispatcher,
-                    graceful_shutdown_timeout_s,
-                )
-                .await
-                {
-                    Ok(worker) => Ok(Arc::new(worker)),
-                    Err(e) => Err(Arc::new(e)),
+        let mut state = self.state.lock();
+        let WorkerPoolState::Running(workers) = &mut *state else {
+            return (
+                false,
+                futures::future::ready(Err(Arc::new(WorkerInitError::PoolStopped)))
+                    .boxed()
+                    .shared(),
+            );
+        };
+        if let Some(entry) = workers.get(&worker_spec.id) {
+            return (false, entry.worker.clone());
+        }
+
+        let worker_id = worker_spec.id;
+        let args = worker_spec.exe.to_vec();
+        let streaming = worker_spec.streaming;
+        let root = root.clone();
+        let env: Vec<(OsString, OsString)> = env.into_iter().collect();
+        let graceful_shutdown_timeout_s = self.graceful_shutdown_timeout_s;
+        let (process, exited_guard) = WorkerProcess::new();
+        let spawn_process = process.dupe();
+        // Initialization runs on its own task rather than inside the shared future: `exited_guard`
+        // lives in that future, so with a lazy `Shared` a shutdown that dropped the last clone
+        // would release the guard without the process having exited.
+        let task = tokio::spawn(async move {
+            spawn_worker(
+                worker_id,
+                args,
+                env,
+                streaming,
+                &root,
+                forkserver,
+                dispatcher,
+                graceful_shutdown_timeout_s,
+                spawn_process,
+                exited_guard,
+            )
+            .await
+        });
+        let fut = async move {
+            match task.await {
+                Ok(Ok(worker)) => Ok(Arc::new(worker)),
+                Ok(Err(e)) => Err(Arc::new(e)),
+                Err(e) => Err(Arc::new(WorkerInitError::InternalError(e.into()))),
+            }
+        }
+        .boxed()
+        .shared();
+
+        workers.insert(
+            worker_id,
+            WorkerEntry {
+                worker: fut.clone(),
+                process,
+            },
+        );
+        (true, fut)
+    }
+
+    /// Waits until the forkserver has confirmed process exit and completed socket cleanup. The
+    /// shutdown task is detached, so cancelling this await cannot cancel worker cleanup.
+    pub async fn shutdown_and_wait(&self) {
+        let stopped = {
+            let mut state = self.state.lock();
+            match &mut *state {
+                WorkerPoolState::Stopped(stopped) => stopped.clone(),
+                WorkerPoolState::Running(workers) => {
+                    let workers = std::mem::take(workers);
+                    let timeout = Duration::from_secs(u64::from(
+                        self.graceful_shutdown_timeout_s.unwrap_or(0),
+                    )) + WORKER_EXIT_CONFIRMATION_SLACK;
+                    let task = tokio::spawn(async move {
+                        let processes = workers
+                            .into_values()
+                            .map(|entry| entry.process)
+                            .collect::<Vec<_>>();
+                        for process in &processes {
+                            process.cancel();
+                        }
+                        let exits = futures::future::join_all(
+                            processes
+                                .iter()
+                                .map(|process| process.exited_observer.while_alive()),
+                        );
+                        // A process that cannot be reaped at all would otherwise block every
+                        // later command forever.
+                        if tokio::time::timeout(timeout, exits).await.is_err() {
+                            tracing::warn!(
+                                "Timed out confirming persistent worker exit after {:?}",
+                                timeout
+                            );
+                        }
+                    });
+                    let stopped = task.map(|_ignored| ()).boxed().shared();
+                    *state = WorkerPoolState::Stopped(stopped.clone());
+                    stopped
                 }
             }
-            .boxed()
-            .shared();
+        };
 
-            workers.insert(worker_id, fut.clone());
-            (true, fut)
-        }
+        stopped.await;
     }
 }
 
@@ -569,7 +707,6 @@ pub struct WorkerHandle {
     client: WorkerClient,
     child_exited_observer: Arc<dyn LivelinessObserver>,
     std_redirects: StdRedirectPaths,
-    _liveliness_guard: LivelinessGuard,
 }
 
 impl WorkerHandle {
@@ -577,13 +714,11 @@ impl WorkerHandle {
         client: WorkerClient,
         child_exited_observer: Arc<dyn LivelinessObserver>,
         std_redirects: StdRedirectPaths,
-        liveliness_guard: LivelinessGuard,
     ) -> Self {
         Self {
             client,
             child_exited_observer,
             std_redirects,
-            _liveliness_guard: liveliness_guard,
         }
     }
 }
@@ -687,7 +822,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
+    use buck2_execute::execute::request::WorkerId;
     use buck2_worker_proto::ExecuteCommand;
     use buck2_worker_proto::ExecuteEvent;
     use buck2_worker_proto::ExecuteResponse;
@@ -700,7 +837,52 @@ mod tests {
     use tonic::transport::Channel;
     use tonic::transport::Server;
 
-    use super::WorkerClient;
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_is_cancellation_shielded_and_waits_for_process_exit() {
+        let pool = Arc::new(WorkerPool::new(None));
+        let (process, exited_guard) = WorkerProcess::new();
+        let worker = futures::future::ready(Err(Arc::new(WorkerInitError::PoolStopped)))
+            .boxed()
+            .shared();
+        {
+            let mut state = pool.state.lock();
+            let WorkerPoolState::Running(workers) = &mut *state else {
+                panic!("new worker pool is not running");
+            };
+            workers.insert(
+                WorkerId(1),
+                WorkerEntry {
+                    worker,
+                    process: process.dupe(),
+                },
+            );
+        }
+
+        let shutdown = tokio::spawn({
+            let pool = pool.dupe();
+            async move { pool.shutdown_and_wait().await }
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            process.cancellation_observer.while_alive(),
+        )
+        .await
+        .expect("shutdown did not cancel the worker process");
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown returned before process exit"
+        );
+        assert!(matches!(*pool.state.lock(), WorkerPoolState::Stopped(_)));
+
+        shutdown.abort();
+        drop(exited_guard);
+        tokio::time::timeout(Duration::from_secs(1), pool.shutdown_and_wait())
+            .await
+            .expect("detached shutdown did not complete");
+    }
 
     struct MockWorker {
         attempts: Arc<AtomicU32>,

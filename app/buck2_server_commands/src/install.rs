@@ -35,6 +35,7 @@ use buck2_build_api::interpreter::rule_defs::provider::builtin::run_info::Frozen
 use buck2_build_api::materialize::HasMaterializationQueueTracker;
 use buck2_build_api::materialize::MaterializationAndUploadContext;
 use buck2_build_api::materialize::materialize_and_upload_artifact_group;
+use buck2_build_api::materialize::prepare_materialized_artifact_group_values_for_local_consumption;
 use buck2_build_api::validation::validation_impl::VALIDATION_IMPL;
 use buck2_cli_proto::InstallRequest;
 use buck2_cli_proto::InstallResponse;
@@ -934,6 +935,12 @@ async fn build_launch_installer(
             })
             .await
             .buck_error_context("Failed to build installer")?;
+
+        // The installer is spawned directly on the host, so its source arguments need the same view
+        // preparation as command-executor actions.
+        for (_, values) in &ensured_inputs {
+            prepare_materialized_artifact_group_values_for_local_consumption(ctx, values).await?;
+        }
 
         // Produce arguments for local platform.
         let path_separator = if cfg!(windows) {
