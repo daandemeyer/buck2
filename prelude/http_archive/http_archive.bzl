@@ -12,22 +12,11 @@ load("@prelude//decls:remote_common.bzl", "remote_common")
 load("@prelude//utils:expect.bzl", "expect")
 load("@prelude//utils:materialization_test.bzl", "materialization_test")
 load("@prelude//utils:utils.bzl", "value_or")
-load(":exec_deps.bzl", "HttpArchiveExecDeps")
 load(":unarchive.bzl", "archive_type", "unarchive")
 
 def http_archive_impl(ctx: AnalysisContext) -> list[Provider]:
     expect(len(ctx.attrs.urls) == 1, "multiple `urls` not supported: {}".format(ctx.attrs.urls))
     expect(len(ctx.attrs.vpnless_urls) < 2, "multiple `vpnless_urls` not supported: {}".format(ctx.attrs.vpnless_urls))
-
-    # The HTTP download is local so it makes little sense to run actions
-    # remotely, unless we can defer them. We'll be able to defer if we provide
-    # a digest that the daemon's digest config natively supports.
-    digest_config = ctx.actions.digest_config()
-    prefer_local = True
-    if ctx.attrs.sha1 != None and digest_config.allows_sha1():
-        prefer_local = False
-    elif ctx.attrs.sha256 != None and digest_config.allows_sha256():
-        prefer_local = False
 
     ext_type = archive_type(ctx.attrs.urls[0], ctx.attrs.type)
 
@@ -53,8 +42,6 @@ def http_archive_impl(ctx: AnalysisContext) -> list[Provider]:
         excludes = ctx.attrs.excludes,
         strip_prefix = ctx.attrs.strip_prefix,
         sub_targets = ctx.attrs.sub_targets,
-        exec_deps = ctx.attrs.exec_deps[HttpArchiveExecDeps],
-        prefer_local = prefer_local,
         has_content_based_path = ctx.attrs.has_content_based_path,
     )
 

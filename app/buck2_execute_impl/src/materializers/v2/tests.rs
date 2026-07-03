@@ -1341,6 +1341,7 @@ async fn test_a_copy_of_buck_out_content_is_nothing_to_the_core() -> buck2_error
                 dest.clone(),
                 leaf(&file("S")),
                 None,
+                false,
             )],
         )
         .await?;
@@ -1373,7 +1374,13 @@ async fn test_a_copy_from_outside_buck_out_is_refused() -> buck2_error::Result<(
             dm.declare_copy_impl(
                 dest.clone(),
                 file("B"),
-                vec![CopiedArtifact::new(src, dest, leaf(&file("B")), None)],
+                vec![CopiedArtifact::new(
+                    src,
+                    dest,
+                    leaf(&file("B")),
+                    None,
+                    false,
+                )],
             )
             .await
             .is_err()

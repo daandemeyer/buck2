@@ -9,7 +9,6 @@
 load("@prelude//decls:remote_common.bzl", "remote_common")
 load("@prelude//user:rule_spec.bzl", "RuleRegistrationSpec")
 load("@prelude//utils:utils.bzl", "value_or")
-load(":exec_deps.bzl", "HttpArchiveExecDeps")
 load(":unarchive.bzl", "archive_type", "unarchive")
 
 # Buck v2 doesn't support directories as source inputs, while v1 allows that.
@@ -28,9 +27,6 @@ def _impl(ctx: AnalysisContext) -> list[Provider]:
         excludes = ctx.attrs.excludes,
         strip_prefix = ctx.attrs.strip_prefix,
         sub_targets = ctx.attrs.sub_targets,
-        exec_deps = ctx.attrs.exec_deps[HttpArchiveExecDeps],
-        # no need -- no http involved
-        prefer_local = False,
     )
 
     return [

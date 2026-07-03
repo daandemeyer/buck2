@@ -713,9 +713,7 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
         // This materializer keeps `dest` as a copy of `src` rather than moving the content, and
         // makes the copy right away so that it happens while the caller still guarantees `src`
         // is intact. Moving would need writers serialized against readers of `dest`, which
-        // nothing here provides; that is a property of the rewritten materializer. Leaving `src`
-        // behind is harmless: nothing reads it until the action that owns it runs again, and
-        // that run deletes it first.
+        // nothing here provides; that is a property of the rewritten materializer.
         self.declare_existing_impl(
             lease,
             vec![DeclareArtifactPayload {
@@ -734,6 +732,8 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
                     dest.clone(),
                     value.entry().dupe().map_dir(|d| d.as_immutable()),
                     None,
+                    // The action set these, and its output should not change by being relocated.
+                    true,
                 )],
             )
             .await?;

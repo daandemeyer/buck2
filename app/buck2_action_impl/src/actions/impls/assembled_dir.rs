@@ -324,12 +324,15 @@ impl Action for AssembledDirAction {
             match copy {
                 CopyMode::Copy {
                     executable_bit_override,
+                    relative_symlinks,
+                    ..
                 } => {
                     let dest_entry = builder.add_copied(
                         value,
                         src.as_ref(),
                         temp_dest.as_ref(),
                         *executable_bit_override,
+                        *relative_symlinks,
                     )?;
                     if src_artifact.is_source() {
                         for (path, metadata) in cas_probe::walk_files(&dest_entry) {
@@ -398,6 +401,7 @@ impl Action for AssembledDirAction {
                         dest: actual_output.join(path),
                         value: ArtifactValue::file(metadata.dupe()),
                         executable_bit_override: *executable_bit_override,
+                        preserve_mtimes: false,
                     }
                 })
                 .collect();
@@ -423,6 +427,7 @@ impl Action for AssembledDirAction {
                             actual_output.join(relative_dest),
                             dest_entry,
                             executable_bit_override,
+                            false,
                         )
                     },
                 )

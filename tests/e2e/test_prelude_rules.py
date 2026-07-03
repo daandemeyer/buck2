@@ -74,12 +74,12 @@ class PreludeRulesTest(BuckTestCase):
 
     # prelude/http_archive/unarchive.bzl `unarchive`
     @buck_test(inplace=False, skip_for_os=["windows", "darwin"])
-    async def test_excluded_names_are_read_by_tar_as_globs(self, buck: Buck) -> None:
-        # The exclusion list holds the member names that matched the `excludes`
-        # regexes, but tar reads every `--exclude-from` line as a glob: `[id].js`
-        # keeps the excluded file and drops `i.js` and `d.js` instead.
+    async def test_excludes_match_member_names_as_regexes(self, buck: Buck) -> None:
+        # `excludes` holds regexes that are matched against the member names, so
+        # only `[id].js` is excluded, even though its name contains glob characters.
         out = await _output(buck, "root//archive:unpacked")
         assert sorted(p.name for p in (out / "pages").iterdir()) == [
-            "[id].js",
+            "d.js",
+            "i.js",
             "keep.js",
         ]

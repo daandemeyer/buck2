@@ -52,6 +52,24 @@ tenant_value = rule(
     attrs = {"value": attrs.string()},
 )
 
+def _nested_buck_impl(_ctx: AnalysisContext) -> list[Provider]:
+    return [
+        DefaultInfo(),
+        RunInfo(args = cmd_args(
+            "fbpython",
+            "-c",
+            "import os, subprocess, sys; " +
+            "sys.exit(subprocess.run([os.environ['NESTED_BUCK2'], '--isolation-dir', " +
+            "os.environ['NESTED_ISOLATION_DIR'], 'targets', '--no-buckd', 'root//:']).returncode)",
+        )),
+    ]
+
+# Runs a nested buck2 invocation from a `buck2 run` target, as its own fresh daemon.
+nested_buck = rule(
+    impl = _nested_buck_impl,
+    attrs = {},
+)
+
 def _nested_run_impl(ctx: AnalysisContext) -> list[Provider]:
     script = ctx.actions.write(
         "nested_run.py",
@@ -75,4 +93,16 @@ nested_run = rule(
         "buck2_path": attrs.string(),
         "isolation_dir": attrs.string(),
     },
+)
+
+def _pwd_run_impl(_ctx: AnalysisContext) -> list[Provider]:
+    return [
+        DefaultInfo(),
+        RunInfo(args = cmd_args("fbpython", "-c", "import os; print(os.getcwd())")),
+    ]
+
+# Prints the working directory a `buck2 run` target starts in.
+pwd_run = rule(
+    impl = _pwd_run_impl,
+    attrs = {},
 )

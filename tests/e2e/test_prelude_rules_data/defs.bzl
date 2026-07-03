@@ -7,7 +7,6 @@
 # above-listed licenses.
 
 load("@prelude//cxx:cxx_sources.bzl", "get_srcs_with_flags")
-load("@prelude//http_archive:exec_deps.bzl", "HttpArchiveExecDeps")
 load("@prelude//http_archive:unarchive.bzl", "unarchive")
 
 def _value_impl(_ctx):
@@ -91,8 +90,6 @@ def _unpack_impl(ctx):
         ext_type = "tar.gz",
         excludes = ctx.attrs.excludes,
         strip_prefix = "top",
-        exec_deps = ctx.attrs.exec_deps[HttpArchiveExecDeps],
-        prefer_local = True,
         sub_targets = [],
     )
     return [DefaultInfo(default_output = out)]
@@ -103,6 +100,5 @@ unpack = rule(
     attrs = {
         "archive": attrs.source(),
         "excludes": attrs.list(attrs.string(), default = []),
-        "exec_deps": attrs.exec_dep(providers = [HttpArchiveExecDeps], default = "prelude//http_archive/tools:exec_deps"),
     },
 )
