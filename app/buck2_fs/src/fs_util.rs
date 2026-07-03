@@ -482,6 +482,31 @@ pub fn symlink_metadata<P: AsRef<AbsPath>>(path: P) -> Result<fs::Metadata, IoEr
         .map_err(|e| IoError::new_with_path("symlink_metadata", path, e))
 }
 
+#[cfg(windows)]
+pub fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+pub fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+/// `metadata` must come from [`symlink_metadata`]: a followed stat reports a
+/// symlink-to-directory as a plain directory, silently defeating this check.
+pub fn is_plain_directory(metadata: &fs::Metadata) -> bool {
+    metadata.is_dir() && !is_reparse_point(metadata)
+}
+
+/// `metadata` must be unfollowed, as for [`is_plain_directory`].
+pub fn is_plain_file(metadata: &fs::Metadata) -> bool {
+    metadata.is_file() && !is_reparse_point(metadata)
+}
+
 pub fn set_permissions<P: AsRef<AbsPath>>(path: P, perm: fs::Permissions) -> Result<(), IoError> {
     let _guard = IoCounterKey::Chmod.guard();
     with_retries(|| fs::set_permissions(path.as_ref().as_maybe_relativized(), perm.clone()))

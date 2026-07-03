@@ -193,7 +193,10 @@ impl<'a, 'v> Serialize for SerializeValue<'a, 'v> {
                         let p = match x {
                             JsonArtifact::ValueAsInputArtifactLike(x) => {
                                 let art = err(x.0.get_bound_artifact())?;
-                                err(art.resolve_path(fs.fs(), self.artifact_path_mapping.get(&art)))?
+                                err(art.resolve_path_for_execution(
+                                    fs.fs(),
+                                    self.artifact_path_mapping.get(&art),
+                                ))?
                             }
                             JsonArtifact::StarlarkOutputArtifact(x) => {
                                 let art = match x.unpack() {
@@ -201,7 +204,7 @@ impl<'a, 'v> Serialize for SerializeValue<'a, 'v> {
                                     Either::Right(x) => x.inner().artifact(),
                                 };
 
-                                err(art.resolve_path(
+                                err(art.resolve_path_for_execution(
                                     fs.fs(),
                                     Some(&ContentBasedPathHash::for_output_artifact()),
                                 ))?

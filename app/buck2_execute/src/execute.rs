@@ -13,6 +13,7 @@ pub mod action_digest_and_blobs;
 pub mod blobs;
 pub mod blocking;
 pub mod cache_uploader;
+pub mod cell_execution_view;
 pub mod claim;
 pub mod clean_output_paths;
 pub mod command_executor;
@@ -28,6 +29,7 @@ pub mod request;
 pub mod result;
 pub mod target;
 pub mod testing_dry_run;
+pub mod testing_source_input;
 
 use std::future::Future;
 

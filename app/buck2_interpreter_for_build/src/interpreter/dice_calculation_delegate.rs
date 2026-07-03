@@ -22,6 +22,7 @@ use buck2_common::package_boundary::HasPackageBoundaryExceptions;
 use buck2_common::package_listing::dice::DicePackageListingResolver;
 use buck2_common::package_listing::listing::PackageListing;
 use buck2_core::build_file_path::BuildFilePath;
+use buck2_core::bzl::LoadFormat;
 use buck2_core::cells::build_file_cell::BuildFileCell;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_core::package::PackageLabel;
@@ -43,6 +44,7 @@ use buck2_interpreter::paths::module::StarlarkModulePath;
 use buck2_interpreter::paths::package::PackageFilePath;
 use buck2_interpreter::paths::path::OwnedStarlarkPath;
 use buck2_interpreter::paths::path::StarlarkPath;
+use buck2_interpreter::toml::toml_value_to_json;
 use buck2_node::nodes::eval_result::EvaluationResult;
 use buck2_node::super_package::SuperPackage;
 use buck2_util::time_span::TimeSpan;
@@ -70,25 +72,21 @@ use crate::interpreter::interpreter_for_dir::ParseData;
 use crate::interpreter::interpreter_for_dir::ParseResult;
 use crate::super_package::package_value::SuperPackageValuesImpl;
 
-fn toml_value_to_json(value: toml::Value) -> serde_json::Value {
-    match value {
-        toml::Value::String(s) => serde_json::Value::String(s),
-        toml::Value::Integer(i) => serde_json::Value::Number(i.into()),
-        toml::Value::Float(f) => match serde_json::Number::from_f64(f) {
-            Some(n) => serde_json::Value::Number(n),
-            None => serde_json::Value::Null,
-        },
-        toml::Value::Boolean(b) => serde_json::Value::Bool(b),
-        toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
-        toml::Value::Array(arr) => {
-            serde_json::Value::Array(arr.into_iter().map(toml_value_to_json).collect())
-        }
-        toml::Value::Table(table) => serde_json::Value::Object(
-            table
-                .into_iter()
-                .map(|(k, v)| (k, toml_value_to_json(v)))
-                .collect(),
-        ),
+/// Context for a load-time parse failure. A `load()` failure fails the whole package, so the
+/// message has to say which parser ran and, when the extension does not imply it, where that
+/// choice came from.
+fn parse_error_context(starlark_file: StarlarkModulePath<'_>, format: LoadFormat) -> String {
+    let explicit = match starlark_file {
+        StarlarkModulePath::LoadFile(path)
+        | StarlarkModulePath::JsonFile(path)
+        | StarlarkModulePath::TomlFile(path) => path.has_explicit_format(),
+        StarlarkModulePath::BxlFile(_) => false,
+    };
+    let path = starlark_file.path();
+    if explicit {
+        format!("Parsing `{path}` as {format}, as requested by `?format={format}`")
+    } else {
+        format!("Parsing `{path}` as {format}")
     }
 }
 
@@ -284,7 +282,7 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
             .with_package_context_information(path.path().to_string())?;
 
         let value: serde_json::Value = serde_json::from_str(&contents)
-            .with_buck_error_context(|| format!("Parsing {path}"))?;
+            .with_buck_error_context(|| parse_error_context(starlark_file, LoadFormat::Json))?;
 
         // patternlint-disable-next-line buck2-no-starlark-module: We expect these to be small + simple
         let frozen = Module::with_temp_heap(|module| {
@@ -311,8 +309,8 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
             .await
             .with_package_context_information(path.path().to_string())?;
 
-        let value: toml::Value =
-            toml::from_str(&contents).with_buck_error_context(|| format!("Parsing {path}"))?;
+        let value: toml::Value = toml::from_str(&contents)
+            .with_buck_error_context(|| parse_error_context(starlark_file, LoadFormat::Toml))?;
         let json_value = toml_value_to_json(value);
 
         // patternlint-disable-next-line buck2-no-starlark-module: We expect these to be small + simple

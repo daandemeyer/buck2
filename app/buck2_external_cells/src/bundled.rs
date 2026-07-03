@@ -27,6 +27,7 @@ use buck2_core::cells::name::CellName;
 use buck2_core::cells::paths::CellRelativePath;
 use buck2_core::cells::paths::CellRelativePathBuf;
 use buck2_core::directory_digest::DirectoryDigest;
+use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_directory::directory::builder::DirectoryBuilder;
 use buck2_directory::directory::directory::Directory;
@@ -393,6 +394,14 @@ async fn declare_all_source_artifacts(
     let mut requests = Vec::new();
     let artifact_fs = ctx.get_artifact_fs().await?;
     let buck_out_resolver = artifact_fs.buck_out_path_resolver();
+
+    if artifact_fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
+        // Bundled files stay lazily declared, but the execution view has to point a directory link
+        // at the physical root before any individual file is materialized.
+        let physical_root = artifact_fs.resolve_cell_source_root_physical(cell_name)?;
+        fs_util::create_dir_all(artifact_fs.fs().resolve(&physical_root))
+            .buck_error_context("Failed to create bundled external cell storage root")?;
+    }
 
     for (path, entry) in ops.dir.unordered_walk_leaves().with_paths() {
         let path = buck_out_resolver.resolve_external_cell_source(

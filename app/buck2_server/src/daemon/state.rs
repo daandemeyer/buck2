@@ -35,6 +35,7 @@ use buck2_common::sqlite::sqlite_db::SqliteIdentity;
 use buck2_core::buck2_env;
 use buck2_core::cells::name::CellName;
 use buck2_core::facebook_only;
+use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::is_open_source;
@@ -53,9 +54,11 @@ use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::blocking::BuckBlockingExecutor;
 use buck2_execute::execute::blocking::DirectIoExecutor;
+use buck2_execute::execute::cell_execution_view::CellExecutionView;
 use buck2_execute::materialize::materializer::MaterializationMethod;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::re::manager::ReConnectionManager;
+use buck2_execute_impl::executors::cell_execution_view::CanonicalCellExecutionView;
 use buck2_execute_impl::executors::local::ForkserverAccess;
 use buck2_execute_impl::materializers::deferred::AccessTimesUpdates;
 use buck2_execute_impl::materializers::deferred::DeferredMaterializer;
@@ -226,6 +229,12 @@ pub struct DaemonStateData {
 
     /// Running more than one automatic idle page-out during this daemon's lifetime.
     pub(crate) allow_multiple_idle_page_outs: bool,
+
+    pub cell_source_path_mode: CellSourcePathMode,
+
+    /// Canonical source roots published during this daemon lifetime.
+    #[allocative(skip)]
+    pub cell_execution_view: Arc<dyn CellExecutionView>,
 }
 
 impl DaemonStateData {
@@ -741,6 +750,10 @@ impl DaemonState {
             // about (potentially kicking off an initial crawl).
             // disable the eager spawn for watchman until we fix dice commit to avoid a panic TODO(bobyf)
             // tokio::task::spawn(watchman_query.sync());
+            tracing::info!(
+                cell_execution_paths = %init_ctx.daemon_startup_config.cell_execution_paths,
+                "Configured cell execution path mode"
+            );
             Ok(Arc::new(DaemonStateData {
                 dice_manager: ConcurrencyHandler::new(dice),
                 file_watcher,
@@ -783,6 +796,8 @@ impl DaemonState {
                     .hydration
                     .as_ref()
                     .is_some_and(|h| h.allow_multiple_idle_page_outs),
+                cell_source_path_mode: init_ctx.daemon_startup_config.cell_execution_paths,
+                cell_execution_view: Arc::new(CanonicalCellExecutionView::new()),
             }))
         };
         let daemon_listener_span = tracing::Span::current();

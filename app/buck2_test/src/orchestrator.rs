@@ -58,7 +58,8 @@ use buck2_common::legacy_configs::dice::HasLegacyConfigs;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
 use buck2_common::liveliness_observer::LivelinessObserver;
 use buck2_common::local_resource_state::LocalResourceState;
-use buck2_core::cells::cell_root_path::CellRootPathBuf;
+use buck2_core::cells::cell_path::CellPath;
+use buck2_core::cells::paths::CellRelativePathBuf;
 use buck2_core::execution_types::executor_config::CommandExecutorConfig;
 use buck2_core::execution_types::executor_config::CommandGenerationOptions;
 use buck2_core::execution_types::executor_config::Executor;
@@ -1055,7 +1056,9 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
             &fs,
             None,
             None,
-            None,
+            // This API hands the command to an external local runner, so it is local by
+            // construction; otherwise canonical cwd validation rejects it as remote-capable.
+            Some(ExecutorPreference::LocalRequired),
             vec![],
             worker,
             test_executor.re_dynamic_image(),
@@ -1074,6 +1077,14 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
             self.dice.global_data().get_digest_config(),
         )
         .await?;
+        // The normal local executor is bypassed here, so the view is published by hand, after
+        // every physical source leaf has been materialized.
+        test_executor
+            .executor()
+            .prepare_materialized_execution_view(
+                &execution_request,
+                materialized_inputs.view_requirements,
+            )?;
 
         prep_scratch_path(&materialized_inputs.scratch, &fs).await?;
 
@@ -1094,6 +1105,12 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
                 self.dice.global_data().get_digest_config(),
             )
             .await?;
+            test_executor
+                .executor()
+                .prepare_materialized_execution_view(
+                    &local_resource_setup_command.execution_request,
+                    materialized_inputs.view_requirements,
+                )?;
             let blocking_executor = self.dice.ctx().get_blocking_executor();
 
             prep_scratch_path(&materialized_inputs.scratch, &fs).await?;
@@ -1480,6 +1497,7 @@ impl BuckTestOrchestrator<'_> {
             remote_dep_file_cache_checker: _,
             cache_uploader,
             output_trees_download_config: _,
+            cell_execution_view,
         } = dice.get_command_executor_from_dice(executor_config).await?;
 
         let (cache_uploader, action_cache_checker) = match stage {
@@ -1505,6 +1523,7 @@ impl BuckTestOrchestrator<'_> {
             fs.clone(),
             executor_config.options,
             platform,
+            cell_execution_view,
         );
         Ok(executor)
     }
@@ -1529,6 +1548,7 @@ impl BuckTestOrchestrator<'_> {
             remote_dep_file_cache_checker: _,
             cache_uploader: _,
             output_trees_download_config: _,
+            cell_execution_view,
         } = dice
             .get_command_executor_from_dice(&executor_config)
             .await?;
@@ -1540,6 +1560,7 @@ impl BuckTestOrchestrator<'_> {
             fs.clone(),
             executor_config.options,
             platform,
+            cell_execution_view,
         );
         Ok(executor)
     }
@@ -1662,13 +1683,19 @@ impl BuckTestOrchestrator<'_> {
         let cwd;
         let (expanded_cmd, expanded_env, ensured_inputs, expanded_worker) = {
             cwd = if test_info.run_from_project_root() || opts.force_run_from_project_root {
-                CellRootPathBuf::new(ProjectRelativePathBuf::unchecked_new("".to_owned()))
+                ProjectRelativePathBuf::unchecked_new("".to_owned())
             } else {
                 supports_re = false;
                 // For compatibility with v1,
                 let cell_resolver = dice.get_cell_resolver().await?;
                 let cell = cell_resolver.get(test_target.target().pkg().cell_name())?;
-                cell.path().to_buf()
+                executor_fs.fs().resolve_cell_path_for_execution(
+                    CellPath::new(
+                        cell.name(),
+                        CellRelativePathBuf::unchecked_new(String::new()),
+                    )
+                    .as_ref(),
+                )?
             };
 
             let expander = Execute2RequestExpander {
@@ -1709,7 +1736,7 @@ impl BuckTestOrchestrator<'_> {
         }
 
         Ok(ExpandedTestExecutable {
-            cwd: cwd.as_project_relative_path().to_buf(),
+            cwd,
             cmd: expanded_cmd,
             env: expanded_env,
             ensured_inputs,
@@ -2541,6 +2568,7 @@ mod tests {
     use buck2_common::dice::data::testing::SetTestingIoProvider;
     use buck2_common::liveliness_observer::NoopLivelinessObserver;
     use buck2_core::cells::CellResolver;
+    use buck2_core::cells::cell_root_path::CellRootPathBuf;
     use buck2_core::cells::name::CellName;
     use buck2_core::configuration::data::ConfigurationData;
     use buck2_core::fs::project::ProjectRootTemp;

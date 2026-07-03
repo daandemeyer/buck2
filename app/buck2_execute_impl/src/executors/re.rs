@@ -17,13 +17,13 @@ use buck2_core::execution_types::executor_config::MetaInternalExtraParams;
 use buck2_core::execution_types::executor_config::ReGangWorker;
 use buck2_core::execution_types::executor_config::RemoteExecutorDependency;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
-use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::soft_error;
 use buck2_events::dispatch::span_async;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::execute::action_digest::ActionDigest;
 use buck2_execute::execute::blobs::ActionBlobs;
+use buck2_execute::execute::cell_execution_view::CellExecutionView;
 use buck2_execute::execute::kind::CommandExecutionKind;
 use buck2_execute::execute::kind::RemoteCommandExecutionDetails;
 use buck2_execute::execute::manager::CommandExecutionManager;
@@ -76,7 +76,6 @@ pub enum RemoteExecutorError {
 
 pub struct ReExecutor {
     pub artifact_fs: ArtifactFs,
-    pub project_fs: ProjectRoot,
     pub materializer: Arc<dyn Materializer>,
     pub incremental_db_state: Arc<IncrementalDbState>,
     pub re_client: ManagedRemoteExecutionClient,
@@ -94,6 +93,8 @@ pub struct ReExecutor {
     pub deduplicate_get_digests_ttl_calls: bool,
     pub output_trees_download_config: OutputTreesDownloadConfig,
     pub priority: Option<i32>,
+    /// Used only for failed-action input repro; ordinary remote execution touches no view.
+    pub cell_execution_view: Arc<dyn CellExecutionView>,
 }
 
 impl ReExecutor {
@@ -110,7 +111,7 @@ impl ReExecutor {
         let upload_response = span_async(buck2_data::ReUploadStart {}, async move {
             let res = re_client
                 .upload(
-                    &self.project_fs,
+                    &self.artifact_fs,
                     &self.materializer,
                     blobs,
                     ProjectRelativePath::empty(),
@@ -488,6 +489,7 @@ impl PreparedCommandExecutor for ReExecutor {
             self.materialize_failed_outputs,
             additional_message,
             &self.output_trees_download_config,
+            Some(&*self.cell_execution_view),
         )
         .boxed()
         .await;

@@ -21,6 +21,24 @@ copy_src = rule(
     },
 )
 
+def _run_source_impl(ctx):
+    return [
+        DefaultInfo(),
+        RunInfo(args = [
+            "fbpython",
+            "-c",
+            "import pathlib,sys;print(pathlib.Path(sys.argv[1]).read_text(),end='')",
+            ctx.attrs.src,
+        ]),
+    ]
+
+run_source = rule(
+    impl = _run_source_impl,
+    attrs = {
+        "src": attrs.source(),
+    },
+)
+
 def _nondeterministic_impl(ctx):
     out = ctx.actions.declare_output("out.txt", has_content_based_path = False)
     ctx.actions.run(
