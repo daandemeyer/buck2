@@ -632,6 +632,9 @@ pub struct DaemonStartupConfig {
     pub retained_event_logs: usize,
     pub macos_qos_class: Option<String>,
     pub daemon_idle_timeout_s: Option<u64>,
+    /// Whether paths may contain literal backslashes on platforms where a backslash is not a path
+    /// separator. Fixed for the daemon lifetime because it changes path-type invariants.
+    pub allow_backslashes_in_paths: bool,
     /// Pagable DICE storage settings, or `None` when paging is disabled.
     pub hydration: Option<HydrationConfig>,
 }
@@ -757,6 +760,12 @@ impl DaemonStartupConfig {
                 section: "buck2",
                 property: "daemon_idle_timeout_s",
             })?,
+            allow_backslashes_in_paths: config
+                .parse(BuckconfigKeyRef {
+                    section: "buck2",
+                    property: "allow_backslashes_in_paths",
+                })?
+                .unwrap_or(false),
             hydration: HydrationConfig::from_config(config, settings)?,
         })
     }
@@ -805,6 +814,7 @@ impl DaemonStartupConfig {
             retained_event_logs: DEFAULT_RETAINED_EVENT_LOGS,
             macos_qos_class: None,
             daemon_idle_timeout_s: None,
+            allow_backslashes_in_paths: false,
             hydration: None,
         }
     }
@@ -845,7 +855,6 @@ mod tests {
         assert_eq!(startup_config.daemon_idle_timeout_s, Some(10800));
         Ok(())
     }
-
     #[test]
     fn test_hydration_settings_enable_idle_page_out() -> buck2_error::Result<()> {
         let config = parse(&[("config", "")], "config")?;
@@ -978,6 +987,33 @@ mod tests {
         assert!(
             custom_hydration.page_out_on_idle,
             "The non-default scope must retain idle page-out for another daemon"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_allow_backslashes_in_paths() -> buck2_error::Result<()> {
+        let default = parse(&[("config", indoc!(r#""#))], "config")?;
+        assert!(
+            !DaemonStartupConfig::new(&default, &BuckSettings::empty(), false)?
+                .allow_backslashes_in_paths
+        );
+
+        let enabled = parse(
+            &[(
+                "config",
+                indoc!(
+                    r#"
+                    [buck2]
+                    allow_backslashes_in_paths = true
+                    "#
+                ),
+            )],
+            "config",
+        )?;
+        assert!(
+            DaemonStartupConfig::new(&enabled, &BuckSettings::empty(), false)?
+                .allow_backslashes_in_paths
         );
         Ok(())
     }
