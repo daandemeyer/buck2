@@ -217,3 +217,41 @@ fn test_dice_clear_doesnt_cause_inject_compute() {
         drop(fut.await);
     });
 }
+
+/// A panicking computation must terminate the key with an error rather than being reported as a
+/// cancellation. Cancellations are retried by starting a new generation, so treating a panic as one
+/// makes the key recompute, panic, and spin forever: the build appears to hang with no diagnostic.
+#[tokio::test]
+async fn test_panicking_key_reports_an_error_rather_than_retrying_forever() {
+    #[derive(
+        Clone, Copy, Dupe, Display, Debug, Eq, PartialEq, Hash, Allocative, Pagable
+    )]
+    #[display("{:?}", self)]
+    #[pagable_typetag(DiceKeyDyn)]
+    struct NeverInjected;
+
+    impl InjectedKey for NeverInjected {
+        type Value = u32;
+        fn value_serialize() -> impl dice::ValueSerialize<Value = Self::Value> {
+            dice::NoValueSerialize::<Self::Value>::new()
+        }
+        fn equality_behavior() -> EqualityBehavior<Self::Value> {
+            EqualityBehavior::Compare(|x, y| x == y)
+        }
+    }
+
+    let dice = Dice::builder().build(DetectCycles::Enabled);
+    let ctx = dice.updater().commit().await;
+
+    // `InjectedKey::compute` panics by construction, which is the case that motivated this: it is
+    // how a test or a caller learns it forgot to inject the key.
+    let result = ctx.compute(&NeverInjected).await;
+    assert!(
+        result.is_err(),
+        "requesting an un-injected key must resolve to an error, not hang"
+    );
+
+    // Requesting it again must also resolve rather than starting yet another doomed generation.
+    let again = ctx.compute(&NeverInjected).await;
+    assert!(again.is_err(), "the terminal state must stick");
+}
