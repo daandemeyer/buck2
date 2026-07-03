@@ -54,6 +54,7 @@ use buck2_execute::directory::ActionDirectoryEntry;
 use buck2_execute::directory::ActionDirectoryMember;
 use buck2_execute::directory::ActionSharedDirectory;
 use buck2_execute::execute::blocking::BlockingExecutor;
+use buck2_execute::materialize::download_cache::DownloadCache;
 use buck2_execute::materialize::materializer::ArtifactNotMaterializedReason;
 use buck2_execute::materialize::materializer::CasDownloadInfo;
 use buck2_execute::materialize::materializer::CasNotFoundError;
@@ -824,6 +825,7 @@ impl DeferredMaterializerAccessor<DefaultIoHandler> {
         sqlite_db: Option<MaterializerStateSqliteDb>,
         sqlite_state: Option<MaterializerState>,
         http_client: HttpClient,
+        download_cache: Option<Arc<DownloadCache>>,
         daemon_dispatcher: EventDispatcher,
     ) -> buck2_error::Result<Self> {
         Self::new_with_io(
@@ -834,6 +836,7 @@ impl DeferredMaterializerAccessor<DefaultIoHandler> {
                 re_client_manager,
                 io_executor,
                 http_client,
+                download_cache,
             )),
             configs,
             sqlite_db,

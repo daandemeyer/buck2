@@ -8,6 +8,7 @@
  * above-listed licenses.
  */
 
+pub mod download_cache;
 pub mod http;
 
 pub mod materializer;

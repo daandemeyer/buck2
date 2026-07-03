@@ -55,6 +55,8 @@ use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::blocking::BuckBlockingExecutor;
 use buck2_execute::execute::blocking::DirectIoExecutor;
+use buck2_execute::materialize::download_cache::DownloadCache;
+use buck2_execute::materialize::download_cache::DownloadCacheConfig;
 use buck2_execute::materialize::materializer::MaterializationMethod;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::re::manager::ReConnectionManager;
@@ -159,6 +161,9 @@ pub struct RepoState {
     /// e.g. making a HEAD request against the remote artifact to determine if
     /// it needs to be downloaded again).
     pub use_network_action_output_cache: bool,
+
+    /// Machine-wide store of `download_file` bytes, shared between projects.
+    pub download_cache: Option<Arc<DownloadCache>>,
 
     /// What buck2 state to store on disk, ex. materializer state on sqlite
     pub disk_state_options: DiskStateOptions,
@@ -665,6 +670,10 @@ impl DaemonState {
                 // but for now seems fine to drop events if scribe isn't enabled.
                 EventDispatcher::null()
             };
+            let download_cache =
+                DownloadCacheConfig::new(&init_ctx.daemon_startup_config.download_cache)?
+                    .map(DownloadCache::new)
+                    .inspect(|cache| cache.spawn_gc());
             let materializer = Self::create_materializer(
                 io.project_root().dupe(),
                 digest_config,
@@ -676,6 +685,7 @@ impl DaemonState {
                 materializer_db,
                 materializer_state,
                 http_client.dupe(),
+                download_cache.dupe(),
                 daemon_dispatcher.dupe(),
             )?;
 
@@ -826,6 +836,7 @@ impl DaemonState {
                 io,
                 materializer,
                 use_network_action_output_cache,
+                download_cache,
                 disk_state_options,
                 create_unhashed_outputs_lock,
                 materializer_state_identity,
@@ -907,6 +918,7 @@ impl DaemonState {
         materializer_db: Option<MaterializerStateSqliteDb>,
         materializer_state: Option<MaterializerState>,
         http_client: HttpClient,
+        download_cache: Option<Arc<DownloadCache>>,
         daemon_dispatcher: EventDispatcher,
     ) -> buck2_error::Result<Arc<dyn Materializer>> {
         match materializations {
@@ -921,6 +933,7 @@ impl DaemonState {
                     materializer_db,
                     materializer_state,
                     http_client,
+                    download_cache,
                     daemon_dispatcher,
                 )?))
             }
