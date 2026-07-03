@@ -153,7 +153,13 @@ fn get_record(materialization: &buck2_data::MaterializationEnd) -> Record {
     {
         Some(buck2_data::MaterializationMethod::CasDownload) => "cas",
         Some(buck2_data::MaterializationMethod::LocalCopy) => "copy",
-        Some(buck2_data::MaterializationMethod::HttpDownload) => "http",
+        Some(buck2_data::MaterializationMethod::HttpDownload) => {
+            if materialization.from_download_cache.unwrap_or(false) {
+                "download-cache"
+            } else {
+                "http"
+            }
+        }
         Some(buck2_data::MaterializationMethod::Write) => "write",
         _ => "<unknown>",
     };
@@ -235,5 +241,32 @@ impl BuckSubcommand for WhatMaterializedCommand {
         })
         .await?;
         ExitResult::success()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn http_materialization(from_download_cache: Option<bool>) -> buck2_data::MaterializationEnd {
+        buck2_data::MaterializationEnd {
+            method: Some(buck2_data::MaterializationMethod::HttpDownload as i32),
+            from_download_cache,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_download_cache_hit_is_not_reported_as_a_download() {
+        assert_eq!(
+            get_record(&http_materialization(Some(true))).method,
+            "download-cache"
+        );
+        assert_eq!(
+            get_record(&http_materialization(Some(false))).method,
+            "http"
+        );
+        // Logs written before the store existed.
+        assert_eq!(get_record(&http_materialization(None)).method, "http");
     }
 }

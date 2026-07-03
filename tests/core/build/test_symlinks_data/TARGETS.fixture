@@ -1,4 +1,4 @@
-load(":defs.bzl", "cp", "cp_via_builtin", "stat_path")
+load(":defs.bzl", "copy_source_dir", "copy_tree", "cp", "cp_via_builtin", "stat_path", "symlink_dir")
 
 cp(name = "cp", src = "src/link/file")
 
@@ -17,7 +17,40 @@ stat_path(
     path = "src/link",
 )
 
+copy_tree(name = "ancestors", src = "ancestors")
+
+copy_source_dir(
+    name = "relocatable_copy",
+    src = "relocatable",
+    relative_symlinks = True,
+)
+
+copy_source_dir(
+    name = "mtimes_copy",
+    src = "relocatable",
+    preserve_mtimes = True,
+    relative_symlinks = True,
+)
+
+copy_source_dir(
+    name = "default_copy",
+    src = "relocatable",
+)
+
+copy_tree(name = "cycle", src = "cycle")
+
+stat_path(name = "loop", path = "loop/a/l1")
+
+stat_path(name = "grow", path = "grow/a/l")
+
 stub(
     name = "symlink_dep",
     deps = ["//testlink:dep"],
+)
+
+symlink_dir(name = "symlink_dir")
+
+symlink_dir(
+    name = "symlink_dir_unhashed",
+    has_content_based_path = False,
 )

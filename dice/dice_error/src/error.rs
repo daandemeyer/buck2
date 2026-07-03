@@ -40,6 +40,10 @@ impl DiceError {
     pub fn injected_key_invalidated(key: Arc<dyn RequestedKey>) -> Self {
         DiceError(Arc::new(DiceErrorImpl::InjectedKeyGotInvalidation(key)))
     }
+
+    pub fn key_panicked() -> Self {
+        DiceError(Arc::new(DiceErrorImpl::KeyPanicked))
+    }
 }
 
 #[derive(Debug, Error, Allocative)]
@@ -63,6 +67,11 @@ pub enum DiceErrorImpl {
     },
     #[error("Activation data was already provided for this key")]
     DuplicateActivationData,
+    #[error(
+        "A key's computation panicked; the panic itself was reported by the panic handler on the \
+        thread that ran it"
+    )]
+    KeyPanicked,
 }
 
 pub type DiceResult<T> = Result<T, DiceError>;

@@ -200,6 +200,7 @@ export const sidebars: SidebarsConfig = {
           collapsed: false,
           items: [
             'users/advanced/deferred_materialization',
+            'users/advanced/download_cache',
             'users/advanced/restarter',
             'users/advanced/in_memory_cache',
             'users/advanced/external_cells',
