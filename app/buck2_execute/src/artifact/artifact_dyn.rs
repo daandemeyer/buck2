@@ -22,6 +22,12 @@ pub trait ArtifactDyn: Send + Sync + 'static {
         content_hash: Option<&ContentBasedPathHash>,
     ) -> buck2_error::Result<ProjectRelativePathBuf>;
 
+    fn resolve_path_for_execution(
+        &self,
+        fs: &ArtifactFs,
+        content_hash: Option<&ContentBasedPathHash>,
+    ) -> buck2_error::Result<ProjectRelativePathBuf>;
+
     /// This function will return the same project relative path as `resolve_path` except
     /// for content-based artifacts, where it will return a path that uses the configuration
     /// hash instead of the content hash.

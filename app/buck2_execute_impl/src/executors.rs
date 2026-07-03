@@ -11,6 +11,7 @@
 pub mod action_cache;
 pub mod action_cache_upload_permission_checker;
 pub mod caching;
+pub mod cell_execution_view;
 pub(crate) mod empty_action_result;
 pub mod hybrid;
 pub mod local;

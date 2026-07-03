@@ -20,9 +20,11 @@ use buck2_common::file_ops::metadata::FileDigest;
 use buck2_common::file_ops::metadata::FileDigestKind;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_core::buck2_env;
+use buck2_core::cells::name::CellName;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
-use buck2_core::fs::project::ProjectRoot;
+use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
+use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::soft_error;
 use buck2_data::ReUploadMetrics;
 use buck2_directory::directory::directory::Directory;
@@ -61,6 +63,7 @@ use crate::directory::ActionFingerprintedDirectoryRef;
 use crate::directory::ActionImmutableDirectory;
 use crate::directory::ReDirectorySerializer;
 use crate::execute::blobs::ActionBlobs;
+use crate::execute::cell_execution_view::physical_source_root;
 use crate::materialize::materializer::ArtifactNotMaterializedReason;
 use crate::materialize::materializer::CasDownloadInfo;
 use crate::materialize::materializer::MaterializationPurpose;
@@ -77,6 +80,25 @@ pub struct UploadStats {
 }
 
 pub struct Uploader {}
+
+fn source_upload_path(
+    artifact_fs: &ArtifactFs,
+    execution_path: ProjectRelativePathBuf,
+    physical_roots: &mut StdBuckHashMap<CellName, ProjectRelativePathBuf>,
+) -> buck2_error::Result<ProjectRelativePathBuf> {
+    let Some(cell_path) = artifact_fs.decode_source_execution_leaf_path(&execution_path)? else {
+        return Ok(execution_path);
+    };
+    let physical_path =
+        physical_source_root(artifact_fs, cell_path.cell(), physical_roots)?.join(cell_path.path());
+    tracing::debug!(
+        source_identity = %cell_path,
+        execution_path = %execution_path,
+        physical_path = %physical_path,
+        "Resolved canonical source upload path"
+    );
+    Ok(physical_path)
+}
 
 impl Uploader {
     async fn find_missing<'a>(
@@ -235,7 +257,7 @@ impl Uploader {
     }
 
     pub async fn upload(
-        fs: &ProjectRoot,
+        artifact_fs: &ArtifactFs,
         client: &RemoteExecutionClient,
         materializer: &Arc<dyn Materializer>,
         dir_path: &ProjectRelativePath,
@@ -270,6 +292,7 @@ impl Uploader {
         if !missing_digests.is_empty() {
             let mut upload_file_paths = Vec::new();
             let mut upload_file_digests = Vec::new();
+            let mut physical_source_roots = StdBuckHashMap::default();
 
             {
                 let mut walk = input_dir.unordered_walk();
@@ -289,7 +312,12 @@ impl Uploader {
                             upload_blobs.push(directory_to_blob(d));
                         }
                         DirectoryEntry::Leaf(ActionDirectoryMember::File(..)) => {
-                            upload_file_paths.push(dir_path.join(path.get()));
+                            let execution_path = dir_path.join(path.get());
+                            upload_file_paths.push(source_upload_path(
+                                artifact_fs,
+                                execution_path,
+                                &mut physical_source_roots,
+                            )?);
                             upload_file_digests.push(digest.to_re());
                         }
                         DirectoryEntry::Leaf(..) => unreachable!(), // TODO: Better representation of this.
@@ -319,7 +347,11 @@ impl Uploader {
                 match name {
                     Ok(name) => {
                         upload_files.push(NamedDigest {
-                            name: fs.resolve(&name).as_maybe_relativized_str()?.to_owned(),
+                            name: artifact_fs
+                                .fs()
+                                .resolve(&name)
+                                .as_maybe_relativized_str()?
+                                .to_owned(),
                             digest,
                             ..Default::default()
                         });
@@ -383,7 +415,11 @@ impl Uploader {
                     }
                     Err(ArtifactNotMaterializedReason::RequiresMaterialization { path }) => {
                         upload_files.push(NamedDigest {
-                            name: fs.resolve(&path).as_maybe_relativized_str()?.to_owned(),
+                            name: artifact_fs
+                                .fs()
+                                .resolve(&path)
+                                .as_maybe_relativized_str()?
+                                .to_owned(),
                             digest,
                             ..Default::default()
                         });
@@ -761,4 +797,49 @@ where
 
             Ok((digest, digest_ttl))
         }))
+}
+
+#[cfg(test)]
+mod tests {
+    use buck2_core::cells::cell_path::CellPath;
+    use buck2_core::cells::name::CellName;
+    use buck2_core::cells::paths::CellRelativePathBuf;
+    use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
+
+    use super::*;
+
+    fn canonical_external_fs() -> buck2_error::Result<ArtifactFs> {
+        Ok(ArtifactFs::testing_new_with_mode_and_external(
+            CellSourcePathMode::CanonicalV1,
+            &[("root", ""), ("sample", "declared/sample")],
+            &["sample"],
+        ))
+    }
+
+    #[test]
+    fn canonical_source_leaf_uploads_from_its_physical_root() -> buck2_error::Result<()> {
+        let artifact_fs = canonical_external_fs()?;
+        let logical_leaf = artifact_fs.resolve_cell_path_for_execution(
+            CellPath::new(
+                CellName::testing_new("sample"),
+                CellRelativePathBuf::unchecked_new("pkg/src.cpp".to_owned()),
+            )
+            .as_ref(),
+        )?;
+        let physical_leaf = artifact_fs
+            .resolve_cell_source_root_physical(CellName::testing_new("sample"))?
+            .join(
+                buck2_fs::paths::forward_rel_path::ForwardRelativePath::unchecked_new(
+                    "pkg/src.cpp",
+                ),
+            );
+
+        assert_ne!(logical_leaf, physical_leaf);
+        assert_eq!(
+            source_upload_path(&artifact_fs, logical_leaf, &mut StdBuckHashMap::default())?,
+            physical_leaf,
+            "a canonical source leaf must be read from its revalidated physical root"
+        );
+        Ok(())
+    }
 }

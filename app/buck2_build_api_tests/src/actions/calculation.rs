@@ -231,6 +231,9 @@ async fn make_default_dice_state(
                     buck2_execute::re::output_trees_download_config::OutputTreesDownloadConfig::new(
                         None, true,
                     ),
+                cell_execution_view: std::sync::Arc::new(
+                    buck2_execute::execute::cell_execution_view::NoopCellExecutionView,
+                ),
             })
         }
     }
