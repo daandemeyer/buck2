@@ -11,3 +11,4 @@
 tonic::include_proto!("action_metadata");
 
 pub static REMOTE_DEP_FILE_KEY: &str = "remote_dep_file";
+pub static DIGESTS_ONLY_KEY: &str = "digests_only";

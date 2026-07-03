@@ -23,6 +23,7 @@ use buck2_artifact::artifact::artifact_type::OutputArtifact;
 use buck2_artifact::artifact::build_artifact::BuildArtifact;
 use buck2_build_api::actions::Action;
 use buck2_build_api::actions::ActionExecutionCtx;
+use buck2_build_api::actions::PreparedLookup;
 use buck2_build_api::actions::UnregisteredAction;
 use buck2_build_api::actions::box_slice_set::BoxSliceSet;
 use buck2_build_api::actions::errors::error_handler::OutputArtifacts;
@@ -34,6 +35,7 @@ use buck2_build_api::actions::execute::action_executor::ActionOutputs;
 use buck2_build_api::actions::impls::expanded_command_line::ExpandedCommandLine;
 use buck2_build_api::actions::impls::expanded_command_line::ExpandedCommandLineDigest;
 use buck2_build_api::actions::impls::expanded_command_line::ExpandedCommandLineFingerprinter;
+use buck2_build_api::actions::impls::run_action_knobs::RunActionKnobs;
 use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_api::artifact_groups::ArtifactGroupValues;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
@@ -1680,6 +1682,22 @@ impl RunAction {
             }
         }
     }
+
+    fn supports_digests_only_cache(&self) -> bool {
+        // A digests-only entry contains no file contents, so a false `default_allow_cache_upload`
+        // doesn't stop it.
+        self.inner.allow_cache_upload != Some(false)
+            // The outputs of an action with `no_outputs_cleanup` or `incremental_remote_outputs`
+            // depend on the outputs of its previous run, which the action digest doesn't cover.
+            && !self.inner.no_outputs_cleanup
+            && !self.inner.incremental_remote_outputs
+            // Preparing an action with `metadata_param` writes its metadata file, but a lookup of
+            // output values must not write files.
+            && self.inner.metadata_param.is_none()
+            // The action digest of a command that runs on a worker doesn't cover the worker.
+            && self.values().worker.is_none()
+            && self.values().remote_worker.is_none()
+    }
 }
 
 #[pagable_typetag]
@@ -1897,6 +1915,9 @@ impl Action for RunAction {
         };
 
         let allow_cache_upload = allow_cache_upload || force_cache_upload()?;
+        let publish_digests_only = result.was_locally_executed()
+            && ctx.run_action_knobs().digests_only_cache
+            && self.supports_digests_only_cache();
         // If there is a dep file entry AND if dep file cache upload is enabled, upload it
         if result.was_success()
             && !result.was_served_by_remote_dep_file_cache()
@@ -1918,6 +1939,7 @@ impl Action for RunAction {
                         None
                     },
                     allow_cache_upload,
+                    publish_digests_only,
                 )
                 .await?;
 
@@ -1939,6 +1961,20 @@ impl Action for RunAction {
             if dep_file_bundle.has_dep_files() {
                 result.dep_file_cache_upload_result =
                     buck2_data::UploadResult::DepFileUploadNotAllowed;
+            }
+            if publish_digests_only {
+                // `cache_upload` only publishes the digests-only entry here, because
+                // `allow_cache_upload` is false. We discard its results, because they describe the
+                // normal upload that this branch already reports.
+                ctx.cache_upload(
+                    &action_and_blobs,
+                    &result,
+                    None,
+                    None,
+                    allow_cache_upload,
+                    publish_digests_only,
+                )
+                .await?;
             }
         }
 
@@ -1978,6 +2014,48 @@ impl Action for RunAction {
         metadata.timing.finish_action = Some(Instant::now() - finish_start);
 
         Ok((outputs, metadata))
+    }
+
+    async fn prepare_lookup(
+        &self,
+        ctx: &mut dyn ActionExecutionCtx,
+    ) -> buck2_error::Result<Option<PreparedLookup>> {
+        if !self.supports_digests_only_cache() {
+            return Ok(None);
+        }
+        let mut visitor = RunActionVisitor::new(&self.inner.dep_files, None);
+        let (prepared_run_action, _, host_sharing_requirements) =
+            self.prepare(&mut visitor, ctx).await?;
+        let request =
+            self.command_execution_request(ctx, prepared_run_action, host_sharing_requirements)?;
+        let prepared_action = ctx.prepare_action(&request, true)?;
+        if is_induced_cache_miss(&prepared_action.action_and_blobs.action) {
+            return Ok(None);
+        }
+        Ok(Some(PreparedLookup {
+            request,
+            prepared_action,
+            allow_dep_file_cache_upload: self.inner.allow_dep_file_cache_upload,
+        }))
+    }
+
+    fn supports_output_values(&self) -> bool {
+        self.supports_digests_only_cache()
+    }
+
+    fn is_lookup_first(&self, knobs: &RunActionKnobs) -> bool {
+        // A local run publishes the normal entry only when `allow_cache_upload` resolves to true.
+        // Without the normal entry, a lookup always misses. RE stores the result of every remote
+        // run, but the check treats every action as a local run. Builders resolve
+        // `allow_cache_upload` with their own `default_allow_cache_upload`. When their value
+        // differs from `knobs.default_allow_cache_upload`, buck2 looks up the entry that builders
+        // don't publish for an action without `allow_cache_upload`.
+        knobs.digests_only_cache
+            && self
+                .inner
+                .allow_cache_upload
+                .unwrap_or(knobs.default_allow_cache_upload)
+            && self.supports_digests_only_cache()
     }
 }
 

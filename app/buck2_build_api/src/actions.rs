@@ -149,6 +149,37 @@ pub trait Action: PagableTagged + Allocative + Debug + Send + Sync + 'static {
         waiting_data: WaitingData,
     ) -> Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError>;
 
+    /// Returns the outputs that `execute` returns for the input values in `ctx`, or `None` when
+    /// only `execute` can compute them. It writes no files, declares nothing in the materializer
+    /// and sends no requests to the network or the CAS.
+    fn output_values(
+        &self,
+        _ctx: &dyn ActionExecutionCtx,
+    ) -> buck2_error::Result<Option<ActionOutputs>> {
+        Ok(None)
+    }
+
+    /// Prepares the command of the action for a cache lookup with the input values in `ctx`, or
+    /// returns `None` when buck2 must not look up the action in the cache. It runs nothing and
+    /// writes no files.
+    async fn prepare_lookup(
+        &self,
+        _ctx: &mut dyn ActionExecutionCtx,
+    ) -> buck2_error::Result<Option<PreparedLookup>> {
+        Ok(None)
+    }
+
+    /// Returns `false` when `output_values` and `prepare_lookup` always return `None`.
+    fn supports_output_values(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when buck2 looks up the normal entry of the action with the input values
+    /// from `OutputValuesKey` before it builds the inputs.
+    fn is_lookup_first(&self, _knobs: &RunActionKnobs) -> bool {
+        false
+    }
+
     /// A machine-readable category for this action, intended to be used when analyzing actions outside of buck2 itself.
     ///
     /// A category provides a namespace for identifiers within the rule that produced this action. Examples of
@@ -244,6 +275,12 @@ pub trait Action: PagableTagged + Allocative + Debug + Send + Sync + 'static {
     // TODO this probably wants more data for execution, like printing a short_name and the target
 }
 
+pub struct PreparedLookup {
+    pub request: CommandExecutionRequest,
+    pub prepared_action: PreparedAction,
+    pub allow_dep_file_cache_upload: bool,
+}
+
 /// The context for actions to use when executing
 #[async_trait]
 pub trait ActionExecutionCtx: Send + Sync {
@@ -290,6 +327,7 @@ pub trait ActionExecutionCtx: Send + Sync {
         re_result: Option<&mut TActionResult2>,
         dep_file_entry: Option<&mut dyn IntoRemoteDepFile>,
         allow_cache_upload: bool,
+        publish_digests_only: bool,
     ) -> buck2_error::Result<CacheUploadResults>;
 
     /// Executes a command
@@ -349,9 +387,13 @@ pub trait ActionExecutionCtx: Send + Sync {
     /// Whether this action may ask the CAS whether it already holds content it would otherwise
     /// produce, a write's or a copy's: false without a CAS, and under `--local-only` and
     /// `--no-remote-cache`, which forgo what remote caches hold. `download_file` asks under
-    /// [`Self::cas_configured`] instead: its content is named by the user's checksum, and the
-    /// CAS serves it in place of the URL rather than in place of a cache.
+    /// [`Self::cas_configured`] and `--local-only` instead: its content is named by the user's
+    /// checksum, and the CAS serves it in place of the URL rather than in place of a cache.
     fn may_probe_cas(&self) -> bool;
+
+    /// `--no-remote-cache`, which unlike `--local-only` also keeps `download_file` from asking
+    /// the CAS for its content.
+    fn skip_cache_read(&self) -> bool;
 
     /// The action cache as write actions use it, under this action's executor configuration;
     /// `None` where that executor reads no cache.

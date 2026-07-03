@@ -284,6 +284,7 @@ async fn in_store(
         .materialize(vec![FileToLink {
             digest,
             executable: false,
+            read_only: false,
             dest: dest.to_owned(),
         }])
         .await?[0])
@@ -294,6 +295,50 @@ async fn in_store(
 fn inode_of(path: &AbsNormPath) -> buck2_error::Result<u64> {
     use std::os::unix::fs::MetadataExt;
     Ok(std::fs::metadata(path)?.ino())
+}
+
+/// Returns the mode as an octal string, so that a failed assertion shows it in the form that
+/// `chmod` takes.
+#[cfg(unix)]
+fn mode_of(path: &AbsNormPath) -> buck2_error::Result<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)?.permissions().mode();
+    Ok(format!("{:o}", mode & 0o7777))
+}
+
+#[cfg(unix)]
+fn write_with_mode(
+    fs: &ProjectRoot,
+    p: &ProjectRelativePathBuf,
+    content: &str,
+    mode: u32,
+) -> buck2_error::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let on_disk = fs.resolve(p);
+    std::fs::create_dir_all(on_disk.parent().unwrap())?;
+    std::fs::write(&on_disk, content)?;
+    std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(mode))?;
+    assert_eq!(
+        mode_of(&on_disk)?,
+        format!("{mode:o}"),
+        "the test can set the mode it needs"
+    );
+    Ok(())
+}
+
+/// Returns a file value whose digest says that the CAS holds the content, so that a report puts
+/// nothing in the stash.
+#[cfg(unix)]
+fn file_in_the_cas(content: &str, is_executable: bool) -> ArtifactValue {
+    let config = CasDigestConfig::testing_default();
+    ArtifactValue::file(FileMetadata {
+        digest: TrackedFileDigest::new_expires(
+            FileDigest::from_content(content.as_bytes(), config),
+            Timestamp::now() + SignedDuration::from_hours(4),
+            config,
+        ),
+        is_executable,
+    })
 }
 
 /// Clean-stale arguments under which everything this daemon has not used is stale.
@@ -1850,6 +1895,84 @@ async fn test_content_tracked_elsewhere_is_copied_rather_than_downloaded() -> bu
                 .resolve(d.join(ForwardRelativePath::unchecked_new("b")))
                 .exists()
         );
+        abort(dm);
+        Ok(())
+    })
+    .await
+}
+
+/// An action can leave its output with any mode, and Buck records only whether the output is
+/// executable. Report an executable output with mode 04755 and a plain output with mode 0600.
+/// Then materialize their content at other paths, where the materializer copies it from the
+/// tracked paths. Each copy must have exactly 0755 or 0644 and an inode of its own, whichever
+/// of reflink, hardlink and copy the filesystem allows. The tracked files must keep their
+/// modes.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_a_copy_from_a_tracked_path_gets_the_canonical_mode() -> buck2_error::Result<()> {
+    ignore_stack_overflow_checks_for_future(async {
+        let temp = ProjectRootTemp::new()?;
+        let (dm, io) = make(temp.path(), None, None);
+        for (name, mode, executable, expected) in [
+            ("setuid", 0o4755, true, "755"),
+            ("owner_only", 0o600, false, "644"),
+        ] {
+            let value = file_in_the_cas(&format!("{name} output, copied"), executable);
+            let tracked = path(&format!("buck-out/v2/gen/{name}"));
+            write_with_mode(
+                temp.path(),
+                &tracked,
+                &format!("{name} output, copied"),
+                mode,
+            )?;
+            drop(report(&dm, &tracked, value.dupe()).await?);
+
+            let copy = path(&format!("buck-out/v2/art/{name}"));
+            materialize_ok(&dm, vec![(copy.clone(), value.dupe())]).await?;
+            assert_eq!(io.take_log(), vec![], "`{name}` came from the tracked path");
+            let (tracked, copy) = (temp.path().resolve(&tracked), temp.path().resolve(&copy));
+            assert_eq!(mode_of(&copy)?, expected, "`{name}`");
+            assert_ne!(inode_of(&copy)?, inode_of(&tracked)?, "`{name}`");
+            assert_eq!(mode_of(&tracked)?, format!("{mode:o}"), "`{name}`");
+        }
+        abort(dm);
+        Ok(())
+    })
+    .await
+}
+
+/// Under `readonly_outputs`, reporting an output removes the write bits of its files. Report
+/// an executable output with mode 0755 and an executable output with mode 04755. The reports
+/// change their modes to 0555 and 04555. Then materialize their content at other paths, where
+/// the materializer copies it from the tracked paths. Each copy must have exactly 0555. The
+/// 04555 file does not have the read-only mode, so its copy must have an inode of its own.
+/// The tracked files must keep the modes that the reports gave them.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_a_copy_from_a_sealed_tracked_path_gets_the_sealed_mode() -> buck2_error::Result<()> {
+    ignore_stack_overflow_checks_for_future(async {
+        let temp = ProjectRootTemp::new()?;
+        let fs = temp.path().dupe();
+        let mut configs = configs();
+        configs.readonly_outputs = true;
+        let (dm, io) = make_with_configs(&fs, StubIoHandler::new(fs.dupe()), None, None, configs);
+        for (name, mode, sealed) in [("sealed", 0o755, "555"), ("sealed_setuid", 0o4755, "4555")] {
+            let value = file_in_the_cas(&format!("{name} output, copied"), true);
+            let tracked = path(&format!("buck-out/v2/gen/{name}"));
+            write_with_mode(&fs, &tracked, &format!("{name} output, copied"), mode)?;
+            drop(report(&dm, &tracked, value.dupe()).await?);
+            assert_eq!(mode_of(&fs.resolve(&tracked))?, sealed, "`{name}` sealed");
+
+            let copy = path(&format!("buck-out/v2/art/{name}"));
+            materialize_ok(&dm, vec![(copy.clone(), value.dupe())]).await?;
+            assert_eq!(io.take_log(), vec![], "`{name}` came from the tracked path");
+            let (tracked, copy) = (fs.resolve(&tracked), fs.resolve(&copy));
+            assert_eq!(mode_of(&copy)?, "555", "`{name}`");
+            if sealed != "555" {
+                assert_ne!(inode_of(&copy)?, inode_of(&tracked)?, "`{name}`");
+            }
+            assert_eq!(mode_of(&tracked)?, sealed, "`{name}`");
+        }
         abort(dm);
         Ok(())
     })

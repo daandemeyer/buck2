@@ -49,6 +49,7 @@ derive_more.workspace = true
 dice.workspace = true
 dice_futures.workspace = true
 dupe.workspace = true
+httptest.workspace = true
 indoc.workspace = true
 itertools.workspace = true
 maplit.workspace = true

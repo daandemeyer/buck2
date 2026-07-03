@@ -18,6 +18,9 @@ rust_library(
         },
     },
     test_deps = [
+        "fbsource//third-party/rust:futures",
+        "fbsource//third-party/rust:tokio",
+        "//buck2/app/buck2_cli_proto:buck2_cli_proto",
         "//buck2/dice/dice_futures:dice_futures",
     ],
     deps = [

@@ -92,6 +92,7 @@ pub struct FileToInsert {
 pub struct FileToLink {
     pub digest: TrackedFileDigest,
     pub executable: bool,
+    pub read_only: bool,
     /// Must not exist; the directories on the way to it are made as needed.
     pub dest: AbsNormPathBuf,
 }
@@ -502,7 +503,7 @@ impl BlobStore {
         Ok(())
     }
 
-    /// Puts each digest's blob at its destination, with the executable bit as asked: out of the
+    /// Puts each digest's blob at its destination, with the mode asked: out of the
     /// stash, a clone of its file where the filesystem has them, else a hardlink when the mode
     /// agrees, else a copy; out of memory, written. One answer per file, `false` where the store
     /// does not hold the blob, which is every answer before `attach_stash`, since the IO runs on
@@ -523,9 +524,15 @@ impl BlobStore {
                         };
                         let digest = file.digest.data();
                         let put = if record.stash_id() == memory.nonces.id {
-                            memory.write(digest, record, file.executable, &file.dest)
+                            memory.write(
+                                digest,
+                                record,
+                                file.executable,
+                                file.read_only,
+                                &file.dest,
+                            )
                         } else {
-                            stash.link(digest, record, file.executable, &file.dest)
+                            stash.link(digest, record, file.executable, file.read_only, &file.dest)
                         };
                         match put {
                             Ok(true) => {
@@ -768,9 +775,18 @@ fn random_id(odd: bool) -> u32 {
 /// that no directory grows large and so that the store can follow CASd if it changes its mind.
 /// Every insertion writes a file of its own, named by a nonce, so that no two insertions and no
 /// insertion and removal ever touch one name; the mode is in the name because a hardlink shares
-/// it. A file is never modified once written, and nothing reads a name the table does not
-/// record, so a file is in the stash exactly from its record on; a crash before that leaves a
-/// file the next daemon's start discards (`discard_stash`).
+/// it. A file's content is never modified once written, and nothing reads a name the table does
+/// not record, so a file is in the stash exactly from its record on; a crash before that leaves
+/// a file the next daemon's start discards (`discard_stash`).
+///
+/// A file in the stash has mode `0o755` or `0o644`, as its name says, whatever the mode of the
+/// file it was made from. Two actions can write the same content with different modes, and a
+/// file linked out of the stash must get the same mode whichever action inserted the content
+/// first. The stash holds `0o755` and `0o644` rather than the `0o555` and `0o444` of
+/// `buck2.readonly_outputs`, because every tenant of a daemon shares the stash and each tenant
+/// reads `buck2.readonly_outputs` from its own config. Under `buck2.readonly_outputs`, removing
+/// the write bits of a tracked file also removes them from a stash file that shares its inode.
+/// `link` therefore checks the mode of a stash file before it hardlinks the file.
 #[derive(Allocative)]
 struct Stash {
     root: AbsNormPathBuf,
@@ -813,7 +829,16 @@ impl Stash {
             Source::Path {
                 path,
                 origin: Origin::BuckOut,
-            } => fs_util::reflink_or_hardlink_or_copy(&path, &file)? != Linked::Hardlinked,
+            } => {
+                // A hardlink shares the source's mode, so only a source that already has
+                // exactly 0755 or 0644 is hardlinked.
+                if fs_util::has_canonical_mode(&fs_util::metadata(&path)?, executable, false) {
+                    fs_util::reflink_or_hardlink_or_copy(&path, &file)? != Linked::Hardlinked
+                } else {
+                    fs_util::reflink_or_copy(&path, &file)?;
+                    true
+                }
+            }
             Source::Path {
                 path,
                 origin: Origin::Source,
@@ -830,9 +855,11 @@ impl Stash {
                 true
             }
         };
-        // A hardlink is the source's inode, mode included; the other legs made a new file.
+        // A hardlink is the source's inode, which already has the canonical mode. A reflink, a
+        // copy or a write made a new file with the source's mode or with the mode that the
+        // umask leaves.
         if made_a_file {
-            fs_util::set_executable(&file, executable)?;
+            fs_util::set_canonical_mode(&file, executable, false)?;
         }
         Ok(record)
     }
@@ -846,22 +873,27 @@ impl Stash {
         digest: &FileDigest,
         record: StashRecord,
         executable: bool,
+        read_only: bool,
         dest: &AbsNormPath,
     ) -> buck2_error::Result<bool> {
         let file = self.file(digest, record);
-        if !fs_util::try_exists(&file)? {
+        let Some(metadata) = fs_util::symlink_metadata_if_exists(&file)? else {
             return Ok(false);
-        }
+        };
         if let Some(parent) = dest.parent() {
             fs_util::create_dir_all(parent)?;
         }
-        if record.executable == executable {
-            fs_util::reflink_or_hardlink_or_copy(&file, dest)?;
+        // A hardlink shares the file's mode, which can differ from the mode asked for. The file
+        // can be executable when `dest` is not, or it can lack its write bits, as the doc of
+        // `Stash` explains.
+        if fs_util::has_canonical_mode(&metadata, executable, read_only) {
+            if fs_util::reflink_or_hardlink_or_copy(&file, dest)? == Linked::Hardlinked {
+                return Ok(true);
+            }
         } else {
-            // A clone or a copy has its own mode; a hardlink would share the file's.
             fs_util::reflink_or_copy(&file, dest)?;
-            fs_util::set_executable(dest, executable)?;
         }
+        fs_util::set_canonical_mode(dest, executable, read_only)?;
         Ok(true)
     }
 
@@ -943,6 +975,7 @@ impl Memory {
         digest: &FileDigest,
         record: StashRecord,
         executable: bool,
+        read_only: bool,
         dest: &AbsNormPath,
     ) -> buck2_error::Result<bool> {
         // The compressed bytes are copied out from under the shard's lock, which an insertion
@@ -957,7 +990,7 @@ impl Memory {
             fs_util::create_dir_all(parent)?;
         }
         fs_util::write(dest, content)?;
-        fs_util::set_executable(dest, executable)?;
+        fs_util::set_canonical_mode(dest, executable, read_only)?;
         Ok(true)
     }
 }
@@ -1059,13 +1092,60 @@ mod tests {
         executable: bool,
         dest: &AbsNormPath,
     ) -> buck2_error::Result<bool> {
+        materialize_with_mode(store, digest, executable, false, dest).await
+    }
+
+    async fn materialize_with_mode(
+        store: &BlobStore,
+        digest: &TrackedFileDigest,
+        executable: bool,
+        read_only: bool,
+        dest: &AbsNormPath,
+    ) -> buck2_error::Result<bool> {
         Ok(store
             .materialize(vec![FileToLink {
                 digest: digest.dupe(),
                 executable,
+                read_only,
                 dest: dest.to_owned(),
             }])
             .await?[0])
+    }
+
+    /// Returns the mode as an octal string, so that a failed assertion shows it in the form that
+    /// `chmod` takes.
+    #[cfg(unix)]
+    fn mode_of(path: &AbsNormPath) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs_util::metadata(path).unwrap().permissions().mode();
+        format!("{:o}", mode & 0o7777)
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &AbsNormPath, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs_util::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(
+            mode_of(path),
+            format!("{mode:o}"),
+            "the test can set the mode it needs"
+        );
+    }
+
+    #[cfg(unix)]
+    fn inode_of(path: &AbsNormPath) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs_util::metadata(path).unwrap().ino()
+    }
+
+    #[cfg(unix)]
+    fn stash_file_of(store: &BlobStore, digest: &TrackedFileDigest) -> AbsNormPathBuf {
+        store
+            .stash
+            .get()
+            .unwrap()
+            .stash
+            .file(digest.data(), digest.stash().unwrap())
     }
 
     /// The files in the stash for `digest`.
@@ -1207,6 +1287,141 @@ mod tests {
                 fs_util::metadata(stash.file(digest.data(), digest.stash().unwrap()))?.ino()
             );
         }
+        Ok(())
+    }
+
+    /// An action can write its output with any mode, and Buck records only whether the output
+    /// is executable. Insert an executable output with mode 04755 from buck-out. The stash file
+    /// and a destination linked from it must have exactly 0755, whichever of reflink, hardlink
+    /// and copy the filesystem allows. The output must keep mode 04755.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_setuid_output_enters_and_leaves_the_stash_as_0755() -> buck2_error::Result<()> {
+        let temp = ProjectRootTemp::new()?;
+        let (store, table) = store(temp.path());
+        let src = scratch(temp.path(), "su");
+        fs_util::write(&src, b"setuid")?;
+        set_mode(&src, 0o4755);
+        let digest = table.intern(digest(b"setuid"), 0);
+        store
+            .insert_files(vec![FileToInsert {
+                path: src.clone(),
+                digest: digest.dupe(),
+                executable: true,
+                origin: Origin::BuckOut,
+            }])
+            .await?;
+        assert_eq!(mode_of(&stash_file_of(&store, &digest)), "755");
+        assert_eq!(mode_of(&src), "4755");
+
+        let dest = scratch(temp.path(), "dest");
+        assert!(materialize_one(&store, &digest, true, &dest).await?);
+        assert_eq!(mode_of(&dest), "755");
+        Ok(())
+    }
+
+    /// A tool can leave its output readable only by its owner, and a user can make a source
+    /// file readable only by its owner. Insert a 0600 file as a plain file and a 0700 file as
+    /// an executable, once from buck-out and once from the sources. Each stash file and each
+    /// destination linked from it must have exactly 0644 or 0755.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_owner_only_files_enter_and_leave_the_stash_with_the_canonical_mode()
+    -> buck2_error::Result<()> {
+        let temp = ProjectRootTemp::new()?;
+        let (store, table) = store(temp.path());
+        for (name, mode, executable, origin, expected) in [
+            ("out", 0o600, false, Origin::BuckOut, "644"),
+            ("out_exec", 0o700, true, Origin::BuckOut, "755"),
+            ("src", 0o600, false, Origin::Source, "644"),
+            ("src_exec", 0o700, true, Origin::Source, "755"),
+        ] {
+            let src = scratch(temp.path(), name);
+            fs_util::write(&src, name)?;
+            set_mode(&src, mode);
+            let digest = table.intern(self::digest(name.as_bytes()), 0);
+            store
+                .insert_files(vec![FileToInsert {
+                    path: src,
+                    digest: digest.dupe(),
+                    executable,
+                    origin,
+                }])
+                .await?;
+            assert_eq!(
+                mode_of(&stash_file_of(&store, &digest)),
+                expected,
+                "`{name}` in the stash"
+            );
+            let dest = scratch(temp.path(), &format!("{name}.dest"));
+            assert!(materialize_one(&store, &digest, executable, &dest).await?);
+            assert_eq!(mode_of(&dest), expected, "`{name}` linked out");
+        }
+        Ok(())
+    }
+
+    /// A stash file can lose its canonical mode after the insertion. Under
+    /// `buck2.readonly_outputs`, removing the write bits of a tracked file also removes them
+    /// from a stash file that shares its inode. Give an executable's stash file other modes, and
+    /// link it out to a writable destination after each change. Each destination must have
+    /// exactly 0755 and an inode of its own. The stash file must keep the mode it was given.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_stash_file_without_the_mode_asked_for_is_never_hardlinked()
+    -> buck2_error::Result<()> {
+        let temp = ProjectRootTemp::new()?;
+        let (store, table) = store(temp.path());
+        let digest = table.intern(digest(b"executable"), 0);
+        store
+            .insert_bytes(b"executable".to_vec(), &digest, true)
+            .await?;
+        let file = stash_file_of(&store, &digest);
+        for mode in [0o4755, 0o1755, 0o555, 0o700, 0o775] {
+            set_mode(&file, mode);
+            let dest = scratch(temp.path(), &format!("dest{mode:o}"));
+            assert!(materialize_one(&store, &digest, true, &dest).await?);
+            assert_eq!(
+                mode_of(&dest),
+                "755",
+                "from a stash file with mode {mode:o}"
+            );
+            assert_ne!(inode_of(&dest), inode_of(&file), "from mode {mode:o}");
+            assert_eq!(mode_of(&file), format!("{mode:o}"));
+        }
+        Ok(())
+    }
+
+    /// Under `buck2.readonly_outputs`, the materializer sets `read_only` for every destination.
+    /// Link an executable's stash file out read-only while it has mode 0755. Then change its
+    /// mode to 0555, as removing the write bits of a tracked file that shares its inode does,
+    /// and link it out read-only again. Each destination must have exactly 0555. The 0755 stash
+    /// file does not have the read-only mode, so its destination must have an inode of its own.
+    /// The stash file must keep its write bits.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_read_only_destination_gets_the_mode_the_seal_gives() -> buck2_error::Result<()>
+    {
+        let temp = ProjectRootTemp::new()?;
+        let (store, table) = store(temp.path());
+        let digest = table.intern(digest(b"sealed later"), 0);
+        store
+            .insert_bytes(b"sealed later".to_vec(), &digest, true)
+            .await?;
+        let file = stash_file_of(&store, &digest);
+        assert_eq!(mode_of(&file), "755");
+
+        let from_writable = scratch(temp.path(), "from_writable");
+        assert!(materialize_with_mode(&store, &digest, true, true, &from_writable).await?);
+        assert_eq!(mode_of(&from_writable), "555");
+        assert_ne!(inode_of(&from_writable), inode_of(&file));
+        assert_eq!(mode_of(&file), "755");
+
+        // Removing the write bits of a tracked file that shares the stash file's inode leaves
+        // the stash file at 0555.
+        set_mode(&file, 0o555);
+        let from_sealed = scratch(temp.path(), "from_sealed");
+        assert!(materialize_with_mode(&store, &digest, true, true, &from_sealed).await?);
+        assert_eq!(mode_of(&from_sealed), "555");
         Ok(())
     }
 
@@ -1429,6 +1644,30 @@ mod tests {
         let other = table.intern(self::digest(b"other"), 0);
         assert!(store.insert_in_memory(&content, &other, false).is_err());
         assert_eq!(other.stash(), None);
+        Ok(())
+    }
+
+    /// A file written out of memory has the mode the umask leaves until the store sets it.
+    /// Write one blob out for every combination of executable and read-only. Each
+    /// destination must have exactly 0644, 0755, 0444 or 0555.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_bytes_in_memory_are_written_with_the_canonical_mode() -> buck2_error::Result<()> {
+        let temp = ProjectRootTemp::new()?;
+        let (store, table) = store(temp.path());
+        let digest = table.intern(digest(b"written out of memory"), 0);
+        store.insert_in_memory(b"written out of memory", &digest, false)?;
+        for (executable, read_only, expected) in [
+            (false, false, "644"),
+            (true, false, "755"),
+            (false, true, "444"),
+            (true, true, "555"),
+        ] {
+            let dest = scratch(temp.path(), &format!("dest{expected}"));
+            assert!(materialize_with_mode(&store, &digest, executable, read_only, &dest).await?);
+            assert_eq!(mode_of(&dest), expected);
+        }
+        assert_eq!(store.stats().memory_served, 4);
         Ok(())
     }
 

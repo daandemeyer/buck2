@@ -955,6 +955,56 @@ pub fn set_executable<P: AsRef<AbsPath>>(path: P, executable: bool) -> Result<()
     Ok(())
 }
 
+#[cfg(unix)]
+fn canonical_mode(executable: bool, read_only: bool) -> u32 {
+    let mode = if executable { 0o755 } else { 0o644 };
+    if read_only { mode & !0o222 } else { mode }
+}
+
+/// Sets the mode of the file at `path` to exactly 0755 for an executable and 0644 for any other
+/// file, or to 0555 and 0444 with `read_only`. Buck's artifact model records only whether a file
+/// is executable, so a copy must not keep any other bit of its source's mode. Unlike
+/// [`set_executable`], this function clears the setuid, setgid and sticky bits and sets the group
+/// and other bits. On Windows, it sets the read-only attribute from `read_only`. It follows
+/// symlinks.
+pub fn set_canonical_mode<P: AsRef<AbsPath>>(
+    path: P,
+    executable: bool,
+    read_only: bool,
+) -> Result<(), IoError> {
+    let path = path.as_ref();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        set_permissions(
+            path,
+            fs::Permissions::from_mode(canonical_mode(executable, read_only)),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ignore_executable = executable;
+        let mut perms = metadata(path)?.permissions();
+        perms.set_readonly(read_only);
+        set_permissions(path, perms)
+    }
+}
+
+/// Returns whether a file with `metadata` has exactly the mode that [`set_canonical_mode`] sets
+/// for `executable` and `read_only`.
+pub fn has_canonical_mode(metadata: &fs::Metadata, executable: bool, read_only: bool) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o7777 == canonical_mode(executable, read_only)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ignore_executable = executable;
+        metadata.permissions().readonly() == read_only
+    }
+}
+
 /// Gives or takes the permission to write `path`, a file: with `false` nobody may write it
 /// (`0o444`, or `0o555` for an executable); with `true` its owner may again. On Windows this is
 /// the read-only attribute. Follows symlinks.
@@ -1394,6 +1444,7 @@ pub mod uncategorized {
     pub use super::create_dir_all;
     pub use super::create_file_if_not_exists;
     pub use super::disk_space_stats;
+    pub use super::has_canonical_mode;
     pub use super::open_file_if_exists;
     pub use super::read_dir_if_exists;
     pub use super::read_if_exists;
@@ -1507,6 +1558,14 @@ pub mod uncategorized {
 
     pub fn set_executable<P: AsRef<AbsPath>>(path: P, executable: bool) -> buck2_error::Result<()> {
         super::set_executable(path, executable).uncategorized()
+    }
+
+    pub fn set_canonical_mode<P: AsRef<AbsPath>>(
+        path: P,
+        executable: bool,
+        read_only: bool,
+    ) -> buck2_error::Result<()> {
+        super::set_canonical_mode(path, executable, read_only).uncategorized()
     }
 
     pub fn set_writable<P: AsRef<AbsPath>>(path: P, writable: bool) -> buck2_error::Result<()> {
@@ -2354,6 +2413,50 @@ mod tests {
         assert!(!fs_util::metadata(&path)?.permissions().readonly());
         fs_util::write(&path, b"again")?;
         assert_eq!(fs_util::read_to_string(&path)?, "again");
+        Ok(())
+    }
+
+    /// `set_canonical_mode` must leave exactly 0755, 0644, 0555 or 0444, whatever mode the
+    /// file had before. Start from modes with the setuid or sticky bit and from modes without
+    /// group and other bits, and check the mode after each call. `has_canonical_mode` must
+    /// accept the result for the same arguments only.
+    #[cfg(unix)]
+    #[test]
+    fn test_set_canonical_mode_keeps_nothing_of_the_old_mode() -> buck2_error::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir()?;
+        let root = AbsPath::new(tempdir.path())?;
+        let path = root.join("file");
+        fs_util::write(&path, b"data")?;
+        for old in [0o4755, 0o1777, 0o700, 0o600, 0o444] {
+            for (executable, read_only, expected) in [
+                (true, false, "755"),
+                (false, false, "644"),
+                (true, true, "555"),
+                (false, true, "444"),
+            ] {
+                fs_util::set_permissions(&path, std::fs::Permissions::from_mode(old))?;
+                fs_util::set_canonical_mode(&path, executable, read_only)?;
+                let metadata = fs_util::metadata(&path)?;
+                assert_eq!(
+                    format!("{:o}", metadata.permissions().mode() & 0o7777),
+                    expected,
+                    "from {old:o}"
+                );
+                assert!(fs_util::has_canonical_mode(
+                    &metadata, executable, read_only
+                ));
+                assert!(!fs_util::has_canonical_mode(
+                    &metadata,
+                    !executable,
+                    read_only
+                ));
+                assert!(!fs_util::has_canonical_mode(
+                    &metadata, executable, !read_only
+                ));
+            }
+        }
         Ok(())
     }
 

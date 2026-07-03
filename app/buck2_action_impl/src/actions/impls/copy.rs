@@ -13,6 +13,7 @@ use std::borrow::Cow;
 use allocative::Allocative;
 use async_trait::async_trait;
 use buck2_artifact::artifact::artifact_dyn::ArtifactDyn;
+use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_artifact::artifact::build_artifact::BuildArtifact;
 use buck2_build_api::actions::Action;
 use buck2_build_api::actions::ActionExecutionCtx;
@@ -26,8 +27,10 @@ use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_signals::env::WaitingData;
 use buck2_core::category::CategoryRef;
 use buck2_core::content_hash::ContentBasedPathHash;
+use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_error::BuckErrorOptionContext;
 use buck2_execute::artifact_utils::ArtifactValueBuilder;
+use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
 use buck2_execute::materialize::materializer::CopiedArtifact;
 use buck2_execute::materialize::materializer::DeclareArtifactPayload;
@@ -130,40 +133,16 @@ impl CopyAction {
             .next()
             .expect("a single artifact by construction")
     }
-}
 
-#[pagable_typetag]
-#[async_trait]
-impl Action for CopyAction {
-    fn kind(&self) -> buck2_data::ActionKind {
-        buck2_data::ActionKind::Copy
-    }
-
-    fn inputs(&self) -> buck2_error::Result<Cow<'_, [ArtifactGroup]>> {
-        Ok(Cow::Borrowed(self.inputs.as_slice()))
-    }
-
-    fn outputs(&self) -> Cow<'_, [BuildArtifact]> {
-        Cow::Borrowed(self.outputs.as_slice())
-    }
-
-    fn first_output(&self) -> &BuildArtifact {
-        self.output()
-    }
-
-    fn category(&self) -> CategoryRef<'_> {
-        CategoryRef::unchecked_new("copy")
-    }
-
-    fn identifier(&self) -> Option<&str> {
-        Some(self.output().get_path().path().as_str())
-    }
-
-    async fn execute(
+    fn copy_value<'a>(
         &self,
-        ctx: &mut dyn ActionExecutionCtx,
-        waiting_data: WaitingData,
-    ) -> Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError> {
+        ctx: &'a dyn ActionExecutionCtx,
+    ) -> buck2_error::Result<(
+        &'a Artifact,
+        ProjectRelativePathBuf,
+        ProjectRelativePathBuf,
+        ArtifactValue,
+    )> {
         let (input, src_value) = ctx
             .artifact_values(self.input())
             .iter()
@@ -207,6 +186,44 @@ impl Action for CopyAction {
 
             builder.build(tmp_dest.as_ref())?
         };
+        Ok((input, src, tmp_dest, value))
+    }
+}
+
+#[pagable_typetag]
+#[async_trait]
+impl Action for CopyAction {
+    fn kind(&self) -> buck2_data::ActionKind {
+        buck2_data::ActionKind::Copy
+    }
+
+    fn inputs(&self) -> buck2_error::Result<Cow<'_, [ArtifactGroup]>> {
+        Ok(Cow::Borrowed(self.inputs.as_slice()))
+    }
+
+    fn outputs(&self) -> Cow<'_, [BuildArtifact]> {
+        Cow::Borrowed(self.outputs.as_slice())
+    }
+
+    fn first_output(&self) -> &BuildArtifact {
+        self.output()
+    }
+
+    fn category(&self) -> CategoryRef<'_> {
+        CategoryRef::unchecked_new("copy")
+    }
+
+    fn identifier(&self) -> Option<&str> {
+        Some(self.output().get_path().path().as_str())
+    }
+
+    async fn execute(
+        &self,
+        ctx: &mut dyn ActionExecutionCtx,
+        waiting_data: WaitingData,
+    ) -> Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError> {
+        let (input, src, tmp_dest, value) = self.copy_value(ctx)?;
+        let artifact_fs = ctx.fs();
 
         let dest = if self.output().get_path().is_content_based_path() {
             artifact_fs.resolve_build(
@@ -296,6 +313,21 @@ impl Action for CopyAction {
                 waiting_data,
             },
         ))
+    }
+
+    fn output_values(
+        &self,
+        ctx: &dyn ActionExecutionCtx,
+    ) -> buck2_error::Result<Option<ActionOutputs>> {
+        let (_, _, _, value) = self.copy_value(ctx)?;
+        Ok(Some(ActionOutputs::from_single(
+            self.output().get_path().dupe(),
+            value,
+        )))
+    }
+
+    fn supports_output_values(&self) -> bool {
+        true
     }
 }
 

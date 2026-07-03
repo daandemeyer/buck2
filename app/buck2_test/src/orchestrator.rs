@@ -1447,6 +1447,7 @@ impl BuckTestOrchestrator<'_> {
                         mergebase: &None,
                         re_platform: executor.re_platform(),
                         allow_cache_upload: true,
+                        publish_digests_only: false,
                     };
                     let _result = match executor
                         .cache_upload(

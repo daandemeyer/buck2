@@ -51,7 +51,10 @@ strong_hash.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+buck2_cli_proto.workspace = true
 dice_futures.workspace = true
+futures.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

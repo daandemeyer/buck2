@@ -129,6 +129,10 @@ impl CommandExecutor {
         &self.0.re_platform
     }
 
+    pub fn action_cache_checker(&self) -> &dyn PreparedCommandOptionalExecutor {
+        self.0.action_cache_checker.as_ref()
+    }
+
     /// Check if the action can be served by the action cache.
     pub async fn action_cache(
         &self,
