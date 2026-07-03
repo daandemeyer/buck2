@@ -7,10 +7,10 @@
 # above-listed licenses.
 
 script = """
-import sys;
+import os, sys;
 if '--list' in sys.argv:
     print('test1\\n')
-sys.exit(0)
+sys.exit(int(os.environ.get('EXIT_CODE', '0')))
 """
 
 def _simple_test_impl(ctx):
@@ -22,6 +22,8 @@ def _simple_test_impl(ctx):
     env = {}
     if ctx.attrs.seed:
         env["SEED"] = ctx.attrs.seed
+    if ctx.attrs.exit_code:
+        env["EXIT_CODE"] = str(ctx.attrs.exit_code)
     return [
         DefaultInfo(out),
         ExternalRunnerTestInfo(
@@ -35,6 +37,7 @@ def _simple_test_impl(ctx):
 
 simple_test = rule(
     attrs = {
+        "exit_code": attrs.int(default = 0),
         "seed": attrs.string(default = ""),
         "supports_test_execution_caching": attrs.bool(default = False),
     },
