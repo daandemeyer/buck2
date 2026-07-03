@@ -943,6 +943,24 @@ mod tests {
     }
 
     #[test]
+    fn from_system_path_drops_current_directory() {
+        for dot in [".", "./"] {
+            assert_eq!(
+                "",
+                RelativePathBuf::from_system_path(Path::new(dot))
+                    .unwrap()
+                    .as_str()
+            );
+        }
+        assert_eq!(
+            "../x",
+            RelativePathBuf::from_system_path(Path::new("./../x"))
+                .unwrap()
+                .as_str()
+        );
+    }
+
+    #[test]
     fn push_and_pop() {
         let mut p = RelativePathBuf::empty();
         p.push("foo");
