@@ -21,8 +21,10 @@ buck2_e2e_test(
     # `cpe::x2p` resolves `localhost` incorrectly, and the downloads fail.
     env = {"CPE_RUST_X2P_SUPPORTS_VPNLESS": "0"},
     deps = [
+        "fbsource//third-party/rust:flate2",
         "fbsource//third-party/rust:hex",
         "fbsource//third-party/rust:sha2",
+        "fbsource//third-party/rust:tar",
     ],
 )
 

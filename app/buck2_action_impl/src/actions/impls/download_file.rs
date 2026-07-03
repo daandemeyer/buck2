@@ -271,15 +271,15 @@ impl DownloadFileAction {
 
     /// Declares the output as a CAS download when the CAS already holds the content, which
     /// leaves nothing to fetch from the origin server or to write to disk now. `None` when the
-    /// content is not there, is about to expire, or there is no CAS to ask. Asked under
-    /// `--local-only` and `--no-remote-cache` too, unlike a write's or copy's probe
+    /// content is not there, is about to expire, there is no CAS to ask, or under
+    /// `--no-remote-cache`. Asked under `--local-only` too, unlike a write's or copy's probe
     /// (`ActionExecutionCtx::may_probe_cas`): the CAS stands in for the URL here, not for a cache.
     async fn declare_from_cas(
         &self,
         ctx: &dyn ActionExecutionCtx,
         metadata: &FileMetadata,
     ) -> buck2_error::Result<Option<ArtifactValue>> {
-        if !ctx.cas_configured() {
+        if !ctx.cas_configured() || ctx.skip_cache_read() {
             return Ok(None);
         }
         let use_case = ctx.invocation_re_use_case();
@@ -398,18 +398,24 @@ impl DownloadFileAction {
             (None, None) => ctx.fs().resolve_build(self.output().get_path(), None)?,
         };
 
-        // Whatever is at the path is stale or untracked, so the disk is cleared before the download
-        // writes there. The lease is held until the download is recorded at the path or published
-        // from it.
         let output_lease = materializer.prepare_outputs(vec![path.clone()]).await?;
-        ctx.blocking_executor()
-            .execute_io(
-                Box::new(CleanOutputPaths {
-                    paths: vec![path.clone()],
-                }),
-                ctx.cancellation_context(),
-            )
-            .await?;
+        // Another configuration may be reading a completed download at the content-based path.
+        // `http_download` replaces regular files atomically, so only clear obstructions.
+        let dest = ctx.fs().fs().resolve(&path);
+        let obstructed = match fs_util::symlink_metadata_if_exists(&dest) {
+            Ok(metadata) => metadata.is_some_and(|metadata| !metadata.is_file()),
+            Err(_) => true,
+        };
+        if obstructed {
+            ctx.blocking_executor()
+                .execute_io(
+                    Box::new(CleanOutputPaths {
+                        paths: vec![path.clone()],
+                    }),
+                    ctx.cancellation_context(),
+                )
+                .await?;
+        }
 
         let digest = http_download(
             client,

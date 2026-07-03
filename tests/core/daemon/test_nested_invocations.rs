@@ -160,3 +160,31 @@ async fn test_same_state_under_sharing(buck: &Buck) -> anyhow::Result<()> {
     assert!(nested.iter().any(|part| part == ".unidaemons"));
     Ok(())
 }
+
+#[buck_test(allow_soft_errors = true)]
+async fn test_no_buckd_in_action_fails_fast(buck: &Buck, tmp_path: &Path) -> anyhow::Result<()> {
+    // A build action invokes Buck with `--no-buckd`. The nested client must reject the
+    // invocation instead of waiting for its parent build's slot or killing its daemon.
+    let log = tmp_path.join("logfile.json-lines");
+    let log = log.to_str().unwrap();
+    buck.build(&[
+        "root//:nested_no_buckd",
+        "--event-log",
+        log,
+        "-c",
+        &nested_buck2_path(buck),
+    ])
+    .env("SANDCASTLE_ID", "")
+    .await
+    .expect_failure()
+    .assert_stderr_matches("Failed to build 'root//:nested_no_buckd");
+    let result = buck
+        .log(&["what-ran", "--failed", "--show-std-err", log])
+        .await?;
+    assert!(
+        result
+            .stdout
+            .contains("cannot be used inside a build action")
+    );
+    Ok(())
+}

@@ -661,7 +661,16 @@ pub fn insert_entry<D>(
         ));
         builder.insert(path.into(), entry)?;
     } else {
-        builder.insert(path.into(), entry)?;
+        match entry {
+            // A source directory at the project root, such as `src = "."` in the root package,
+            // has an empty path. `insert` rejects the empty path. The root of the builder is the
+            // project root, so merge the entries of the directory into the builder instead.
+            // The source listing is exhaustive, and `merge` would mark the root of the builder
+            // as exhaustive too. The root also contains `buck-out`, which the listing leaves out.
+            // `merge_entries` keeps the root non-exhaustive.
+            DirectoryEntry::Dir(dir) if path.is_empty() => builder.merge_entries(dir)?,
+            entry => builder.insert(path.into(), entry)?,
+        }
     }
 
     Ok(())
@@ -992,6 +1001,45 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_insert_dir_at_project_root() -> buck2_error::Result<()> {
+        let digest_config = DigestConfig::testing_default();
+        let file = || FileMetadata::empty(digest_config.cas_digest_config());
+
+        let mut root_dir = ActionDirectoryBuilder::empty_non_exhaustive();
+        insert_file(&mut root_dir, path("f"), file())?;
+        insert_file(&mut root_dir, path("d/f"), file())?;
+        // A source directory listing is exhaustive, like the one for the project root.
+        root_dir.mark_uniformly_exhaustive();
+        let root_dir = root_dir.fingerprint(digest_config.as_directory_serializer());
+
+        let mut builder = ActionDirectoryBuilder::empty_non_exhaustive();
+        insert_file(&mut builder, path("d/f"), file())?;
+        insert_file(&mut builder, path("buck-out/f"), file())?;
+        insert_entry(
+            &mut builder,
+            path(""),
+            DirectoryEntry::Dir(root_dir.into_builder()),
+        )?;
+
+        let mut expected = ActionDirectoryBuilder::empty_non_exhaustive();
+        for p in ["f", "d/f", "buck-out/f"] {
+            insert_file(&mut expected, path(p), file())?;
+        }
+        assert_dirs_eq(&builder, &expected);
+
+        // `buck-out` is not part of the project root listing, so the root of the input tree
+        // must stay non-exhaustive.
+        let fingerprinted = builder
+            .clone()
+            .fingerprint(digest_config.as_directory_serializer());
+        assert!(!fingerprinted.exhaustiveness_hash().is_exhaustive());
+
+        assert!(insert_file(&mut builder, path(""), file()).is_err());
+
+        Ok(())
+    }
+
     fn build_test_dir() -> buck2_error::Result<ActionDirectoryBuilder> {
         let digest_config = DigestConfig::testing_default();
 
@@ -1241,6 +1289,63 @@ mod tests {
         let tree = directory_to_re_tree(&dir);
         let dir2 = re_tree_to_directory(&tree, &jiff::Timestamp::now(), digest_config, true)?;
 
+        assert_dirs_eq(&dir, &dir2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_symlink_to_current_directory_round_trips() -> buck2_error::Result<()> {
+        // A directory with normalized `.` targets must retain writable symlink targets after
+        // serialization to an RE tree and deserialization back into an action directory.
+        let digest_config = DigestConfig::testing_default();
+
+        let mut builder = ActionDirectoryBuilder::empty_non_exhaustive();
+        insert_file(
+            &mut builder,
+            path("out/x"),
+            FileMetadata::empty(digest_config.cas_digest_config()),
+        )?;
+        for (link, target) in [
+            ("out/here", "."),
+            ("out/dotslash", "./"),
+            ("out/d/here", "../x"),
+        ] {
+            let target = RelativePathBuf::from_system_path(Path::new(target))?;
+            insert_symlink(&mut builder, path(link), Arc::new(Symlink::new(target)))?;
+        }
+
+        let target = |link: &str| match find(
+            Directory::as_ref(&builder),
+            ForwardRelativePath::new(link)?,
+        )? {
+            Some(DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(s))) => {
+                buck2_error::Ok(s.target().as_str().to_owned())
+            }
+            _ => panic!("`{link}` is not a symlink"),
+        };
+        assert_eq!(target("out/here")?, ".");
+        assert_eq!(target("out/dotslash")?, ".");
+        assert_eq!(target("out/d/here")?, "../x");
+
+        // Following the link does not leave the directory.
+        let value = extract_artifact_value(&builder, &path("out/here"), digest_config)?
+            .internal_error("Not value!")?;
+        assert!(matches!(
+            value.entry(),
+            DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(_))
+        ));
+
+        let dir = builder.fingerprint(digest_config.as_directory_serializer());
+        let tree = directory_to_re_tree(&dir);
+        for node in tree.root.as_ref().unwrap().symlinks.iter() {
+            assert!(
+                !node.target.is_empty(),
+                "`{}` has an empty target",
+                node.name
+            );
+        }
+        let dir2 = re_tree_to_directory(&tree, &jiff::Timestamp::now(), digest_config, true)?;
         assert_dirs_eq(&dir, &dir2);
 
         Ok(())
