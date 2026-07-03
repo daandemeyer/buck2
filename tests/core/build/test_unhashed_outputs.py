@@ -156,3 +156,16 @@ async def test_projected_symlink_output(buck: Buck) -> None:
     assert output.parent.is_symlink()
     assert output.is_symlink()
     assert output.resolve().is_file()
+
+
+@buck_test(skip_for_os=["windows"])
+async def test_content_based_output_keeps_mtimes(buck: Buck) -> None:
+    result = await buck.build("//:projected_symlink_output")
+    out = result.get_build_report().output_for_target(
+        "root//:projected_symlink_output"
+    ).parent
+
+    for i, name in enumerate(["target", "profile", "sub", "."]):
+        # os.path.join keeps the trailing `.`, which Path would drop.
+        mtime = os.lstat(os.path.join(out, name)).st_mtime
+        assert mtime == 1_000_000_000 + i, name
