@@ -13,6 +13,7 @@ use std::sync::Arc;
 use allocative::Allocative;
 use buck2_common::ignores::ignore_set::IgnoreSet;
 use buck2_core::fs::i_project_rel_path::IProjectRelativePath;
+use buck2_core::fs::project_rel_path::ProjectRelativePath;
 
 /// Type that file watchers use to determine if a file is ignored
 ///
@@ -31,5 +32,11 @@ impl FileWatcherIgnores {
 
     pub(crate) fn is_ignored(&self, path: IProjectRelativePath) -> bool {
         self.ignores.is_match(&path)
+    }
+
+    /// Like `is_ignored`, but for a path that is not interned. The notify watcher matches paths
+    /// that `ProjectRelativePath::new` rejects, and those must not go into the interner.
+    pub(crate) fn is_ignored_uninterned(&self, path: &ProjectRelativePath) -> bool {
+        self.ignores.is_match(path)
     }
 }
