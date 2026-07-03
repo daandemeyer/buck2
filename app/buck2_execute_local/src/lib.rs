@@ -651,6 +651,48 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_graceful_kill_awaits_the_child() -> buck2_error::Result<()> {
+        async fn kill_after_timeout(script: &str, graceful_s: u32) -> buck2_error::Result<()> {
+            let mut cmd = background_command("sh");
+            cmd.arg("-c").arg(script);
+            let stream = spawn_command_and_stream_events(
+                cmd,
+                Some(Duration::from_millis(100)),
+                futures::future::pending(),
+                DefaultStatusDecoder,
+                DefaultKillProcess {
+                    graceful_shutdown_timeout_s: Some(graceful_s),
+                },
+                None,
+                true,
+                None,
+                futures::stream::pending(),
+            )
+            .await?;
+            let res = decode_command_event_stream(stream).await?;
+            assert_matches!(res.status, GatherOutputStatus::TimedOut(..));
+            Ok(())
+        }
+
+        // A signalled child stays a zombie until it is waited on, so termination has to reap it
+        // rather than probe for its absence.
+        tokio::time::timeout(Duration::from_secs(20), kill_after_timeout("sleep 1000", 5))
+            .await
+            .buck_error_context("graceful termination did not observe the child's exit")??;
+
+        // Escalation still bounds the wait when the child ignores SIGTERM.
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            kill_after_timeout("trap \"\" TERM; sleep 1000", 1),
+        )
+        .await
+        .buck_error_context("SIGKILL escalation did not observe the child's exit")??;
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_kill_terminates_process_group() -> buck2_error::Result<()> {
         use sysinfo::Pid;

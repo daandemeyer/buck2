@@ -39,6 +39,8 @@ mod unix {
     use tracing::info;
     use tracing::warn;
 
+    /// Only for processes this one does not parent: exit is detected by probing for the pid's
+    /// absence, and our own children stay as zombies until they are waited on.
     pub(crate) async fn try_terminate_process_gracefully(
         pid: i32,
         timeout: Duration,
