@@ -18,6 +18,7 @@ use buck2_core::cells::cell_path::CellPath;
 use buck2_core::cells::cell_path::CellPathRef;
 use buck2_core::cells::name::CellName;
 use buck2_core::cells::paths::CellRelativePath;
+use buck2_fs::paths::RelativePathBuf;
 use buck2_fs::paths::file_name::FileNameBuf;
 use cmp_any::PartialEqAny;
 use dice::DiceComputations;
@@ -41,6 +42,7 @@ use crate::file_ops::metadata::RawPathMetadata;
 use crate::file_ops::metadata::RawSymlink;
 use crate::file_ops::metadata::ReadDirOutput;
 use crate::file_ops::metadata::SimpleDirEntry;
+use crate::file_ops::metadata::Symlink;
 use crate::file_ops::metadata::TrackedFileDigest;
 use crate::file_ops::trait_::FileOps;
 use crate::ignores::file_ignores::FileIgnoreResult;
@@ -49,6 +51,8 @@ use crate::ignores::file_ignores::FileIgnoreResult;
 enum TestFileOpsEntry {
     File(String /*data*/, FileMetadata),
     ExternalSymlink(Arc<ExternalSymlink>),
+    /// The resolved target and the target as written in the link.
+    Symlink(Arc<CellPath>, Arc<Symlink>),
     Directory(BTreeSet<SimpleDirEntry>),
 }
 
@@ -64,7 +68,9 @@ impl TestFileOps {
         for (path, entry) in inputs {
             let mut file_type = match entry {
                 TestFileOpsEntry::Directory(..) => FileType::Directory,
-                TestFileOpsEntry::ExternalSymlink(..) => FileType::Symlink,
+                TestFileOpsEntry::ExternalSymlink(..) | TestFileOpsEntry::Symlink(..) => {
+                    FileType::Symlink
+                }
                 TestFileOpsEntry::File(..) => FileType::File,
             };
             // make sure the test setup is correct and concise
@@ -99,28 +105,42 @@ impl TestFileOps {
     }
 
     pub fn new_with_files(files: BTreeMap<CellPath, String>) -> Self {
+        Self::new_with_files_and_symlinks(files, BTreeMap::new())
+    }
+
+    /// Symlink targets are relative to the directory containing the link, as on disk.
+    pub fn new_with_files_and_symlinks(
+        files: BTreeMap<CellPath, String>,
+        symlinks: BTreeMap<CellPath, RelativePathBuf>,
+    ) -> Self {
         let cas_digest_config = CasDigestConfig::testing_default();
 
-        Self::new(
-            files
-                .into_iter()
-                .map(|(path, data)| {
-                    (
-                        path,
-                        TestFileOpsEntry::File(
-                            data.clone(),
-                            FileMetadata {
-                                digest: TrackedFileDigest::from_content(
-                                    data.as_bytes(),
-                                    cas_digest_config,
-                                ),
-                                is_executable: false,
-                            },
-                        ),
-                    )
-                })
-                .collect::<BTreeMap<CellPath, TestFileOpsEntry>>(),
-        )
+        let mut entries = files
+            .into_iter()
+            .map(|(path, data)| {
+                let metadata = FileMetadata {
+                    digest: TrackedFileDigest::from_content(data.as_bytes(), cas_digest_config),
+                    is_executable: false,
+                };
+                (path, TestFileOpsEntry::File(data, metadata))
+            })
+            .collect::<BTreeMap<CellPath, TestFileOpsEntry>>();
+        for (path, target) in symlinks {
+            let dir = path.parent().expect("symlink at a cell root");
+            let resolved = CellPath::new(
+                dir.cell(),
+                dir.path()
+                    .as_forward_relative_path()
+                    .join_normalized(&target)
+                    .unwrap()
+                    .into(),
+            );
+            entries.insert(
+                path,
+                TestFileOpsEntry::Symlink(Arc::new(resolved), Arc::new(Symlink::new(target))),
+            );
+        }
+        Self::new(entries)
     }
 
     pub fn new_with_files_metadata(files: BTreeMap<CellPath, FileMetadata>) -> Self {
@@ -208,6 +228,23 @@ impl FileOps for TestFileOps {
         &self,
         path: CellPathRef<'async_trait>,
     ) -> buck2_error::Result<Option<RawPathMetadata>> {
+        // As on disk, a symlink at a prefix of the path redirects the rest of the path.
+        let ancestors: Vec<_> = path.ancestors().skip(1).collect();
+        for prefix in ancestors.into_iter().rev() {
+            if let Some(TestFileOpsEntry::Symlink(target, symlink)) =
+                self.entries.get(&prefix.to_owned())
+            {
+                let rest = path.strip_prefix(prefix)?;
+                return Ok(Some(RawPathMetadata::Symlink {
+                    at: Arc::new(prefix.to_owned()),
+                    to: RawSymlink::Relative(
+                        Arc::new(target.join(rest)),
+                        Arc::new(Symlink::new(symlink.target().join(rest.as_str()))),
+                    ),
+                }));
+            }
+        }
+
         self.entries.get(&path.to_owned()).map_or(Ok(None), |e| {
             match e {
                 TestFileOpsEntry::File(_data, metadata) => {
@@ -217,11 +254,11 @@ impl FileOps for TestFileOps {
                     at: Arc::new(path.to_owned()),
                     to: RawSymlink::External(sym.dupe()),
                 }),
-                _ => Err(buck2_error::buck2_error!(
-                    buck2_error::ErrorTag::Tier0,
-                    "couldn't get metadata for {:?}",
-                    path
-                )),
+                TestFileOpsEntry::Symlink(target, symlink) => Ok(RawPathMetadata::Symlink {
+                    at: Arc::new(path.to_owned()),
+                    to: RawSymlink::Relative(target.dupe(), symlink.dupe()),
+                }),
+                TestFileOpsEntry::Directory(..) => Ok(RawPathMetadata::Directory),
             }
             .map(Some)
         })

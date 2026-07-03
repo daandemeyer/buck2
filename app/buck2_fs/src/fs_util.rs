@@ -348,7 +348,7 @@ pub fn copy<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(from: P, to: Q) -> Result<u64,
     let from_ref = from.as_ref();
     let to_ref = to.as_ref();
     with_retries(|| {
-        fs::copy(
+        copy_impl(
             from_ref.as_maybe_relativized(),
             to_ref.as_maybe_relativized(),
         )
@@ -363,6 +363,84 @@ pub fn copy<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(from: P, to: Q) -> Result<u64,
             .check_eden(from_ref)
             .check_eden(to_ref)
     })
+}
+
+/// `fs::copy` on Linux uses `copy_file_range`, which keeps holes only on a filesystem that can
+/// share extents (btrfs, XFS). Elsewhere (ext4, tmpfs) sparse files get inflated to their full
+/// size. Copy only the data ranges of a sparse file instead.
+#[cfg(target_os = "linux")]
+fn copy_impl(from: &Path, to: &Path) -> io::Result<u64> {
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    use nix::errno::Errno;
+    use nix::unistd::Whence;
+    use nix::unistd::lseek;
+
+    let src = File::open(from)?;
+    let metadata = src.metadata()?;
+    let len = metadata.len();
+    // `blocks()` counts 512 byte units, whatever the filesystem's block size.
+    if !metadata.is_file() || metadata.blocks() * 512 >= len {
+        return fs::copy(from, to);
+    }
+
+    let permissions = metadata.permissions();
+    let mut dst = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(permissions.mode())
+        .open(to)?;
+    let mut offset = 0;
+    while offset < len {
+        let data = match lseek(&src, offset as i64, Whence::SeekData) {
+            Ok(data) => data as u64,
+            // Nothing but a hole from `offset` on.
+            Err(Errno::ENXIO) => break,
+            Err(e) => return Err(e.into()),
+        };
+        let hole = lseek(&src, data as i64, Whence::SeekHole)? as u64;
+        (&src).seek(SeekFrom::Start(data))?;
+        dst.seek(SeekFrom::Start(data))?;
+        // Like `fs::copy`, this goes through `copy_file_range` where possible, which still shares
+        // the extents on a filesystem that can.
+        io::copy(&mut (&src).take(hole - data), &mut dst)?;
+        offset = hole;
+    }
+    // Covers a trailing hole, which no copy above reaches.
+    dst.set_len(len)?;
+    // As `fs::copy` does: the mode given to `open` only applies to a new file, minus the umask.
+    dst.set_permissions(permissions)?;
+    Ok(len)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn copy_impl(from: &Path, to: &Path) -> io::Result<u64> {
+    fs::copy(from, to)
+}
+
+pub fn hard_link<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(
+    original: P,
+    link: Q,
+) -> Result<(), IoError> {
+    let _guard = IoCounterKey::Hardlink.guard();
+    let original = original.as_ref();
+    let link = link.as_ref();
+    with_retries(|| fs::hard_link(original.as_maybe_relativized(), link.as_maybe_relativized()))
+        .map_err(|e| {
+            IoError::new(e)
+                .context(format!(
+                    "hard_link(original={}, link={})",
+                    original.display(),
+                    link.display()
+                ))
+                .check_eden(original)
+                .check_eden(link)
+        })
 }
 
 pub fn read_link<P: AsRef<AbsPath>>(path: P) -> Result<PathBuf, IoError> {
@@ -468,6 +546,63 @@ pub fn set_executable<P: AsRef<AbsPath>>(path: P, executable: bool) -> Result<()
     }
 
     Ok(())
+}
+
+/// Sets the modification time of `to` to that of `from`, without following symlinks.
+pub fn copy_mtime<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(from: P, to: Q) -> Result<(), IoError> {
+    let from = from.as_ref();
+    let to = to.as_ref();
+    let metadata = symlink_metadata(from)?;
+
+    let _guard = IoCounterKey::Chmod.guard();
+    with_retries(|| set_mtime_no_follow(to.as_maybe_relativized(), &metadata)).map_err(|e| {
+        IoError::new(e)
+            .context(format!(
+                "copy_mtime(from={}, to={})",
+                from.display(),
+                to.display()
+            ))
+            .check_eden(to)
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn set_mtime_no_follow(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    use nix::fcntl::AT_FDCWD;
+    use nix::sys::stat::UtimensatFlags;
+    use nix::sys::stat::utimensat;
+    use nix::sys::time::TimeSpec;
+
+    let mtime = TimeSpec::new(metadata.mtime() as _, metadata.mtime_nsec() as _);
+    utimensat(
+        AT_FDCWD,
+        path,
+        &TimeSpec::UTIME_OMIT,
+        &mtime,
+        UtimensatFlags::NoFollowSymlink,
+    )
+    .map_err(io::Error::from)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn set_mtime_no_follow(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+        // Needed to open directories, and to open symlinks rather than their targets.
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options
+        .open(path)?
+        .set_times(fs::FileTimes::new().set_modified(metadata.modified()?))
 }
 
 pub fn remove_dir_all<P: AsRef<AbsPath>>(path: P) -> Result<(), IoError> {
@@ -875,6 +1010,13 @@ pub mod uncategorized {
         super::set_executable(path, executable).uncategorized()
     }
 
+    pub fn copy_mtime<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(
+        from: P,
+        to: Q,
+    ) -> buck2_error::Result<()> {
+        super::copy_mtime(from, to).uncategorized()
+    }
+
     pub fn remove_dir_all<P: AsRef<AbsPath>>(path: P) -> buck2_error::Result<()> {
         super::remove_dir_all(path).uncategorized()
     }
@@ -938,6 +1080,42 @@ mod tests {
         let not_existing_dir = existing_path.join(ForwardRelativePath::unchecked_new("dir"));
         let res = fs_util::read_dir_if_exists(not_existing_dir)?;
         assert!(res.is_none());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn copy_keeps_holes() -> buck2_error::Result<()> {
+        use std::io::Seek;
+        use std::io::SeekFrom;
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        const LEN: u64 = 64 << 20;
+        let tempdir = tempfile::tempdir()?;
+        let src = AbsPath::new(tempdir.path())?.join("src");
+        let dst = AbsPath::new(tempdir.path())?.join("dst");
+
+        // Data at the start and in the middle, and a trailing hole.
+        let mut file = File::create(&src)?;
+        file.write_all(b"head")?;
+        file.seek(SeekFrom::Start(LEN / 2))?;
+        file.write_all(b"middle")?;
+        file.set_len(LEN)?;
+        file.set_permissions(fs::Permissions::from_mode(0o751))?;
+        drop(file);
+        let src_blocks = fs::metadata(&src)?.blocks();
+        if src_blocks * 512 >= LEN {
+            // The temporary directory is on a filesystem without holes.
+            return Ok(());
+        }
+
+        assert_eq!(fs_util::copy(&src, &dst)?, LEN);
+        assert_eq!(fs::read(&src)?, fs::read(&dst)?);
+        let metadata = fs::metadata(&dst)?;
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o751);
+        assert!(metadata.blocks() * 512 < LEN / 2);
         Ok(())
     }
 
@@ -1039,6 +1217,43 @@ mod tests {
         fs_util::symlink(&target_path, &symlink_path)?;
         fs_util::write(&target_path, b"File content")?;
         assert_eq!(fs_util::read_to_string(&symlink_path)?, "File content");
+        Ok(())
+    }
+
+    // Other Unix platforms fall back to std, which follows symlinks.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn copy_mtime_does_not_follow_symlinks() -> buck2_error::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = AbsPath::new(tempdir.path())?;
+        let time = |secs| std::time::UNIX_EPOCH + std::time::Duration::new(secs, 123_456_789);
+        let set_mtime = |path: &AbsPath, mtime| {
+            File::open(path.as_path())?.set_times(fs::FileTimes::new().set_modified(mtime))
+        };
+
+        let old_file = root.join("old_file");
+        let old_dir = root.join("old_dir");
+        fs_util::write(&old_file, b"")?;
+        fs_util::create_dir_all(&old_dir)?;
+        set_mtime(&old_file, time(1_000_000_000))?;
+        set_mtime(&old_dir, time(1_000_000_001))?;
+
+        let file = root.join("file");
+        let link = root.join("link");
+        fs_util::write(&file, b"")?;
+        fs_util::symlink("file", &link)?;
+        set_mtime(&file, time(1_000_000_002))?;
+
+        fs_util::copy_mtime(&old_file, &link)?;
+        assert_eq!(
+            fs_util::symlink_metadata(&link)?.modified()?,
+            time(1_000_000_000)
+        );
+        assert_eq!(fs_util::metadata(&file)?.modified()?, time(1_000_000_002));
+
+        fs_util::copy_mtime(&old_dir, &file)?;
+        assert_eq!(fs_util::metadata(&file)?.modified()?, time(1_000_000_001));
+
         Ok(())
     }
 
