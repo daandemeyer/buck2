@@ -473,4 +473,4 @@ xattr = "1.6.1"
 zstd = { version = "0.13.3", features = ["experimental", "zstdmt"] }
 
 [workspace.lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ["cfg(fbcode_build)", "cfg(buck_build)", "cfg(client_only)", "cfg(tokio_unstable)"]}
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(fbcode_build)", "cfg(buck_build)", "cfg(buck2_memfrag)", "cfg(client_only)", "cfg(tokio_unstable)"]}
