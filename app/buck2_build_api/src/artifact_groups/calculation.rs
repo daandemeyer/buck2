@@ -432,7 +432,8 @@ async fn path_artifact_value(
             let dont_read_through_symlink = use_correct_source_symlink_reading && at == cell_path;
             if dont_read_through_symlink {
                 let artifact_fs = ctx.get_artifact_fs().await?;
-                let target_path = artifact_fs.resolve_cell_path((*target).as_ref())?;
+                let target_path =
+                    artifact_fs.resolve_cell_path_for_execution((*target).as_ref())?;
                 let mut builder = ActionDirectoryBuilder::empty();
                 insert_artifact(&mut builder, target_path, &target_artifact_value)?;
                 let deps = builder
@@ -497,7 +498,9 @@ impl Key for EnsureProjectedArtifactKey {
             BaseArtifactKind::Build(built) => {
                 artifact_fs.resolve_build(built.get_path(), Some(&base_content_based_path_hash))?
             }
-            BaseArtifactKind::Source(source) => artifact_fs.resolve_source(source.get_path())?,
+            BaseArtifactKind::Source(source) => {
+                artifact_fs.resolve_source_for_execution(source.get_path())?
+            }
         };
 
         let projected_path = base_path.join(path);
