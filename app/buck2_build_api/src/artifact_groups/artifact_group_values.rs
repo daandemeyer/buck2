@@ -48,12 +48,12 @@ impl ArtifactGroupValues {
         for (artifact, value) in values.iter() {
             if artifact.path_resolution_requires_artifact_value() {
                 let path = artifact
-                    .resolve_path(artifact_fs, Some(&value.content_based_path_hash()))
+                    .resolve_path_for_execution(artifact_fs, Some(&value.content_based_path_hash()))
                     .buck_error_context("Invalid artifact")?;
                 insert_artifact_lazy(&mut builder, path, value)?;
             } else {
                 let path = artifact
-                    .resolve_path(artifact_fs, None)
+                    .resolve_path_for_execution(artifact_fs, None)
                     .buck_error_context("Invalid artifact")?;
                 insert_artifact_lazy(&mut builder, path, value)?;
             }
@@ -104,7 +104,7 @@ impl ArtifactGroupValues {
         }
 
         for (artifact, value) in self.iter() {
-            let projrel_path = artifact.resolve_path(
+            let projrel_path = artifact.resolve_path_for_execution(
                 artifact_fs,
                 if artifact.path_resolution_requires_artifact_value() {
                     Some(value.content_based_path_hash())
@@ -282,11 +282,31 @@ impl ArtifactGroupValuesDyn for ArtifactGroupValues {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
     use buck2_artifact::actions::key::ActionIndex;
     use buck2_artifact::artifact::artifact_type::testing::BuildArtifactTestingExt;
     use buck2_artifact::artifact::build_artifact::BuildArtifact;
+    use buck2_artifact::artifact::source_artifact::SourceArtifact;
+    use buck2_common::file_ops::metadata::FileMetadata;
+    use buck2_common::file_ops::metadata::TrackedFileDigest;
+    use buck2_core::cells::CellAliasResolver;
+    use buck2_core::cells::CellResolver;
+    use buck2_core::cells::cell_root_path::CellRootPathBuf;
+    use buck2_core::cells::external::ExternalCellOrigin;
+    use buck2_core::cells::external::GitCellSetup;
+    use buck2_core::cells::instance::CellInstance;
+    use buck2_core::cells::name::CellName;
+    use buck2_core::cells::nested::NestedCells;
     use buck2_core::configuration::data::ConfigurationData;
+    use buck2_core::fs::buck_out_path::BuckOutPathResolver;
+    use buck2_core::fs::project::ProjectRoot;
+    use buck2_core::fs::project_rel_path::ProjectRelativePath;
+    use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+    use buck2_core::package::source_path::SourcePath;
     use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
+    use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 
     use super::*;
 
@@ -299,6 +319,92 @@ mod tests {
         let value = ArtifactValue::file(DigestConfig::testing_default().empty_file());
 
         (Artifact::from(artifact), value)
+    }
+
+    fn external_artifact_fs() -> buck2_error::Result<ArtifactFs> {
+        let root_name = CellName::testing_new("root");
+        let external_name = CellName::testing_new("sample");
+        let root_path = CellRootPathBuf::testing_new("");
+        let external_path = CellRootPathBuf::testing_new("declared/sample");
+        let roots = [
+            (root_name, root_path.as_path()),
+            (external_name, external_path.as_path()),
+        ];
+        let cells = CellResolver::new(
+            vec![
+                CellInstance::new(
+                    root_name,
+                    root_path.clone(),
+                    None,
+                    NestedCells::from_cell_roots(&roots, &root_path),
+                )?,
+                CellInstance::new(
+                    external_name,
+                    external_path.clone(),
+                    Some(ExternalCellOrigin::Git(GitCellSetup {
+                        git_origin: Arc::from("https://example.com/sample.git"),
+                        commit: Arc::from("0123456789abcdef0123456789abcdef01234567"),
+                        object_format: None,
+                    })),
+                    NestedCells::from_cell_roots(&roots, &external_path),
+                )?,
+            ],
+            CellAliasResolver::new(root_name, Default::default())?,
+        )?;
+        Ok(ArtifactFs::new(
+            cells,
+            BuckOutPathResolver::new(ProjectRelativePathBuf::unchecked_new("buck-out/v2".into())),
+            ProjectRoot::new_unchecked(
+                AbsNormPathBuf::new(
+                    Path::new(if cfg!(windows) {
+                        "C:\\project"
+                    } else {
+                        "/project"
+                    })
+                    .to_owned(),
+                )
+                .unwrap(),
+            ),
+        ))
+    }
+
+    #[test]
+    fn execution_api_preserves_external_input_and_action_digests() -> buck2_error::Result<()> {
+        let digest_config = DigestConfig::testing_default();
+        let artifact_fs = external_artifact_fs()?;
+        let source_path = SourcePath::testing_new("sample//pkg", "src.cpp");
+        let artifact = Artifact::from(SourceArtifact::new(source_path));
+        let value = ArtifactValue::file(FileMetadata {
+            digest: TrackedFileDigest::from_content(b"source", digest_config.cas_digest_config()),
+            is_executable: false,
+        });
+
+        let legacy_path = artifact.resolve_path(&artifact_fs, None)?;
+        assert_eq!(
+            &*legacy_path,
+            ProjectRelativePath::unchecked_new(
+                "buck-out/v2/external_cells/git/0123456789abcdef0123456789abcdef01234567/pkg/src.cpp"
+            )
+        );
+        let execution_path = artifact.resolve_path_for_execution(&artifact_fs, None)?;
+        assert_eq!(legacy_path, execution_path);
+
+        let mut legacy_input = LazyActionDirectoryBuilder::empty();
+        insert_artifact_lazy(&mut legacy_input, legacy_path.clone(), &value)?;
+        let legacy_input = legacy_input
+            .finalize()?
+            .fingerprint(digest_config.as_directory_serializer())
+            .shared(&*INTERNER);
+
+        let migrated_values = ArtifactGroupValues::from_artifact(artifact, value);
+        let mut migrated_input = LazyActionDirectoryBuilder::empty();
+        migrated_values.add_to_directory(&mut migrated_input, &artifact_fs)?;
+        let migrated_input = migrated_input
+            .finalize()?
+            .fingerprint(digest_config.as_directory_serializer())
+            .shared(&*INTERNER);
+        assert_eq!(legacy_input.fingerprint(), migrated_input.fingerprint());
+        Ok(())
     }
 
     impl ArtifactGroupValuesData {
