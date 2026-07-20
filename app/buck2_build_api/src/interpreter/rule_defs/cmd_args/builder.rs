@@ -66,17 +66,19 @@ pub(crate) fn compute_relative_to_path<'v>(
                     ));
                 }
             };
-            value
-                .inner()
-                .artifact
-                .resolve_path(fs.fs(), Some(&ContentBasedPathHash::for_output_artifact()))?
+            value.inner().artifact.resolve_path_for_execution(
+                fs.fs(),
+                Some(&ContentBasedPathHash::for_output_artifact()),
+            )?
         }
         RelativeOrigin::Artifact(artifact) => {
             let artifact = artifact.get_bound_artifact()?;
             let mapper = RelativeOriginArtifactPathMapper::new(artifact_path_mapping);
-            artifact.resolve_path(fs.fs(), mapper.get(&artifact))?
+            artifact.resolve_path_for_execution(fs.fs(), mapper.get(&artifact))?
         }
-        RelativeOrigin::CellRoot(cell_root) => fs.fs().resolve_cell_path(cell_root.cell_path())?,
+        RelativeOrigin::CellRoot(cell_root) => fs
+            .fs()
+            .resolve_cell_path_for_execution(cell_root.cell_path())?,
         RelativeOrigin::ProjectRoot(_) => ProjectRelativePath::empty().to_owned(),
     };
 
@@ -325,12 +327,15 @@ impl<'v, 'a> CommandLineBuilder<'v, 'a> {
 
     pub fn push_artifact(&mut self, artifact: &Artifact) -> buck2_error::Result<()> {
         self.write_project_path(
-            artifact.resolve_path(self.fs.fs(), self.artifact_path_mapping.get(artifact))?,
+            artifact.resolve_path_for_execution(
+                self.fs.fs(),
+                self.artifact_path_mapping.get(artifact),
+            )?,
         )
     }
 
     pub fn push_output_artifact(&mut self, artifact: &Artifact) -> buck2_error::Result<()> {
-        self.write_project_path(artifact.resolve_path(
+        self.write_project_path(artifact.resolve_path_for_execution(
             self.fs.fs(),
             Some(&ContentBasedPathHash::for_output_artifact()),
         )?)
@@ -347,7 +352,7 @@ impl<'v, 'a> CommandLineBuilder<'v, 'a> {
     }
 
     pub fn push_cell_path(&mut self, path: CellPathRef) -> buck2_error::Result<()> {
-        self.write_project_path(self.fs.fs().resolve_cell_path(path)?)
+        self.write_project_path(self.fs.fs().resolve_cell_path_for_execution(path)?)
     }
 
     pub fn push_project_path(&mut self, path: ProjectRelativePathBuf) -> buck2_error::Result<()> {
