@@ -165,15 +165,13 @@ impl Action for CopyAction {
             .ok_or_else(|| internal_error!("Input did not dereference to exactly one artifact"))?;
 
         let artifact_fs = ctx.fs();
-        let src = input.resolve_path(
-            artifact_fs,
-            if input.path_resolution_requires_artifact_value() {
-                Some(src_value.content_based_path_hash())
-            } else {
-                None
-            }
-            .as_ref(),
-        )?;
+        let content_hash = if input.path_resolution_requires_artifact_value() {
+            Some(src_value.content_based_path_hash())
+        } else {
+            None
+        };
+        let src_execution = input.resolve_path_for_execution(artifact_fs, content_hash.as_ref())?;
+        let src_physical = input.resolve_path(artifact_fs, content_hash.as_ref())?;
         let tmp_dest = artifact_fs.resolve_build(
             self.output().get_path(),
             Some(&ContentBasedPathHash::for_output_artifact()),
@@ -188,13 +186,13 @@ impl Action for CopyAction {
                 } => {
                     builder.add_copied(
                         src_value,
-                        src.as_ref(),
+                        src_execution.as_ref(),
                         tmp_dest.as_ref(),
                         executable_bit_override,
                     )?;
                 }
                 CopyMode::Symlink => {
-                    builder.add_symlinked(src_value, src.clone(), tmp_dest.as_ref())?;
+                    builder.add_symlinked(src_value, src_execution, tmp_dest.as_ref())?;
                 }
             }
 
@@ -222,7 +220,7 @@ impl Action for CopyAction {
                 // directory with ignored paths, as the materializer will incorrectly assume that
                 // the source directory matches the artifact value when it doesn't.
                 vec![CopiedArtifact::new(
-                    src,
+                    src_physical,
                     dest,
                     value.entry().dupe().map_dir(|d| d.as_immutable()),
                     match self.copy {
