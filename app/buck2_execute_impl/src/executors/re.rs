@@ -17,7 +17,6 @@ use buck2_core::execution_types::executor_config::MetaInternalExtraParams;
 use buck2_core::execution_types::executor_config::ReGangWorker;
 use buck2_core::execution_types::executor_config::RemoteExecutorDependency;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
-use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::soft_error;
 use buck2_events::dispatch::span_async;
@@ -76,7 +75,6 @@ pub enum RemoteExecutorError {
 
 pub struct ReExecutor {
     pub artifact_fs: ArtifactFs,
-    pub project_fs: ProjectRoot,
     pub materializer: Arc<dyn Materializer>,
     pub incremental_db_state: Arc<IncrementalDbState>,
     pub re_client: ManagedRemoteExecutionClient,
@@ -110,7 +108,7 @@ impl ReExecutor {
         let upload_response = span_async(buck2_data::ReUploadStart {}, async move {
             let res = re_client
                 .upload(
-                    &self.project_fs,
+                    &self.artifact_fs,
                     &self.materializer,
                     blobs,
                     ProjectRelativePath::empty(),
