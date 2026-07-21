@@ -23,6 +23,7 @@ use buck2_events::dispatch::span_async;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::execute::action_digest::ActionDigest;
 use buck2_execute::execute::blobs::ActionBlobs;
+use buck2_execute::execute::cell_execution_view::CellExecutionView;
 use buck2_execute::execute::kind::CommandExecutionKind;
 use buck2_execute::execute::kind::RemoteCommandExecutionDetails;
 use buck2_execute::execute::manager::CommandExecutionManager;
@@ -92,6 +93,8 @@ pub struct ReExecutor {
     pub deduplicate_get_digests_ttl_calls: bool,
     pub output_trees_download_config: OutputTreesDownloadConfig,
     pub priority: Option<i32>,
+    /// Used only for failed-action input repro; ordinary remote execution touches no view.
+    pub cell_execution_view: Option<Arc<dyn CellExecutionView>>,
 }
 
 impl ReExecutor {
@@ -486,6 +489,7 @@ impl PreparedCommandExecutor for ReExecutor {
             self.materialize_failed_outputs,
             additional_message,
             &self.output_trees_download_config,
+            self.cell_execution_view.as_deref(),
         )
         .boxed()
         .await;
