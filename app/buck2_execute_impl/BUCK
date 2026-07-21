@@ -24,6 +24,7 @@ rust_library(
     },
     test_deps = [
         "fbsource//third-party/rust:assert_matches",
+        "fbsource//third-party/rust:tempfile",
     ],
     deps = [
         "fbsource//third-party/rust:async-condvar-fair",
