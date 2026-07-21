@@ -20,9 +20,11 @@ use buck2_common::file_ops::metadata::FileDigest;
 use buck2_common::file_ops::metadata::FileDigestKind;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_core::buck2_env;
+use buck2_core::cells::name::CellName;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
+use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::soft_error;
 use buck2_data::ReUploadMetrics;
 use buck2_directory::directory::directory::Directory;
@@ -76,6 +78,32 @@ pub struct UploadStats {
 }
 
 pub struct Uploader {}
+
+fn source_upload_path(
+    artifact_fs: &ArtifactFs,
+    execution_path: ProjectRelativePathBuf,
+    physical_roots: &mut StdBuckHashMap<CellName, ProjectRelativePathBuf>,
+) -> buck2_error::Result<ProjectRelativePathBuf> {
+    let Some(cell_path) = artifact_fs.decode_source_execution_leaf_path(&execution_path)? else {
+        return Ok(execution_path);
+    };
+    let physical_root = match physical_roots.get(&cell_path.cell()) {
+        Some(root) => root.clone(),
+        None => {
+            let root = artifact_fs.resolve_cell_source_root_for_consumption(cell_path.cell())?;
+            physical_roots.insert(cell_path.cell(), root.clone());
+            root
+        }
+    };
+    let physical_path = physical_root.join(cell_path.path());
+    tracing::debug!(
+        source_identity = %cell_path,
+        execution_path = %execution_path,
+        physical_path = %physical_path,
+        "Resolved canonical source upload path"
+    );
+    Ok(physical_path)
+}
 
 impl Uploader {
     async fn find_missing<'a>(
@@ -269,6 +297,7 @@ impl Uploader {
         if !missing_digests.is_empty() {
             let mut upload_file_paths = Vec::new();
             let mut upload_file_digests = Vec::new();
+            let mut physical_source_roots = StdBuckHashMap::default();
 
             {
                 let mut walk = input_dir.unordered_walk();
@@ -288,7 +317,12 @@ impl Uploader {
                             upload_blobs.push(directory_to_blob(d));
                         }
                         DirectoryEntry::Leaf(ActionDirectoryMember::File(..)) => {
-                            upload_file_paths.push(dir_path.join(path.get()));
+                            let execution_path = dir_path.join(path.get());
+                            upload_file_paths.push(source_upload_path(
+                                artifact_fs,
+                                execution_path,
+                                &mut physical_source_roots,
+                            )?);
                             upload_file_digests.push(digest.to_re());
                         }
                         DirectoryEntry::Leaf(..) => unreachable!(), // TODO: Better representation of this.
@@ -768,4 +802,66 @@ where
 
             Ok((digest, digest_ttl))
         }))
+}
+
+#[cfg(test)]
+mod tests {
+    use buck2_common::file_ops::metadata::FileMetadata;
+    use buck2_core::cells::cell_path::CellPath;
+    use buck2_core::cells::name::CellName;
+    use buck2_core::cells::paths::CellRelativePathBuf;
+    use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
+
+    use super::*;
+    use crate::directory::ActionDirectoryBuilder;
+
+    fn canonical_external_fs() -> buck2_error::Result<ArtifactFs> {
+        Ok(ArtifactFs::testing_new_with_mode_and_external(
+            CellSourcePathMode::CanonicalV1,
+            &[("root", ""), ("sample", "declared/sample")],
+            &["sample"],
+        ))
+    }
+
+    #[test]
+    fn uploader_reads_physical_bytes_without_renaming_merkle_leaf() -> buck2_error::Result<()> {
+        let artifact_fs = canonical_external_fs()?;
+        let logical_leaf = artifact_fs.resolve_cell_path_for_execution(
+            CellPath::new(
+                CellName::testing_new("sample"),
+                CellRelativePathBuf::unchecked_new("pkg/src.cpp".to_owned()),
+            )
+            .as_ref(),
+        )?;
+        let physical_leaf = artifact_fs
+            .resolve_cell_source_root_physical(CellName::testing_new("sample"))?
+            .join(
+                buck2_fs::paths::forward_rel_path::ForwardRelativePath::unchecked_new(
+                    "pkg/src.cpp",
+                ),
+            );
+
+        let mut builder = ActionDirectoryBuilder::empty();
+        builder.insert(
+            &logical_leaf,
+            DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
+                digest: DigestConfig::testing_default().empty_file().digest,
+                is_executable: false,
+            })),
+        )?;
+        let directory =
+            builder.fingerprint(DigestConfig::testing_default().as_directory_serializer());
+        let merkle_names = directory
+            .unordered_walk_leaves()
+            .paths()
+            .map(|path| path.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(merkle_names, vec![logical_leaf.as_str()]);
+        assert_eq!(
+            source_upload_path(&artifact_fs, logical_leaf, &mut StdBuckHashMap::default())?,
+            physical_leaf
+        );
+        Ok(())
+    }
 }
