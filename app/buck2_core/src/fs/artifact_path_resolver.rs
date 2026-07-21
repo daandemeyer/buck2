@@ -8,6 +8,8 @@
  * above-listed licenses.
  */
 
+use std::io;
+
 use allocative::Allocative;
 use buck2_fs::paths::file_name::FileName;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
@@ -249,6 +251,24 @@ impl ArtifactFs {
                     .join(path.path()))
             }
         }
+    }
+
+    /// Missing roots remain the responsibility of normal source lookup, but existing local root
+    /// components must not redirect canonical source identity through a symlink or junction.
+    pub fn validate_canonical_cell(&self, cell: CellName) -> buck2_error::Result<()> {
+        if self.cell_source_path_mode == CellSourcePathMode::Physical {
+            return Ok(());
+        }
+
+        self.validate_canonical_cell_layout(cell)?;
+        let instance = self.cell_resolver.get(cell)?;
+        if instance.external().is_none() {
+            self.validate_local_cell_root_no_follow(
+                cell,
+                instance.path().as_project_relative_path(),
+            )?;
+        }
+        Ok(())
     }
 
     /// Runs the lexical checks eagerly so a misconfigured workspace fails before any source
@@ -498,6 +518,44 @@ impl ArtifactFs {
         Ok(())
     }
 
+    fn validate_local_cell_root_no_follow(
+        &self,
+        cell: CellName,
+        physical_root: &crate::fs::project_rel_path::ProjectRelativePath,
+    ) -> buck2_error::Result<()> {
+        let mut current = self.project_filesystem.root().as_path().to_path_buf();
+        for component in physical_root.iter() {
+            current.push(component.as_str());
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || metadata_is_reparse_point(&metadata) {
+                        return Err(buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::Input,
+                            "Local cell `{cell}` has source root `{physical_root}` with symlink/junction component `{}`; canonical_v1 requires ordinary local cell roots to use real directory components",
+                            current.display(),
+                        ));
+                    }
+                    if !metadata.is_dir() {
+                        return Err(buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::Input,
+                            "Local cell `{cell}` has source root `{physical_root}` with non-directory component `{}`",
+                            current.display(),
+                        ));
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+                Err(e) => {
+                    return Err(buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Input,
+                        "Failed to inspect local cell `{cell}` source-root component `{}`: {e}",
+                        current.display(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn canonical_cell_sources_root(&self) -> ProjectRelativePathBuf {
         self.buck_out_path_resolver
             .root()
@@ -569,6 +627,19 @@ pub(crate) fn source_component_eq(left: &str, right: &str) -> bool {
     {
         left == right
     }
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -919,6 +990,23 @@ mod tests {
                 "Buck-out root `{root}` should be rejected"
             );
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_local_cell_root_does_not_follow_symlinks() -> buck2_error::Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::create_dir(temp.path().join("real"))?;
+        std::os::unix::fs::symlink("real", temp.path().join("alias"))?;
+
+        let mut fs = local_artifact_fs_with_cell_name_and_path("sample", "alias")?;
+        fs.project_filesystem =
+            ProjectRoot::new_unchecked(AbsNormPathBuf::new(temp.path().to_path_buf()).unwrap());
+        assert!(
+            fs.validate_canonical_cell(CellName::testing_new("sample"))
+                .is_err()
+        );
         Ok(())
     }
 }

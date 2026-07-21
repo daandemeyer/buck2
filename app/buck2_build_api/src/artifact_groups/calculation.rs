@@ -28,6 +28,8 @@ use buck2_common::legacy_configs::key::BuckconfigKeyRef;
 use buck2_common::package_listing::dice::DicePackageListingResolver;
 use buck2_core::build_file_path::BuildFilePath;
 use buck2_core::cells::cell_path::CellPath;
+use buck2_core::fs::artifact_path_resolver::CanonicalSourcePathClass;
+use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
 use buck2_core::package::PackageLabel;
 use buck2_directory::directory::directory_data::DirectoryData;
 use buck2_error::BuckErrorContext;
@@ -287,12 +289,44 @@ async fn dir_artifact_value(
             ctx: &mut DiceComputations,
             _cancellation: &CancellationContext,
         ) -> Self::Value {
+            let artifact_fs = ctx.get_artifact_fs().await?;
+            artifact_fs.validate_canonical_cell(self.0.cell())?;
             let files = DiceFileComputations::read_dir(ctx, self.0.as_ref().as_ref())
                 .await?
                 .included;
+            let mut included = Vec::with_capacity(files.len());
+            for entry in files.iter() {
+                if artifact_fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1
+                    && self.0.path().is_empty()
+                {
+                    // Omit only the byte-exact `buck-out` entry: it is present in
+                    // every physical checkout on every host, so filtering it keeps
+                    // the directory value host-independent. Case-variant names are
+                    // reserved host-dependently (case-insensitive on Windows), so
+                    // silently dropping them would diverge the directory
+                    // fingerprint across daemon hosts for byte-identical
+                    // checkouts; reject them loudly instead, matching direct
+                    // source references.
+                    if entry.file_name.as_str() == "buck-out" {
+                        continue;
+                    }
+                    if artifact_fs.classify_source_top_level_name(&entry.file_name)
+                        == CanonicalSourcePathClass::ReservedBuckOut
+                    {
+                        return Err(buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::Input,
+                            "Source directory entry `{}` in cell `{}` is a case variant of the reserved top-level `buck-out` name in `canonical_v1`",
+                            entry.file_name,
+                            self.0.cell(),
+                        ));
+                    }
+                }
+                included.push(entry.clone());
+            }
+            let files = included;
 
             let entry_values = ctx
-                .try_compute_join(files.iter(), async |ctx, x| {
+                .try_compute_join(files, async |ctx, x| {
                     // TODO(scottcao): This current creates a `DirArtifactValueKey` for each subdir of a source directory.
                     // Instead, this should be 1 key for the entire top-level directory since there's almost
                     // no chance of getting cache hit with a sub-directory.
@@ -302,7 +336,7 @@ async fn dir_artifact_value(
                         None,
                     )
                     .await?;
-                    buck2_error::Ok((x.file_name.clone(), value))
+                    buck2_error::Ok((x.file_name, value))
                 })
                 .await?;
 
@@ -372,6 +406,18 @@ async fn path_artifact_value(
     cell_path: Arc<CellPath>,
     label: Option<PackageLabel>,
 ) -> buck2_error::Result<ArtifactValue> {
+    let artifact_fs = ctx.get_artifact_fs().await?;
+    artifact_fs.validate_canonical_cell(cell_path.cell())?;
+    if artifact_fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1
+        && artifact_fs.classify_source_cell_path(cell_path.path())
+            == CanonicalSourcePathClass::ReservedBuckOut
+    {
+        return Err(buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "Source path `{cell_path}` is beneath the reserved top-level `buck-out` subtree in `canonical_v1`",
+        ));
+    }
+
     let raw = match DiceFileComputations::read_path_metadata(ctx, cell_path.as_ref().as_ref()).await
     {
         Ok(raw) => Ok(raw),
@@ -397,12 +443,22 @@ async fn path_artifact_value(
 
     match raw {
         RawPathMetadata::Symlink {
-            at: _,
+            at,
             to: RawSymlink::External(external_symlink),
-        } => Ok(ArtifactValue::new(
-            ActionDirectoryEntry::Leaf(ActionDirectoryMember::ExternalSymlink(external_symlink)),
-            None,
-        )),
+        } => {
+            if artifact_fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
+                return Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "Source symlink `{at}` has an absolute or external target; canonical_v1 only supports relative source symlinks that remain inside one cell",
+                ));
+            }
+            Ok(ArtifactValue::new(
+                ActionDirectoryEntry::Leaf(ActionDirectoryMember::ExternalSymlink(
+                    external_symlink,
+                )),
+                None,
+            ))
+        }
         RawPathMetadata::File(metadata) => Ok(ArtifactValue::new(
             ActionDirectoryEntry::Leaf(ActionDirectoryMember::File(metadata)),
             None,
@@ -412,6 +468,12 @@ async fn path_artifact_value(
             at,
             to: RawSymlink::Relative(target, target_rel),
         } => {
+            if artifact_fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
+                return Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "Declared source symlink `{at}` is not yet supported with `cell_execution_paths = canonical_v1`",
+                ));
+            }
             // TODO (T126181780): This should have a limit on recursion.
             let target_artifact_value = path_artifact_value(ctx, target.dupe(), label).await?;
             let root_cell = ctx.get_cell_resolver().await?.root_cell();
@@ -431,7 +493,6 @@ async fn path_artifact_value(
             // `ArtifactValue` to make that possible, but Jakob isn't sure that's a good idea
             let dont_read_through_symlink = use_correct_source_symlink_reading && at == cell_path;
             if dont_read_through_symlink {
-                let artifact_fs = ctx.get_artifact_fs().await?;
                 let target_path =
                     artifact_fs.resolve_cell_path_for_execution((*target).as_ref())?;
                 let mut builder = ActionDirectoryBuilder::empty();
