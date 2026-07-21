@@ -41,13 +41,11 @@ impl<T> FindConflict<T> for PathAccumulator {
     }
 }
 
-#[cfg(test)]
 struct PrefixLookupContainer<T> {
     leaf: T,
     path: buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf,
 }
 
-#[cfg(test)]
 impl<T> FindConflict<T> for PrefixLookupContainer<T> {
     fn new<'b>(path: &'b FileName, remaining: impl Iterator<Item = &'b FileName>, leaf: T) -> Self {
         Self {
@@ -76,8 +74,9 @@ pub fn find<'a, 'b, D: DirectoryRef<'a>>(
         .map_err(move |path| DirectoryFindError::CannotTraverseLeaf { path })
 }
 
-#[cfg(test)] // Dead code.
-pub(crate) fn find_prefix<'a, 'b, D: DirectoryRef<'a>>(
+/// Find an exact entry, or the leaf which prevents traversal to it plus the path suffix below that
+/// leaf. For consumers which can treat particular leaves, such as symlinks, as membership prefixes.
+pub fn find_entry_or_prefix<'a, 'b, D: DirectoryRef<'a>>(
     dir: D,
     path: impl IntoIterator<Item = &'b FileName>,
 ) -> Result<
@@ -143,7 +142,7 @@ mod tests {
     use crate::directory::directory::Directory;
     use crate::directory::entry::DirectoryEntry;
     use crate::directory::find::find;
-    use crate::directory::find::find_prefix;
+    use crate::directory::find::find_entry_or_prefix;
     use crate::directory::test::NopEntry;
     use crate::directory::test::TestDirectoryBuilder;
     use crate::directory::test::path;
@@ -172,19 +171,19 @@ mod tests {
     }
 
     #[test]
-    fn test_find_prefix() -> buck2_error::Result<()> {
+    fn test_find_entry_or_prefix() -> buck2_error::Result<()> {
         let mut a = TestDirectoryBuilder::empty();
         a.insert(path("a/b/c"), DirectoryEntry::Leaf(NopEntry))?;
 
         assert_matches!(
-            find_prefix(a.as_ref(), path("a/b/c")),
+            find_entry_or_prefix(a.as_ref(), path("a/b/c")),
             Ok(Some((
                 DirectoryEntry::Leaf(..),
                 path
             ))) if path.is_empty()
         );
         assert_matches!(
-            find_prefix(a.as_ref(), path("a/b")),
+            find_entry_or_prefix(a.as_ref(), path("a/b")),
             Ok(Some((
                 DirectoryEntry::Dir(..),
                 path
@@ -192,13 +191,13 @@ mod tests {
         );
 
         assert_matches!(
-            find_prefix(a.as_ref(), path("a/b/c/d")),
+            find_entry_or_prefix(a.as_ref(), path("a/b/c/d")),
             Ok(Some((DirectoryEntry::Leaf(..), rest))) => {
                 assert_eq!(rest, path("d"));
             }
         );
         assert_matches!(
-            find_prefix(a.as_ref(), path("a/b/c/d/e")),
+            find_entry_or_prefix(a.as_ref(), path("a/b/c/d/e")),
             Ok(Some((DirectoryEntry::Leaf(..), rest))) => {
                 assert_eq!(rest, path("d/e"));
             }
