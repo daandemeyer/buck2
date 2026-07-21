@@ -403,7 +403,7 @@ impl CacheUploader {
                     let fut = async move {
                         self.re_client
                             .upload(
-                                self.artifact_fs.fs(),
+                                &self.artifact_fs,
                                 &self.materializer,
                                 &action_blobs,
                                 output.path(),

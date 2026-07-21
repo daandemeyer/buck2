@@ -21,7 +21,7 @@ use buck2_core::buck2_env;
 use buck2_core::execution_types::executor_config::MetaInternalExtraParams;
 use buck2_core::execution_types::executor_config::RemoteExecutorDependency;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
-use buck2_core::fs::project::ProjectRoot;
+use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_data::ReQueueAcquiringDependencies;
 use buck2_data::ReQueueCancelled;
@@ -267,7 +267,7 @@ impl RemoteExecutionClient {
 
     pub async fn upload(
         &self,
-        fs: &ProjectRoot,
+        artifact_fs: &ArtifactFs,
         materializer: &Arc<dyn Materializer>,
         blobs: &ActionBlobs,
         dir_path: &ProjectRelativePath,
@@ -283,7 +283,7 @@ impl RemoteExecutionClient {
         self.data
             .uploads
             .op(Uploader::upload(
-                fs,
+                artifact_fs,
                 self,
                 materializer,
                 dir_path,
