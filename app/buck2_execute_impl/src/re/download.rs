@@ -31,6 +31,7 @@ use buck2_execute::directory::ActionDirectoryMember;
 use buck2_execute::directory::extract_artifact_value;
 use buck2_execute::directory::re_tree_to_directory;
 use buck2_execute::execute::action_digest::TrackedActionDigest;
+use buck2_execute::execute::cell_execution_view::CellExecutionView;
 use buck2_execute::execute::executor_stage_async;
 use buck2_execute::execute::kind::RemoteCommandExecutionDetails;
 use buck2_execute::execute::manager::CommandExecutionManager;
@@ -94,6 +95,7 @@ pub async fn download_action_results<'a>(
     materialize_failed_re_action_outputs: bool,
     additional_message: Option<String>,
     output_trees_download_config: &OutputTreesDownloadConfig,
+    cell_execution_view: Option<&dyn CellExecutionView>,
 ) -> DownloadResult {
     let std_streams = response.std_streams(re_client, digest_config);
     let std_streams = async {
@@ -161,7 +163,20 @@ pub async fn download_action_results<'a>(
                         match materialize_inputs(artifact_fs, materializer, request, digest_config)
                             .await
                         {
-                            Ok(materialized_paths) => Some(materialized_paths.paths.clone()),
+                            Ok(materialized_paths) => {
+                                // The materialized canonical source paths are only readable for
+                                // local repro through the execution view; prepare it when the
+                                // daemon has one. Best effort: this is a debug aid.
+                                if let Some(view) = cell_execution_view
+                                    && let Err(e) = view
+                                        .prepare(artifact_fs, &materialized_paths.view_requirements)
+                                {
+                                    console_message(format!(
+                                        "Failed to prepare execution view for failed action inputs: {e}"
+                                    ));
+                                }
+                                Some(materialized_paths.paths.clone())
+                            }
                             Err(e) => {
                                 // TODO(minglunli): Properly handle this and the error below and add a test for it.
                                 console_message(format!(

@@ -20,6 +20,7 @@ use buck2_common::legacy_configs::dice::HasLegacyConfigs;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
 use buck2_common::legacy_configs::view::LegacyBuckConfigView;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
+use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_error::BuckErrorContext;
 use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
@@ -27,7 +28,10 @@ use buck2_execute::artifact_utils::ArtifactValueBuilder;
 use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::digest_config::HasDigestConfig;
 use buck2_execute::directory::ActionDirectoryBuilder;
+use buck2_execute::directory::LazyActionDirectoryBuilder;
 use buck2_execute::execute::blobs::ActionBlobs;
+use buck2_execute::execute::cell_execution_view::collect_canonical_source_inputs;
+use buck2_execute::execute::cell_execution_view::prepare_materialized_cell_execution_view;
 use buck2_execute::materialize::materializer::HasMaterializer;
 use buck2_hash::BuckDashSet;
 use dice::DiceComputations;
@@ -35,9 +39,11 @@ use dice::UserComputationData;
 use dice_futures::spawn::spawn_dropcancel;
 use dupe::Dupe;
 use futures::FutureExt;
+use futures::StreamExt;
 
 use crate::actions::artifact::get_artifact_fs::GetArtifactFs;
 use crate::actions::artifact::materializer::ArtifactMaterializer;
+use crate::actions::execute::dice_data::GetCellExecutionView;
 use crate::actions::execute::dice_data::GetReClient;
 use crate::actions::impls::run_action_knobs::HasRunActionKnobs;
 use crate::artifact_groups::ArtifactGroup;
@@ -79,6 +85,45 @@ buck2_util::size_assert::words_of_async_fn_future!(materialize_artifact_group, (
 #[cfg(fbcode_build)]
 buck2_util::size_assert::words_of_async_fn_future!(ensure_uploaded, (_, _), ~401);
 
+/// For processes Buck2 launches directly on the host rather than through a command executor.
+pub async fn prepare_materialized_artifact_group_values_for_local_consumption(
+    ctx: &mut DiceComputations<'_>,
+    values: &ArtifactGroupValues,
+) -> buck2_error::Result<()> {
+    let artifact_fs = ctx.get_artifact_fs().await?;
+    if artifact_fs.cell_source_path_mode() == CellSourcePathMode::Physical {
+        return Ok(());
+    }
+
+    let digest_config = ctx.global_data().get_digest_config();
+    let mut execution_inputs = LazyActionDirectoryBuilder::empty();
+    values.add_to_directory(&mut execution_inputs, &artifact_fs)?;
+    let execution_inputs = execution_inputs
+        .finalize()?
+        .fingerprint(digest_config.as_directory_serializer());
+    let canonical_sources = collect_canonical_source_inputs(&artifact_fs, &execution_inputs)?;
+
+    let materializer = ctx.per_transaction_data().get_materializer();
+    if !canonical_sources.physical_paths.is_empty() {
+        let mut source_materializations = materializer
+            .materialize_many(canonical_sources.physical_paths)
+            .await
+            .buck_error_context("Failed to materialize canonical source artifacts")?;
+        while let Some(result) = source_materializations.next().await {
+            result.buck_error_context("Failed to materialize canonical source artifacts")?;
+        }
+    }
+
+    prepare_materialized_cell_execution_view(
+        ctx.per_transaction_data()
+            .get_cell_execution_view()
+            .as_deref(),
+        &artifact_fs,
+        canonical_sources.view_requirements,
+        None,
+    )
+}
+
 async fn materialize_artifact_group(
     ctx: &mut DiceComputations<'_>,
     artifact_group: &ArtifactGroup,
@@ -91,15 +136,14 @@ async fn materialize_artifact_group(
 
     if let MaterializationContext::Materialize { force } = materialization_context {
         waiting_data.start_waiting_category_now(WaitingCategory::MaterializerPrepare);
+        prepare_materialized_artifact_group_values_for_local_consumption(ctx, &values).await?;
+
         let artifact_fs = ctx.get_artifact_fs().await?;
         let digest_config = ctx.global_data().get_digest_config();
 
         let data = ctx.data();
-        let shared_data = Arc::new((
-            data.dupe(),
-            artifact_fs.clone(),
-            ctx.per_transaction_data().get_materializer(),
-        ));
+        let materializer = ctx.per_transaction_data().get_materializer();
+        let shared_data = Arc::new((data.dupe(), artifact_fs.clone(), materializer.dupe()));
 
         let mut materialize_futs = Vec::new();
 
