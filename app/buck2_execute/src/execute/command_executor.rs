@@ -21,6 +21,8 @@ use buck2_core::execution_types::executor_config::RemoteExecutorCafFbpkg;
 use buck2_core::execution_types::executor_config::RemoteExecutorCustomImage;
 use buck2_core::execution_types::executor_config::RemoteExecutorDependency;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
+use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
+use buck2_core::fs::buck_out_path::BuckOutNamespace;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_data::NetworkAccess;
@@ -34,6 +36,9 @@ use remote_execution::TActionResult2;
 use sorted_vector_map::SortedVectorMap;
 
 use super::cache_uploader::CacheUploadResults;
+use super::cell_execution_view::CellExecutionView;
+use super::cell_execution_view::CellExecutionViewRequirements;
+use super::cell_execution_view::prepare_materialized_cell_execution_view;
 use crate::artifact::fs::ExecutorFs;
 use crate::digest::CasDigestToReExt;
 use crate::digest_config::DigestConfig;
@@ -54,6 +59,60 @@ use crate::execute::request::OutputType;
 use crate::execute::request::RemoteWorkerSpec;
 use crate::execute::result::CommandExecutionMetadata;
 use crate::execute::result::CommandExecutionResult;
+
+fn validate_canonical_working_directory(
+    artifact_fs: &ArtifactFs,
+    request: &CommandExecutionRequest,
+) -> buck2_error::Result<()> {
+    let working_directory = request.working_directory();
+    if artifact_fs.cell_source_path_mode() == CellSourcePathMode::Physical
+        || working_directory.is_empty()
+    {
+        return Ok(());
+    }
+
+    if let Some(cell_path) = artifact_fs.decode_source_execution_path(working_directory)? {
+        if cell_path.path().is_empty() && request.executor_preference().requires_local() {
+            return Ok(());
+        }
+        return Err(buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "Canonical cell execution paths only support an exact cell-root working directory for a local-only request; `{}` is in cell `{}`",
+            working_directory,
+            cell_path.cell(),
+        ));
+    }
+
+    if artifact_fs
+        .buck_out_path_resolver()
+        .classify_namespace(working_directory)
+        .is_some_and(|namespace| {
+            namespace.is_generated() && namespace != BuckOutNamespace::OfflineCache
+        })
+    {
+        // A declared output whose parents are created before execution is the only proof that the
+        // cwd will exist remotely too: elsewhere local resolution succeeds while the RE Merkle
+        // tree lacks the directory.
+        for output in request.outputs() {
+            let resolved = output.resolve_configuration_hash_path(artifact_fs)?;
+            if resolved
+                .path_to_create()
+                .is_some_and(|path| path.starts_with(working_directory))
+            {
+                return Ok(());
+            }
+        }
+        return Err(buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "Canonical cell execution paths support a generated working directory `{working_directory}` only when it contains a declared output of the request",
+        ));
+    }
+
+    Err(buck2_error!(
+        buck2_error::ErrorTag::Input,
+        "Canonical cell execution paths do not support physical source or arbitrary Buck-out working directory `{working_directory}`; use the project root, an exact canonical cell root for a local-only request, or a declared generated directory",
+    ))
+}
 
 #[derive(Copy, Dupe, Clone, Debug, PartialEq, Eq)]
 pub struct ActionExecutionTimingData {
@@ -87,6 +146,7 @@ struct CommandExecutorData {
     options: CommandGenerationOptions,
     re_platform: RE::Platform,
     cache_uploader: Arc<dyn UploadCache>,
+    cell_execution_view: Option<Arc<dyn CellExecutionView>>,
 }
 
 impl CommandExecutor {
@@ -99,6 +159,28 @@ impl CommandExecutor {
         options: CommandGenerationOptions,
         re_platform: RE::Platform,
     ) -> Self {
+        Self::new_with_cell_execution_view(
+            inner,
+            action_cache_checker,
+            remote_dep_file_cache_checker,
+            cache_uploader,
+            artifact_fs,
+            options,
+            re_platform,
+            None,
+        )
+    }
+
+    pub fn new_with_cell_execution_view(
+        inner: Arc<dyn PreparedCommandExecutor>,
+        action_cache_checker: Arc<dyn PreparedCommandOptionalExecutor>,
+        remote_dep_file_cache_checker: Arc<dyn PreparedCommandOptionalExecutor>,
+        cache_uploader: Arc<dyn UploadCache>,
+        artifact_fs: ArtifactFs,
+        options: CommandGenerationOptions,
+        re_platform: RE::Platform,
+        cell_execution_view: Option<Arc<dyn CellExecutionView>>,
+    ) -> Self {
         Self(Arc::new(CommandExecutorData {
             inner,
             action_cache_checker,
@@ -107,6 +189,7 @@ impl CommandExecutor {
             options,
             re_platform,
             cache_uploader,
+            cell_execution_view,
         }))
     }
 
@@ -120,6 +203,22 @@ impl CommandExecutor {
 
     pub fn re_platform(&self) -> &RE::Platform {
         &self.0.re_platform
+    }
+
+    /// The host-consumer handoff used outside the normal local executor, for inputs the caller has
+    /// already materialized.
+    pub fn prepare_materialized_execution_view(
+        &self,
+        request: &CommandExecutionRequest,
+        requirements: CellExecutionViewRequirements,
+    ) -> buck2_error::Result<()> {
+        validate_canonical_working_directory(&self.0.artifact_fs, request)?;
+        prepare_materialized_cell_execution_view(
+            self.0.cell_execution_view.as_deref(),
+            &self.0.artifact_fs,
+            requirements,
+            Some(request.working_directory()),
+        )
     }
 
     /// Check if the action can be served by the action cache.
@@ -201,6 +300,9 @@ impl CommandExecutor {
         re_outputs_required: bool,
     ) -> buck2_error::Result<PreparedAction> {
         executor_stage(buck2_data::PrepareAction {}, || {
+            // Validate only: action construction and cache lookup must stay side-effect free, so
+            // realizing the view is left to whichever consumer needs the paths.
+            validate_canonical_working_directory(&self.0.artifact_fs, request)?;
             let input_digest = request.paths().input_directory().fingerprint();
 
             let mut platform = self.0.re_platform.clone();
@@ -266,6 +368,167 @@ impl CommandExecutor {
 
             buck2_error::Ok(action)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use buck2_core::cells::cell_path::CellPath;
+    use buck2_core::cells::name::CellName;
+    use buck2_core::cells::paths::CellRelativePathBuf;
+    use buck2_core::fs::buck_out_path::BuckOutTestPath;
+    use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
+    use buck2_hash::BuckIndexSet;
+    use sorted_vector_map::SortedVectorMap;
+
+    use super::*;
+    use crate::execute::request::CommandExecutionOutput;
+    use crate::execute::request::CommandExecutionPaths;
+    use crate::execute::request::OutputCreationBehavior;
+
+    fn canonical_artifact_fs() -> buck2_error::Result<ArtifactFs> {
+        Ok(ArtifactFs::testing_new_with_mode_and_external(
+            CellSourcePathMode::CanonicalV1,
+            &[
+                ("root", ""),
+                ("local", "workspace/local"),
+                ("external", "declared/external"),
+            ],
+            &["external"],
+        ))
+    }
+
+    #[test]
+    fn canonical_working_directory_policy_is_local_and_lexical() -> buck2_error::Result<()> {
+        let fs = canonical_artifact_fs()?;
+        let request_with_outputs =
+            |cwd: ProjectRelativePathBuf,
+             preference: ExecutorPreference,
+             outputs: BuckIndexSet<CommandExecutionOutput>| {
+                Ok::<_, buck2_error::Error>(
+                    CommandExecutionRequest::new(
+                        vec!["tool".to_owned()],
+                        Vec::new(),
+                        CommandExecutionPaths::new(
+                            Vec::new(),
+                            outputs,
+                            &fs,
+                            DigestConfig::testing_default(),
+                            None,
+                        )?,
+                        SortedVectorMap::default(),
+                    )
+                    .with_working_directory(cwd)
+                    .with_executor_preference(preference),
+                )
+            };
+        let request = |cwd: ProjectRelativePathBuf, preference: ExecutorPreference| {
+            request_with_outputs(cwd, preference, Default::default())
+        };
+
+        let logical = fs.resolve_cell_path_for_execution(
+            CellPath::new(
+                CellName::testing_new("local"),
+                CellRelativePathBuf::unchecked_new(String::new()),
+            )
+            .as_ref(),
+        )?;
+        let local_physical =
+            fs.resolve_cell_source_root_physical(CellName::testing_new("local"))?;
+        let external_physical =
+            fs.resolve_cell_source_root_physical(CellName::testing_new("external"))?;
+
+        validate_canonical_working_directory(
+            &fs,
+            &request(logical.clone(), ExecutorPreference::LocalRequired)?,
+        )?;
+        for path in [logical, local_physical, external_physical] {
+            let error = validate_canonical_working_directory(
+                &fs,
+                &request(path, ExecutorPreference::Default)?,
+            )
+            .expect_err("remote-capable canonical or physical source cwd must be rejected");
+            assert!(error.to_string().contains("working directory"), "{error:#}");
+        }
+
+        assert!(
+            validate_canonical_working_directory(
+                &fs,
+                &request(
+                    ProjectRelativePathBuf::unchecked_new("app/pkg".to_owned()),
+                    ExecutorPreference::LocalRequired,
+                )?,
+            )
+            .is_err()
+        );
+        // A generated-namespace cwd is accepted only when the request proves the
+        // directory exists by declaring an output at or beneath it.
+        let test_output = CommandExecutionOutput::TestPath {
+            path: BuckOutTestPath::new(
+                ForwardRelativePathBuf::unchecked_new("buck-out/v2/test/base".to_owned()),
+                ForwardRelativePathBuf::unchecked_new("out.txt".to_owned()),
+            ),
+            create: OutputCreationBehavior::Parent,
+        };
+        let mut outputs = BuckIndexSet::default();
+        outputs.insert(test_output);
+        validate_canonical_working_directory(
+            &fs,
+            &request_with_outputs(
+                ProjectRelativePathBuf::unchecked_new("buck-out/v2/test/base".to_owned()),
+                ExecutorPreference::Default,
+                outputs,
+            )?,
+        )?;
+        let parent_only_output = CommandExecutionOutput::TestPath {
+            path: BuckOutTestPath::new(
+                ForwardRelativePathBuf::unchecked_new("buck-out/v2/test/base".to_owned()),
+                ForwardRelativePathBuf::unchecked_new("out.txt".to_owned()),
+            ),
+            create: OutputCreationBehavior::Parent,
+        };
+        let mut outputs = BuckIndexSet::default();
+        outputs.insert(parent_only_output);
+        assert!(
+            validate_canonical_working_directory(
+                &fs,
+                &request_with_outputs(
+                    ProjectRelativePathBuf::unchecked_new(
+                        "buck-out/v2/test/base/out.txt".to_owned()
+                    ),
+                    ExecutorPreference::Default,
+                    outputs,
+                )?,
+            )
+            .is_err(),
+            "an output whose parent alone is created must not justify using the output as cwd"
+        );
+        assert!(
+            validate_canonical_working_directory(
+                &fs,
+                &request(
+                    ProjectRelativePathBuf::unchecked_new(
+                        "buck-out/v2/gen/root/pkg/output".to_owned()
+                    ),
+                    ExecutorPreference::Default,
+                )?,
+            )
+            .is_err(),
+            "generated cwd without a contained declared output must be rejected"
+        );
+        assert!(
+            validate_canonical_working_directory(
+                &fs,
+                &request(
+                    ProjectRelativePathBuf::unchecked_new("buck-out/v2/offline-cache/x".to_owned()),
+                    ExecutorPreference::Default,
+                )?,
+            )
+            .is_err(),
+            "offline-cache cwd must be rejected outright"
+        );
+        Ok(())
     }
 }
 

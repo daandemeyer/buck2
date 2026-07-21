@@ -1056,7 +1056,9 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
             &fs,
             None,
             None,
-            None,
+            // This API hands the command to an external local runner, so it is local by
+            // construction; otherwise canonical cwd validation rejects it as remote-capable.
+            Some(ExecutorPreference::LocalRequired),
             vec![],
             worker,
             test_executor.re_dynamic_image(),
@@ -1075,6 +1077,14 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
             self.dice.global_data().get_digest_config(),
         )
         .await?;
+        // The normal local executor is bypassed here, so the view is published by hand, after
+        // every physical source leaf has been materialized.
+        test_executor
+            .executor()
+            .prepare_materialized_execution_view(
+                &execution_request,
+                materialized_inputs.view_requirements,
+            )?;
 
         prep_scratch_path(&materialized_inputs.scratch, &fs).await?;
 
@@ -1095,6 +1105,12 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
                 self.dice.global_data().get_digest_config(),
             )
             .await?;
+            test_executor
+                .executor()
+                .prepare_materialized_execution_view(
+                    &local_resource_setup_command.execution_request,
+                    materialized_inputs.view_requirements,
+                )?;
             let blocking_executor = self.dice.ctx().get_blocking_executor();
 
             prep_scratch_path(&materialized_inputs.scratch, &fs).await?;
@@ -1481,6 +1497,7 @@ impl BuckTestOrchestrator<'_> {
             remote_dep_file_cache_checker: _,
             cache_uploader,
             output_trees_download_config: _,
+            cell_execution_view,
         } = dice.get_command_executor_from_dice(executor_config).await?;
 
         let (cache_uploader, action_cache_checker) = match stage {
@@ -1498,7 +1515,7 @@ impl BuckTestOrchestrator<'_> {
             }
         };
 
-        let executor = CommandExecutor::new(
+        let executor = CommandExecutor::new_with_cell_execution_view(
             executor,
             action_cache_checker,
             Arc::new(NoOpCommandOptionalExecutor {}),
@@ -1506,6 +1523,7 @@ impl BuckTestOrchestrator<'_> {
             fs.clone(),
             executor_config.options,
             platform,
+            cell_execution_view,
         );
         Ok(executor)
     }
@@ -1530,10 +1548,11 @@ impl BuckTestOrchestrator<'_> {
             remote_dep_file_cache_checker: _,
             cache_uploader: _,
             output_trees_download_config: _,
+            cell_execution_view,
         } = dice
             .get_command_executor_from_dice(&executor_config)
             .await?;
-        let executor = CommandExecutor::new(
+        let executor = CommandExecutor::new_with_cell_execution_view(
             executor,
             Arc::new(NoOpCommandOptionalExecutor {}),
             Arc::new(NoOpCommandOptionalExecutor {}),
@@ -1541,6 +1560,7 @@ impl BuckTestOrchestrator<'_> {
             fs.clone(),
             executor_config.options,
             platform,
+            cell_execution_view,
         );
         Ok(executor)
     }

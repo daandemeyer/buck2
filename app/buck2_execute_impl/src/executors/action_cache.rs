@@ -198,6 +198,8 @@ async fn query_action_cache_and_download_result(
         false,
         None,
         output_trees_download_config,
+        // Cache hits never materialize failed-action inputs, so no view is needed.
+        None,
     )
     .await;
 

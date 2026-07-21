@@ -452,7 +452,9 @@ impl Drop for CleanProgressHandle {
 }
 
 fn clean_buck_out(path: &AbsNormPathBuf, console_type: ConsoleType) -> buck2_error::Result<()> {
-    let walk = WalkDir::new(path);
+    // Canonical cell execution roots are links into the user's checkout, so neither the parallel
+    // file-removal pass nor the final `remove_dir_all` may follow them.
+    let walk = WalkDir::new(path).follow_links(false);
     let thread_pool = ThreadPool::new(buck2_util::threads::available_parallelism());
     let error = Arc::new(Mutex::new(None));
 
@@ -525,4 +527,38 @@ fn clean_buck_out(path: &AbsNormPathBuf, console_type: ConsoleType) -> buck2_err
         fs_util::remove_dir_all(path).categorize_internal()?;
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    #[test]
+    fn clean_does_not_follow_canonical_cell_view_link() -> buck2_error::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let buck_out = temp.path().join("buck-out");
+        let generated = buck_out.join("v2/gen/output");
+        let canonical_cell = buck_out.join("v2/cell_sources/v1/c_73616d706c65");
+        let canonical_entry = canonical_cell.join("src");
+        let physical_cell = temp.path().join("physical-sample");
+        let physical_source = physical_cell.join("src/source.cpp");
+
+        fs::create_dir_all(generated.parent().unwrap())?;
+        fs::write(&generated, b"generated")?;
+        fs::create_dir_all(&canonical_cell)?;
+        fs::create_dir_all(physical_source.parent().unwrap())?;
+        fs::write(&physical_source, b"source")?;
+        symlink(physical_cell.join("src"), &canonical_entry)?;
+
+        clean_buck_out(&AbsNormPathBuf::new(buck_out.clone())?, ConsoleType::None)?;
+
+        assert!(physical_source.exists());
+        assert!(!generated.exists());
+        assert!(!canonical_entry.exists());
+        assert!(!canonical_cell.exists());
+        Ok(())
+    }
 }
