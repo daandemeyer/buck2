@@ -27,6 +27,7 @@ use buck2_common::liveliness_observer::NoopLivelinessObserver;
 use buck2_common::local_resource_state::LocalResourceHolder;
 use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
+use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
 use buck2_core::fs::buck_out_path::BuildArtifactPath;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
@@ -47,6 +48,11 @@ use buck2_execute::entry::HashingInfo;
 use buck2_execute::entry::build_entry_from_disk;
 use buck2_execute::execute::action_digest::ActionDigest;
 use buck2_execute::execute::blocking::BlockingExecutor;
+use buck2_execute::execute::cell_execution_view::CanonicalSourceInputs;
+use buck2_execute::execute::cell_execution_view::CellExecutionView;
+use buck2_execute::execute::cell_execution_view::CellExecutionViewRequirements;
+use buck2_execute::execute::cell_execution_view::collect_canonical_source_inputs;
+use buck2_execute::execute::cell_execution_view::prepare_materialized_cell_execution_view;
 use buck2_execute::execute::clean_output_paths::CleanOutputPaths;
 use buck2_execute::execute::environment_inheritance::EnvironmentInheritance;
 use buck2_execute::execute::executor_stage_async;
@@ -146,6 +152,7 @@ pub struct LocalExecutor {
     worker_pool: Option<Arc<WorkerPool>>,
     memory_tracker: Option<MemoryTrackerHandle>,
     daemon_id: DaemonId,
+    cell_execution_view: Option<Arc<dyn CellExecutionView>>,
 }
 
 impl LocalExecutor {
@@ -161,6 +168,7 @@ impl LocalExecutor {
         worker_pool: Option<Arc<WorkerPool>>,
         memory_tracker: Option<MemoryTrackerHandle>,
         daemon_id: DaemonId,
+        cell_execution_view: Option<Arc<dyn CellExecutionView>>,
     ) -> Self {
         Self {
             artifact_fs,
@@ -174,6 +182,7 @@ impl LocalExecutor {
             worker_pool,
             memory_tracker,
             daemon_id,
+            cell_execution_view,
         }
     }
 
@@ -584,10 +593,17 @@ impl LocalExecutor {
                 )
                 .await;
 
-                let scratch_path = r1?.scratch;
+                let materialized_inputs = r1?;
                 r2?;
 
-                buck2_error::Ok((scratch_path, Instant::now() - start))
+                prepare_materialized_cell_execution_view(
+                    self.cell_execution_view.as_deref(),
+                    &self.artifact_fs,
+                    materialized_inputs.view_requirements,
+                    Some(request.working_directory()),
+                )?;
+
+                buck2_error::Ok((materialized_inputs.scratch, Instant::now() - start))
             },
         )
         .boxed()
@@ -1093,6 +1109,21 @@ impl LocalExecutor {
         if let (Some(worker_spec), Some(worker_pool), ForkserverAccess::Client(_)) =
             (request.worker(), self.worker_pool.dupe(), &self.forkserver)
         {
+            if self.artifact_fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
+                // Persistent-worker lifecycle is not yet integrated with canonical cell
+                // execution paths: a worker process can outlive its command, and nothing
+                // confirms its exit before the sparse source view may be rebound for a
+                // different cell topology. Reject the combination cleanly; support lands
+                // in a follow-up change. Remote persistent workers are unaffected: they
+                // execute remotely and perform no view I/O.
+                return ControlFlow::Break(manager.error(
+                    "canonical_local_worker_unsupported",
+                    buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Input,
+                        "Local persistent workers are not yet supported with `cell_execution_paths = canonical_v1`; disable persistent workers or use physical cell execution paths"
+                    ),
+                ));
+            }
             let env = worker_spec
                 .env
                 .iter()
@@ -1350,6 +1381,7 @@ impl<'a> StrOrOsStr<'a> {
 pub struct MaterializedInputPaths {
     pub scratch: ScratchPath,
     pub paths: Vec<ProjectRelativePathBuf>,
+    pub view_requirements: CellExecutionViewRequirements,
 }
 
 /// Materialize all inputs artifact for CommandExecutionRequest so the command can be executed
@@ -1366,6 +1398,18 @@ pub async fn materialize_inputs(
     let mut paths = vec![];
     let mut scratch = ScratchPath(None);
     let mut configuration_path_to_content_based_path_symlinks = vec![];
+    let mut canonical_sources = CanonicalSourceInputs::default();
+
+    // A source entry can occur only in a generated artifact's dependency tree, so the finalized
+    // input directories are inspected rather than just the top-level artifact list.
+    if artifact_fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
+        let mut inputs =
+            collect_canonical_source_inputs(artifact_fs, request.paths().input_directory())?;
+        paths.append(&mut inputs.physical_paths);
+        canonical_sources
+            .view_requirements
+            .merge(inputs.view_requirements);
+    }
 
     for input in request.inputs().iter().chain(
         request
@@ -1460,7 +1504,11 @@ pub async fn materialize_inputs(
         }
     }
 
-    Ok(MaterializedInputPaths { scratch, paths })
+    Ok(MaterializedInputPaths {
+        scratch,
+        paths,
+        view_requirements: canonical_sources.view_requirements,
+    })
 }
 
 /// A scratch path discovered during `materialize_inputs`.
@@ -1780,19 +1828,99 @@ mod tests {
     use std::str;
 
     use assert_matches::assert_matches;
+    use buck2_build_signals::env::WaitingData;
     use buck2_common::liveliness_observer::NoopLivelinessObserver;
     use buck2_core::cells::CellResolver;
+    use buck2_core::cells::cell_path::CellPath;
     use buck2_core::cells::cell_root_path::CellRootPathBuf;
     use buck2_core::cells::name::CellName;
+    use buck2_core::cells::paths::CellRelativePathBuf;
     use buck2_core::fs::buck_out_path::BuckOutPathResolver;
     use buck2_core::fs::project::ProjectRoot;
     use buck2_core::fs::project::ProjectRootTemp;
+    use buck2_events::dispatch::with_dispatcher_async;
+    use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
+    use buck2_execute::artifact::group::artifact_group_values_dyn::ArtifactGroupValuesDyn;
     use buck2_execute::execute::blocking::testing::DummyBlockingExecutor;
+    use buck2_execute::execute::claim::MutexClaimManager;
+    use buck2_execute::execute::manager::CommandExecutionManager;
+    use buck2_execute::execute::request::CommandExecutionInput;
+    use buck2_execute::execute::request::CommandExecutionPaths;
+    use buck2_execute::execute::request::CommandExecutionRequest;
+    use buck2_execute::execute::result::CommandExecutionStatus;
     use buck2_hash::StdBuckHashMap;
+    use dice_futures::cancellation::CancellationContext;
     use host_sharing::HostSharingStrategy;
 
     use super::*;
+    use crate::executors::cell_execution_view::CanonicalCellExecutionView;
     use crate::materializers::deferred::NoDiskDeferredMaterializer;
+
+    struct TestSourceArtifact(CellPath);
+
+    impl ArtifactDyn for TestSourceArtifact {
+        fn resolve_path(
+            &self,
+            fs: &ArtifactFs,
+            _content_hash: Option<&ContentBasedPathHash>,
+        ) -> buck2_error::Result<ProjectRelativePathBuf> {
+            fs.resolve_cell_path(self.0.as_ref())
+        }
+
+        fn resolve_path_for_execution(
+            &self,
+            fs: &ArtifactFs,
+            _content_hash: Option<&ContentBasedPathHash>,
+        ) -> buck2_error::Result<ProjectRelativePathBuf> {
+            fs.resolve_cell_path_for_execution(self.0.as_ref())
+        }
+
+        fn resolve_configuration_hash_path(
+            &self,
+            fs: &ArtifactFs,
+        ) -> buck2_error::Result<ProjectRelativePathBuf> {
+            self.resolve_path(fs, None)
+        }
+
+        fn requires_materialization(&self, _fs: &ArtifactFs) -> bool {
+            false
+        }
+
+        fn has_content_based_path(&self) -> bool {
+            false
+        }
+
+        fn is_projected(&self) -> bool {
+            false
+        }
+    }
+
+    struct TestArtifactGroupValues {
+        artifact: TestSourceArtifact,
+        value: ArtifactValue,
+    }
+
+    impl ArtifactGroupValuesDyn for TestArtifactGroupValues {
+        fn iter(&self) -> Box<dyn Iterator<Item = (&dyn ArtifactDyn, &ArtifactValue)> + '_> {
+            Box::new(std::iter::once((
+                &self.artifact as &dyn ArtifactDyn,
+                &self.value,
+            )))
+        }
+
+        fn add_to_directory(
+            &self,
+            builder: &mut buck2_execute::directory::LazyActionDirectoryBuilder,
+            artifact_fs: &ArtifactFs,
+        ) -> buck2_error::Result<()> {
+            buck2_execute::directory::insert_artifact_lazy(
+                builder,
+                self.artifact
+                    .resolve_path_for_execution(artifact_fs, None)?,
+                &self.value,
+            )
+        }
+    }
 
     fn artifact_fs(project_fs: ProjectRoot) -> ArtifactFs {
         ArtifactFs::new(
@@ -1829,6 +1957,7 @@ mod tests {
             None,
             None,
             DaemonId::new(),
+            None,
         );
 
         Ok((executor, temp.path().root().to_buf(), temp))
@@ -1868,6 +1997,102 @@ mod tests {
             assert_eq!(stdout, format!("{root}\n{root}\n"));
         }
 
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_local_execution_observes_logical_source_path() -> buck2_error::Result<()> {
+        let temp = ProjectRootTemp::new()?;
+        std::fs::create_dir_all(temp.path().root().as_path().join("cell_path"))?;
+        std::fs::write(
+            temp.path().root().as_path().join("cell_path/input.txt"),
+            b"",
+        )?;
+
+        let cell = CellName::testing_new("cell");
+        let artifact_fs = ArtifactFs::new_with_cell_source_path_mode(
+            CellResolver::testing_with_name_and_path(
+                cell,
+                CellRootPathBuf::new(ProjectRelativePathBuf::unchecked_new("cell_path".into())),
+            ),
+            BuckOutPathResolver::new(ProjectRelativePathBuf::unchecked_new("buck-out/v2".into())),
+            temp.path().clone(),
+            CellSourcePathMode::CanonicalV1,
+        );
+        let source = CellPath::new(
+            cell,
+            CellRelativePathBuf::unchecked_new("input.txt".to_owned()),
+        );
+        let logical_path = artifact_fs.resolve_cell_path_for_execution(source.as_ref())?;
+        let digest_config = DigestConfig::testing_default();
+        let paths = CommandExecutionPaths::new(
+            vec![CommandExecutionInput::Artifact(Box::new(
+                TestArtifactGroupValues {
+                    artifact: TestSourceArtifact(source),
+                    value: ArtifactValue::file(digest_config.empty_file()),
+                },
+            ))],
+            Default::default(),
+            &artifact_fs,
+            digest_config,
+            None,
+        )?;
+        let request = CommandExecutionRequest::new(
+            vec!["sh".to_owned()],
+            vec!["-c".to_owned(), format!("test -f {logical_path}")],
+            paths,
+            Default::default(),
+        );
+
+        let executor = LocalExecutor::new(
+            artifact_fs,
+            Arc::new(NoDiskDeferredMaterializer::testing_new_no_disk(
+                temp.path().dupe(),
+            )?),
+            Arc::new(IncrementalDbState::db_disabled()),
+            Arc::new(DummyBlockingExecutor {
+                fs: temp.path().clone(),
+            }),
+            Arc::new(HostSharingBroker::new(
+                HostSharingStrategy::SmallerTasksFirst,
+                1,
+            )),
+            temp.path().root().to_buf(),
+            ForkserverAccess::None,
+            ExecutorGlobalKnobs::default(),
+            None,
+            None,
+            DaemonId::new(),
+            Some(Arc::new(CanonicalCellExecutionView::new())),
+        );
+        let manager = CommandExecutionManager::new(
+            Box::new(MutexClaimManager::new()),
+            EventDispatcher::null(),
+            Arc::new(NoopLivelinessObserver),
+            WaitingData::new(),
+        );
+        let cancellations = CancellationContext::testing();
+        let action_digest = ActionDigest::empty(digest_config.cas_digest_config());
+        let result = with_dispatcher_async(
+            EventDispatcher::null(),
+            cancellations.with_structured_cancellation(|observer| {
+                executor.exec_request(
+                    &action_digest,
+                    &request,
+                    manager,
+                    observer,
+                    cancellations,
+                    digest_config,
+                    &[],
+                    None,
+                )
+            }),
+        )
+        .await;
+
+        assert_matches!(result.report.status, CommandExecutionStatus::Success { .. });
+        assert!(temp.path().resolve(&logical_path).as_path().is_file());
         Ok(())
     }
 

@@ -64,6 +64,8 @@ struct CellResolverKey;
 impl InjectedKey for CellResolverKey {
     type Value = Option<CellResolver>;
 
+    /// Lazy rebinding of `canonical_v1` execution views assumes any cell topology change makes the
+    /// next command's DICE state non-equivalent, so this must stay a structural comparison.
     fn equality(x: &Self::Value, y: &Self::Value) -> bool {
         match (x, y) {
             (Some(x), Some(y)) => x == y,
@@ -156,5 +158,102 @@ impl SetCellResolver for DiceTransactionUpdater {
 
     fn set_none_cell_resolver(&mut self) -> buck2_error::Result<()> {
         Ok(self.changed_to(vec![(CellResolverKey, None)])?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use buck2_core::cells::cell_root_path::CellRootPathBuf;
+    use buck2_core::cells::external::ExternalCellOrigin;
+    use buck2_core::cells::external::GitCellSetup;
+    use buck2_core::cells::instance::CellInstance;
+    use buck2_core::cells::nested::NestedCells;
+    use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+
+    use super::*;
+
+    fn resolver(
+        cell_root: &str,
+        external: Option<ExternalCellOrigin>,
+    ) -> buck2_error::Result<CellResolver> {
+        let root_name = CellName::testing_new("root");
+        let cell_name = CellName::testing_new("sample");
+        let root_path = CellRootPathBuf::new(ProjectRelativePathBuf::unchecked_new(String::new()));
+        let cell_path =
+            CellRootPathBuf::new(ProjectRelativePathBuf::unchecked_new(cell_root.to_owned()));
+        let roots = [
+            (root_name, root_path.as_path()),
+            (cell_name, cell_path.as_path()),
+        ];
+        CellResolver::new(
+            vec![
+                CellInstance::new(
+                    root_name,
+                    root_path.clone(),
+                    None,
+                    NestedCells::from_cell_roots(&roots, root_path.as_path()),
+                )?,
+                CellInstance::new(
+                    cell_name,
+                    cell_path.clone(),
+                    external,
+                    NestedCells::from_cell_roots(&roots, cell_path.as_path()),
+                )?,
+            ],
+            CellAliasResolver::new(root_name, Default::default())?,
+        )
+    }
+
+    fn git(commit: &str) -> Option<ExternalCellOrigin> {
+        Some(ExternalCellOrigin::Git(GitCellSetup {
+            git_origin: Arc::from("https://example.com/sample.git"),
+            commit: Arc::from(commit),
+            object_format: None,
+        }))
+    }
+
+    /// Pins the invariant documented on [`CellResolverKey::equality`].
+    #[test]
+    fn cell_resolver_key_equality_tracks_topology() -> buck2_error::Result<()> {
+        let eq = <CellResolverKey as InjectedKey>::equality;
+        let base = resolver("third-party/sample", None)?;
+
+        assert!(eq(
+            &Some(base.clone()),
+            &Some(resolver("third-party/sample", None)?)
+        ));
+        assert!(!eq(
+            &Some(base.clone()),
+            &Some(resolver("development/sample", None)?)
+        ));
+
+        let commit_a = "0123456789abcdef0123456789abcdef01234567";
+        let with_origin = resolver("third-party/sample", git(commit_a))?;
+        assert!(!eq(&Some(base.clone()), &Some(with_origin.clone())));
+        assert!(eq(
+            &Some(with_origin.clone()),
+            &Some(resolver("third-party/sample", git(commit_a))?)
+        ));
+        assert!(!eq(
+            &Some(with_origin.clone()),
+            &Some(resolver(
+                "third-party/sample",
+                git("89abcdef0123456789abcdef0123456789abcdef")
+            )?)
+        ));
+        // The origin *kind* must discriminate too, not just the git commit.
+        assert!(!eq(
+            &Some(with_origin),
+            &Some(resolver(
+                "third-party/sample",
+                Some(ExternalCellOrigin::Bundled(CellName::testing_new("sample")))
+            )?)
+        ));
+
+        assert!(!eq(&Some(base), &None));
+        assert!(eq(&None, &None));
+        Ok(())
     }
 }
