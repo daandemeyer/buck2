@@ -291,6 +291,7 @@ mod tests {
     use buck2_artifact::artifact::source_artifact::SourceArtifact;
     use buck2_common::file_ops::metadata::FileMetadata;
     use buck2_common::file_ops::metadata::TrackedFileDigest;
+    use buck2_core::cells::name::CellName;
     use buck2_core::configuration::data::ConfigurationData;
     use buck2_core::execution_types::executor_config::CommandGenerationOptions;
     use buck2_core::execution_types::executor_config::OutputPathsBehavior;
@@ -301,7 +302,11 @@ mod tests {
     use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
     use buck2_directory::directory::fingerprinted_directory::FingerprintedDirectory;
     use buck2_execute::digest::CasDigestToReExt;
+    use buck2_execute::directory::ActionDirectoryBuilder;
+    use buck2_execute::directory::INTERNER;
+    use buck2_execute::directory::insert_artifact;
     use buck2_execute::execute::cache_uploader::NoOpCacheUploader;
+    use buck2_execute::execute::cell_execution_view::collect_canonical_source_inputs;
     use buck2_execute::execute::command_executor::CommandExecutor;
     use buck2_execute::execute::prepared::NoOpCommandOptionalExecutor;
     use buck2_execute::execute::request::ActionMetadataBlobData;
@@ -716,6 +721,63 @@ mod tests {
             "the canonical cell-name component must keep distinct cells disjoint",
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_source_collector_finds_top_level_and_artifact_value_deps()
+    -> buck2_error::Result<()> {
+        let digest_config = DigestConfig::testing_default();
+        let artifact_fs = source_artifact_fs(
+            "sample",
+            "declared/sample",
+            true,
+            CellSourcePathMode::CanonicalV1,
+        )?;
+        let source_path = SourcePath::testing_new("sample//pkg", "src.cpp");
+        let source = Artifact::from(SourceArtifact::new(source_path.clone()));
+        let source_value = source_value(b"source", digest_config);
+        let top_level_paths = CommandExecutionPaths::new(
+            vec![CommandExecutionInput::Artifact(Box::new(
+                ArtifactGroupValues::from_artifact(source.dupe(), source_value.dupe()),
+            ))],
+            Default::default(),
+            &artifact_fs,
+            digest_config,
+            None,
+        )?;
+        let expected_physical = artifact_fs.resolve_source(source_path.as_ref())?;
+        let collected =
+            collect_canonical_source_inputs(&artifact_fs, top_level_paths.input_directory())?;
+        assert_eq!(
+            collected.view_requirements.cells().collect::<Vec<_>>(),
+            vec![CellName::testing_new("sample")]
+        );
+        assert_eq!(collected.physical_paths, vec![expected_physical.clone()]);
+
+        let mut deps = ActionDirectoryBuilder::empty();
+        insert_artifact(
+            &mut deps,
+            artifact_fs.resolve_source_for_execution(source_path.as_ref())?,
+            &source_value,
+        )?;
+        let deps = deps
+            .fingerprint(digest_config.as_directory_serializer())
+            .shared(&*INTERNER);
+        let (generated, generated_value) = artifact("generated");
+        let generated_value = ArtifactValue::new(generated_value.entry().dupe(), Some(deps));
+        let dependency_paths = CommandExecutionPaths::new(
+            vec![CommandExecutionInput::Artifact(Box::new(
+                ArtifactGroupValues::from_artifact(generated, generated_value),
+            ))],
+            Default::default(),
+            &artifact_fs,
+            digest_config,
+            None,
+        )?;
+        let collected =
+            collect_canonical_source_inputs(&artifact_fs, dependency_paths.input_directory())?;
+        assert_eq!(collected.physical_paths, vec![expected_physical]);
         Ok(())
     }
 

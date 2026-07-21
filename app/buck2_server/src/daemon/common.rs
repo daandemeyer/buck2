@@ -37,6 +37,7 @@ use buck2_events::daemon_id::DaemonId;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::cache_uploader::NoOpCacheUploader;
 use buck2_execute::execute::cache_uploader::force_cache_upload;
+use buck2_execute::execute::cell_execution_view::CellExecutionView;
 use buck2_execute::execute::prepared::NoOpCommandOptionalExecutor;
 use buck2_execute::execute::prepared::PreparedCommandExecutor;
 use buck2_execute::execute::prepared::PreparedCommandOptionalExecutor;
@@ -97,6 +98,7 @@ pub struct CommandExecutorFactory {
     deduplicate_get_digests_ttl_calls: bool,
     output_trees_download_config: OutputTreesDownloadConfig,
     daemon_id: DaemonId,
+    cell_execution_view: Option<Arc<dyn CellExecutionView>>,
 }
 
 impl CommandExecutorFactory {
@@ -123,6 +125,7 @@ impl CommandExecutorFactory {
         deduplicate_get_digests_ttl_calls: bool,
         output_trees_download_config: OutputTreesDownloadConfig,
         daemon_id: DaemonId,
+        cell_execution_view: Option<Arc<dyn CellExecutionView>>,
     ) -> Self {
         let cache_upload_permission_checker = Arc::new(ActionCacheUploadPermissionChecker::new());
 
@@ -151,6 +154,7 @@ impl CommandExecutorFactory {
             deduplicate_get_digests_ttl_calls,
             output_trees_download_config,
             daemon_id,
+            cell_execution_view,
         }
     }
 
@@ -202,6 +206,7 @@ impl HasCommandExecutor for CommandExecutorFactory {
                 worker_pool,
                 self.memory_tracker.dupe(),
                 self.daemon_id.dupe(),
+                self.cell_execution_view.dupe(),
             )
         };
 
@@ -222,6 +227,7 @@ impl HasCommandExecutor for CommandExecutorFactory {
                 remote_dep_file_cache_checker: Arc::new(NoOpCommandOptionalExecutor {}),
                 cache_uploader: Arc::new(NoOpCacheUploader {}),
                 output_trees_download_config: self.output_trees_download_config.dupe(),
+                cell_execution_view: self.cell_execution_view.dupe(),
             });
         }
 
@@ -251,6 +257,7 @@ impl HasCommandExecutor for CommandExecutorFactory {
                 deduplicate_get_digests_ttl_calls: self.deduplicate_get_digests_ttl_calls,
                 output_trees_download_config: self.output_trees_download_config.dupe(),
                 priority,
+                cell_execution_view: self.cell_execution_view.dupe(),
             }
         };
 
@@ -267,6 +274,7 @@ impl HasCommandExecutor for CommandExecutorFactory {
                         remote_dep_file_cache_checker: Arc::new(NoOpCommandOptionalExecutor {}),
                         cache_uploader: Arc::new(NoOpCacheUploader {}),
                         output_trees_download_config: self.output_trees_download_config.dupe(),
+                        cell_execution_view: self.cell_execution_view.dupe(),
                     })
                 }
             }
@@ -457,6 +465,7 @@ impl HasCommandExecutor for CommandExecutorFactory {
                     remote_dep_file_cache_checker,
                     cache_uploader,
                     output_trees_download_config: self.output_trees_download_config.dupe(),
+                    cell_execution_view: self.cell_execution_view.dupe(),
                 })
             }
         };
