@@ -106,7 +106,9 @@ use buck2_interpreter_for_build::interpreter::cycles::LoadCycleDescriptor;
 use buck2_interpreter_for_build::interpreter::interpreter_setup::setup_interpreter;
 use buck2_resource_control::HasResourceControl;
 use buck2_server_ctx::bxl::InitBxlStreamingTracker;
+use buck2_server_ctx::concurrency::CommandCleanup;
 use buck2_server_ctx::concurrency::DiceUpdater;
+use buck2_server_ctx::concurrency::SetCommandCleanup;
 use buck2_server_ctx::ctx::DiceAccessor;
 use buck2_server_ctx::ctx::LockedPreviousCommandData;
 use buck2_server_ctx::ctx::PrivateStruct;
@@ -588,6 +590,15 @@ impl ServerCommandContext<'_> {
     }
 }
 
+struct WorkerPoolCleanup(Arc<WorkerPool>);
+
+#[async_trait]
+impl CommandCleanup for WorkerPoolCleanup {
+    async fn cleanup(&self) {
+        self.0.shutdown_and_wait().await;
+    }
+}
+
 struct DiceCommandUpdater<'s, 'a: 's> {
     cmd_ctx: &'s ServerCommandContext<'a>,
     execution_strategy: ExecutionStrategy,
@@ -907,6 +918,7 @@ impl DiceCommandUpdater<'_, '_> {
         data.set_detailed_aggregated_metrics_events_holder();
 
         let worker_pool = Arc::new(WorkerPool::new(persistent_worker_shutdown_timeout_s));
+        data.set_command_cleanup(Arc::new(WorkerPoolCleanup(worker_pool.dupe())));
 
         let critical_path_backend = root_config
             .parse(BuckconfigKeyRef {
