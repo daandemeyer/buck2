@@ -21,7 +21,7 @@ use buck2_common::file_ops::metadata::FileDigestKind;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_core::buck2_env;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
-use buck2_core::fs::project::ProjectRoot;
+use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::soft_error;
 use buck2_data::ReUploadMetrics;
@@ -235,7 +235,7 @@ impl Uploader {
     }
 
     pub async fn upload(
-        fs: &ProjectRoot,
+        artifact_fs: &ArtifactFs,
         client: &RemoteExecutionClient,
         materializer: &Arc<dyn Materializer>,
         dir_path: &ProjectRelativePath,
@@ -319,7 +319,11 @@ impl Uploader {
                 match name {
                     Ok(name) => {
                         upload_files.push(NamedDigest {
-                            name: fs.resolve(&name).as_maybe_relativized_str()?.to_owned(),
+                            name: artifact_fs
+                                .fs()
+                                .resolve(&name)
+                                .as_maybe_relativized_str()?
+                                .to_owned(),
                             digest,
                             ..Default::default()
                         });
@@ -383,7 +387,11 @@ impl Uploader {
                     }
                     Err(ArtifactNotMaterializedReason::RequiresMaterialization { path }) => {
                         upload_files.push(NamedDigest {
-                            name: fs.resolve(&path).as_maybe_relativized_str()?.to_owned(),
+                            name: artifact_fs
+                                .fs()
+                                .resolve(&path)
+                                .as_maybe_relativized_str()?
+                                .to_owned(),
                             digest,
                             ..Default::default()
                         });
