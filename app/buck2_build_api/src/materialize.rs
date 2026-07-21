@@ -213,7 +213,7 @@ async fn ensure_uploaded(
         .get_re_client()
         .with_use_case(re_use_case)
         .upload(
-            artifact_fs.fs(),
+            &artifact_fs,
             &ctx.per_transaction_data().get_materializer(),
             &ActionBlobs::new(digest_config),
             ProjectRelativePath::empty(),

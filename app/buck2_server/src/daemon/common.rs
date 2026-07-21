@@ -234,7 +234,6 @@ impl HasCommandExecutor for CommandExecutorFactory {
                                    priority: Option<i32>| {
             ReExecutor {
                 artifact_fs: artifact_fs.clone(),
-                project_fs: self.project_root.clone(),
                 materializer: self.materializer.dupe(),
                 incremental_db_state: self.incremental_db_state.dupe(),
                 re_client: self.get_prepared_re_client(*re_use_case),
