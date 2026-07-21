@@ -268,8 +268,6 @@ impl BuckOutNamespace {
         Self::CellSources,
     ];
 
-    pub const CONTENT_HASH_CAPABLE: [Self; 4] = [Self::Art, Self::ArtAnon, Self::ArtBxl, Self::Tmp];
-
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Art => "art",
