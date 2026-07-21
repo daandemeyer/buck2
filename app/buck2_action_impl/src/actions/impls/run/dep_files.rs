@@ -37,6 +37,7 @@ use buck2_core::buck2_env;
 use buck2_core::configuration::pair::Configuration;
 use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
+use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
 use buck2_core::fs::buck_out_path::BuildArtifactPath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::soft_error;
@@ -1770,6 +1771,15 @@ impl ConcreteDepFiles {
         fs: &ArtifactFs,
         builder: &ActionDirectoryBuilder,
     ) -> buck2_error::Result<Option<DirectorySelector>> {
+        // Canonical mode ships without membership pruning: dep-file lines are
+        // spelled in canonical execution paths, which this physical-mode parser
+        // must not be reused for (lexical stripping and `..` handling differ).
+        // Degrade every tag to its full declared-input fingerprint — the
+        // standard action-cache-equivalent, so staleness is impossible — until
+        // the membership-check pruning implementation lands.
+        if fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
+            return Ok(None);
+        }
         let dep_file = match self.contents.get(label) {
             Some(dep_file) => dep_file,
             None => return Ok(None),

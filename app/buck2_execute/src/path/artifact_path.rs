@@ -103,27 +103,17 @@ impl ArtifactPath<'_> {
         artifact_fs: &ArtifactFs,
         content_hash: Option<&ContentBasedPathHash>,
     ) -> buck2_error::Result<ProjectRelativePathBuf> {
-        let ArtifactPath {
-            base_path,
-            projected_path,
-            hidden_components_count: _,
-        } = self;
-
-        let base_path = match base_path {
-            Either::Left(build) => artifact_fs
-                .buck_out_path_resolver()
-                .resolve_gen(build, content_hash)?,
-            Either::Right(source) => artifact_fs.resolve_source(*source)?,
-        };
-
-        Ok(base_path.join(projected_path))
+        self.resolve_with(artifact_fs, content_hash, ArtifactFs::resolve_source)
     }
 
-    /// Returns the project-relative path that should be observed by an action.
-    pub fn resolve_for_execution(
+    fn resolve_with(
         &self,
         artifact_fs: &ArtifactFs,
         content_hash: Option<&ContentBasedPathHash>,
+        resolve_source: fn(
+            &ArtifactFs,
+            SourcePathRef,
+        ) -> buck2_error::Result<ProjectRelativePathBuf>,
     ) -> buck2_error::Result<ProjectRelativePathBuf> {
         let ArtifactPath {
             base_path,
@@ -135,10 +125,23 @@ impl ArtifactPath<'_> {
             Either::Left(build) => artifact_fs
                 .buck_out_path_resolver()
                 .resolve_gen(build, content_hash)?,
-            Either::Right(source) => artifact_fs.resolve_source_for_execution(*source)?,
+            Either::Right(source) => resolve_source(artifact_fs, *source)?,
         };
 
         Ok(base_path.join(projected_path))
+    }
+
+    /// Returns the project-relative path that should be observed by an action.
+    pub fn resolve_for_execution(
+        &self,
+        artifact_fs: &ArtifactFs,
+        content_hash: Option<&ContentBasedPathHash>,
+    ) -> buck2_error::Result<ProjectRelativePathBuf> {
+        self.resolve_with(
+            artifact_fs,
+            content_hash,
+            ArtifactFs::resolve_source_for_execution,
+        )
     }
 
     /// This function will return the same project relative path as `resolve_path` except
