@@ -35,6 +35,7 @@ use buck2_common::sqlite::sqlite_db::SqliteIdentity;
 use buck2_core::buck2_env;
 use buck2_core::cells::name::CellName;
 use buck2_core::facebook_only;
+use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::is_open_source;
@@ -53,9 +54,11 @@ use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::blocking::BuckBlockingExecutor;
 use buck2_execute::execute::blocking::DirectIoExecutor;
+use buck2_execute::execute::cell_execution_view::CellExecutionView;
 use buck2_execute::materialize::materializer::MaterializationMethod;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::re::manager::ReConnectionManager;
+use buck2_execute_impl::executors::cell_execution_view::CanonicalCellExecutionView;
 use buck2_execute_impl::executors::local::ForkserverAccess;
 use buck2_execute_impl::materializers::deferred::AccessTimesUpdates;
 use buck2_execute_impl::materializers::deferred::DeferredMaterializer;
@@ -223,6 +226,12 @@ pub struct DaemonStateData {
     /// fixed for the daemon's lifetime). Read per command in `finalize` to decide
     /// whether to schedule a background page-out; `None` disables it.
     pub(crate) page_out_on_idle: Option<PageOutThresholds>,
+
+    pub cell_source_path_mode: CellSourcePathMode,
+
+    /// Canonical source roots published during this daemon lifetime.
+    #[allocative(skip)]
+    pub cell_execution_view: Option<Arc<dyn CellExecutionView>>,
 }
 
 impl DaemonStateData {
@@ -738,6 +747,10 @@ impl DaemonState {
             // about (potentially kicking off an initial crawl).
             // disable the eager spawn for watchman until we fix dice commit to avoid a panic TODO(bobyf)
             // tokio::task::spawn(watchman_query.sync());
+            tracing::info!(
+                cell_execution_paths = %init_ctx.daemon_startup_config.cell_execution_paths,
+                "Configured cell execution path mode"
+            );
             Ok(Arc::new(DaemonStateData {
                 dice_manager: ConcurrencyHandler::new(dice),
                 file_watcher,
@@ -775,6 +788,10 @@ impl DaemonState {
                     .map(|h| PageOutThresholds {
                         min_free_disk_gb: h.page_out_min_free_disk_gb,
                     }),
+                cell_source_path_mode: init_ctx.daemon_startup_config.cell_execution_paths,
+                cell_execution_view: cell_execution_view_for_mode(
+                    init_ctx.daemon_startup_config.cell_execution_paths,
+                )?,
             }))
         };
         let daemon_listener_span = tracing::Span::current();
@@ -975,6 +992,23 @@ impl DaemonState {
     }
 }
 
+fn cell_execution_view_for_mode(
+    mode: CellSourcePathMode,
+) -> buck2_error::Result<Option<Arc<dyn CellExecutionView>>> {
+    match mode {
+        CellSourcePathMode::Physical => Ok(None),
+        CellSourcePathMode::CanonicalV1 => {
+            if cfg!(windows) {
+                return Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "cell_execution_paths = canonical_v1 is not yet supported on Windows"
+                ));
+            }
+            Ok(Some(Arc::new(CanonicalCellExecutionView::new())))
+        }
+    }
+}
+
 fn convert_algorithm_kind(kind: DigestAlgorithmFamily) -> buck2_error::Result<DigestAlgorithm> {
     buck2_error::Ok(match kind {
         DigestAlgorithmFamily::Sha1 => DigestAlgorithm::Sha1,
@@ -1054,6 +1088,24 @@ mod tests {
     use indoc::indoc;
 
     use super::*;
+
+    #[test]
+    fn canonical_mode_installs_cell_execution_view() {
+        assert!(
+            cell_execution_view_for_mode(CellSourcePathMode::Physical)
+                .unwrap()
+                .is_none()
+        );
+        if cfg!(windows) {
+            assert!(cell_execution_view_for_mode(CellSourcePathMode::CanonicalV1).is_err());
+        } else {
+            assert!(
+                cell_execution_view_for_mode(CellSourcePathMode::CanonicalV1)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_from_startup_config_defaults_internal() -> buck2_error::Result<()> {

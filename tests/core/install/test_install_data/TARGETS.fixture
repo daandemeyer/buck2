@@ -38,6 +38,17 @@ installer(
     installer = ":installer_bin_target",
 )
 
+# Used by the canonical-mode install test: canonical_v1 rejects source symlinks
+# with absolute targets, so this target must not include `etc_hosts`.
+installer(
+    name = "installer_canonical_test",
+    files = {
+        "artifact_a": "artifact_a.txt",
+        "artifact_b": "artifact_b.txt",
+    },
+    installer = ":installer_bin_target",
+)
+
 installer(
     name = "installer_server_sends_error",
     files = {"artifact_a": "artifact_a.txt"},

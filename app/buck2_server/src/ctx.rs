@@ -17,6 +17,7 @@ use std::time::Instant;
 
 use allocative::Allocative;
 use async_trait::async_trait;
+use buck2_build_api::actions::execute::dice_data::SetCellExecutionView;
 use buck2_build_api::actions::execute::dice_data::SetCommandExecutor;
 use buck2_build_api::actions::execute::dice_data::SetReClient;
 use buck2_build_api::actions::execute::dice_data::set_fallback_executor_config;
@@ -688,7 +689,10 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
             Arc::new(ConcurrentTargetLabelInterner::default()),
         )?;
 
-        ctx.set_buck_out_path(Some(self.cmd_ctx.buck_out_dir.clone()))?;
+        ctx.set_build_context_data(
+            Some(self.cmd_ctx.buck_out_dir.clone()),
+            self.cmd_ctx.base_context.daemon.cell_source_path_mode,
+        )?;
 
         let optional_validations = self
             .cmd_ctx
@@ -963,10 +967,9 @@ impl DiceCommandUpdater<'_, '_> {
             run_action_knobs.deduplicate_get_digests_ttl_calls,
             output_trees_download_config.dupe(),
             self.cmd_ctx.base_context.daemon.daemon_id.dupe(),
-            // Production activation is introduced separately; this integration layer
-            // keeps the view injectable while normal daemon construction stays physical.
-            None,
+            self.cmd_ctx.base_context.daemon.cell_execution_view.dupe(),
         )));
+        data.set_cell_execution_view(self.cmd_ctx.base_context.daemon.cell_execution_view.dupe());
         data.set_blocking_executor(self.cmd_ctx.base_context.daemon.blocking_executor.dupe());
         data.set_http_client(self.cmd_ctx.base_context.daemon.http_client.dupe());
         data.set_materializer(self.cmd_ctx.base_context.daemon.materializer.dupe());
