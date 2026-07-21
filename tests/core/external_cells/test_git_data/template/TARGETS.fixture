@@ -1,7 +1,12 @@
-load("@root//:defs.bzl", "copy_src", "nondeterministic_src")
+load("@root//:defs.bzl", "copy_src", "nondeterministic_src", "run_source")
 
 copy_src(
     name = "t",
+    src = "src.txt",
+)
+
+run_source(
+    name = "run_source",
     src = "src.txt",
 )
 
