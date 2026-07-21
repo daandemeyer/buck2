@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use allocative::Allocative;
 use buck2_core::buck2_env;
+use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
 use buck2_error::BuckErrorContext;
 #[cfg(unix)]
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
@@ -598,6 +599,9 @@ pub struct DaemonStartupConfig {
     pub retained_event_logs: usize,
     pub macos_qos_class: Option<String>,
     pub daemon_idle_timeout_s: Option<u64>,
+    /// Fixed for the daemon lifetime: changing it changes command and action digests as well as
+    /// persistent-worker state.
+    pub cell_execution_paths: CellSourcePathMode,
     /// Pagable DICE storage settings, or `None` when paging is disabled.
     pub hydration: Option<HydrationConfig>,
 }
@@ -717,6 +721,12 @@ impl DaemonStartupConfig {
                 section: "buck2",
                 property: "daemon_idle_timeout_s",
             })?,
+            cell_execution_paths: config
+                .parse(BuckconfigKeyRef {
+                    section: "buck2",
+                    property: "cell_execution_paths",
+                })?
+                .unwrap_or_default(),
             hydration: HydrationConfig::from_config(config)?,
         })
     }
@@ -749,6 +759,7 @@ impl DaemonStartupConfig {
             retained_event_logs: DEFAULT_RETAINED_EVENT_LOGS,
             macos_qos_class: None,
             daemon_idle_timeout_s: None,
+            cell_execution_paths: CellSourcePathMode::Physical,
             hydration: None,
         }
     }
@@ -785,6 +796,47 @@ mod tests {
         )?;
         let startup_config = DaemonStartupConfig::new(&config, &BuckSettings::empty())?;
         assert_eq!(startup_config.daemon_idle_timeout_s, Some(10800));
+        Ok(())
+    }
+
+    #[test]
+    fn test_cell_execution_paths() -> buck2_error::Result<()> {
+        let default = parse(&[("config", indoc!(r#""#))], "config")?;
+        assert_eq!(
+            DaemonStartupConfig::new(&default, &BuckSettings::empty())?.cell_execution_paths,
+            CellSourcePathMode::Physical
+        );
+
+        let canonical = parse(
+            &[(
+                "config",
+                indoc!(
+                    r#"
+                    [buck2]
+                    cell_execution_paths = canonical_v1
+                    "#
+                ),
+            )],
+            "config",
+        )?;
+        assert_eq!(
+            DaemonStartupConfig::new(&canonical, &BuckSettings::empty())?.cell_execution_paths,
+            CellSourcePathMode::CanonicalV1
+        );
+
+        let invalid = parse(
+            &[(
+                "config",
+                indoc!(
+                    r#"
+                    [buck2]
+                    cell_execution_paths = future
+                    "#
+                ),
+            )],
+            "config",
+        )?;
+        assert!(DaemonStartupConfig::new(&invalid, &BuckSettings::empty()).is_err());
         Ok(())
     }
 }

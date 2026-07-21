@@ -54,6 +54,28 @@ async def test_success_install(buck: Buck, tmp_path: Path) -> None:
     assert not islink(f"{tmp_dir}/etc_hosts")
 
 
+# cell_execution_paths is daemon startup config: it must come from a buckconfig
+# file (extra_buck_config), not `-c`, which never reaches DaemonStartupConfig.
+@buck_test(extra_buck_config={"buck2": {"cell_execution_paths": "canonical_v1"}})
+async def test_canonical_source_installer_and_files(buck: Buck, tmp_path: Path) -> None:
+    _setup_sandbox(buck)
+    tmp_dir = tmp_path / "canonical_install_test"
+    tmp_dir.mkdir()
+    await buck.install(
+        "root//:installer_canonical_test",
+        "--",
+        "--dst",
+        f"{tmp_dir}/",
+    )
+    assert (tmp_dir / "artifact_a").read_text().strip() == "artifact_a"
+    assert (tmp_dir / "artifact_b").read_text().strip() == "artifact_b"
+    # Prove the daemon really ran in canonical mode: the install handoff must
+    # have published the source view for the root cell.
+    assert list(buck.cwd.glob("buck-out/*/cell_sources/v1/c_*")), (
+        "expected a published canonical cell source view under buck-out"
+    )
+
+
 @buck_test(write_invocation_record=True)
 @env("BUCK_LOG", "buck2_server_commands::commands::install=debug")
 async def test_install_logging(buck: Buck, tmp_path: Path) -> None:

@@ -29,10 +29,16 @@ impl GetArtifactFs for DiceComputations<'_> {
         let buck_out_path_resolver = self.get_buck_out_path().await?;
         let project_filesystem = self.global_data().get_io_provider().project_root().dupe();
         let buck_path_resolver = self.get_cell_resolver().await?;
-        Ok(ArtifactFs::new(
+        let cell_source_path_mode = self.get_cell_source_path_mode().await?;
+        let artifact_fs = ArtifactFs::new_with_cell_source_path_mode(
             buck_path_resolver,
             buck_out_path_resolver,
             project_filesystem,
-        ))
+            cell_source_path_mode,
+        );
+        // Fail a misconfigured canonical workspace before any source value, Action or upload can
+        // be constructed from this ArtifactFs.
+        artifact_fs.validate_canonical_layout()?;
+        Ok(artifact_fs)
     }
 }
