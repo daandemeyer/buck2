@@ -335,6 +335,30 @@ impl ArtifactFs {
         }
     }
 
+    pub fn resolve_cell_source_root_physical(
+        &self,
+        cell: CellName,
+    ) -> buck2_error::Result<ProjectRelativePathBuf> {
+        let instance = self.cell_resolver.get(cell)?;
+        if let Some(origin) = instance.external() {
+            Ok(self
+                .buck_out_path_resolver
+                .resolve_external_cell_source(CellRelativePath::empty(), origin.dupe()))
+        } else {
+            Ok(instance.path().as_project_relative_path().to_buf())
+        }
+    }
+
+    /// Revalidating here closes a local cell-root symlink rebinding race between initial
+    /// configuration and the later upload or local-view handoff.
+    pub fn resolve_cell_source_root_for_consumption(
+        &self,
+        cell: CellName,
+    ) -> buck2_error::Result<ProjectRelativePathBuf> {
+        self.validate_canonical_cell(cell)?;
+        self.resolve_cell_source_root_physical(cell)
+    }
+
     pub fn resolve_source(
         &self,
         source_artifact_path: SourcePathRef,
@@ -644,12 +668,15 @@ fn metadata_is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
+
     use super::ArtifactFs;
     use super::CellSourcePathMode;
     use crate::cells::cell_path::CellPath;
     use crate::cells::name::CellName;
     use crate::cells::paths::CellRelativePathBuf;
     use crate::fs::buck_out_path::BuckOutPathResolver;
+    use crate::fs::project::ProjectRoot;
     use crate::fs::project_rel_path::ProjectRelativePath;
     use crate::fs::project_rel_path::ProjectRelativePathBuf;
     use crate::package::source_path::SourcePath;
@@ -720,6 +747,17 @@ mod tests {
             fs.decode_source_execution_path(&execution)?,
             Some(source.to_cell_path().to_owned())
         );
+        let decoded = fs
+            .decode_source_execution_path(&execution)?
+            .expect("canonical source path");
+        assert_eq!(
+            fs.resolve_cell_source_root_for_consumption(decoded.cell())?
+                .join(decoded.path()),
+            ProjectRelativePathBuf::unchecked_new(
+                "buck-out/v2/external_cells/git/0123456789abcdef0123456789abcdef01234567/pkg/src.cpp"
+                    .into()
+            )
+        );
         assert_eq!(
             fs.resolve_source(source.as_ref())?,
             ProjectRelativePathBuf::unchecked_new(
@@ -749,6 +787,14 @@ mod tests {
         assert_eq!(
             fs.decode_source_execution_path(&root_execution)?,
             Some(root_source.to_cell_path().to_owned())
+        );
+        let decoded_root = fs
+            .decode_source_execution_path(&root_execution)?
+            .expect("canonical root source path");
+        assert_eq!(
+            fs.resolve_cell_source_root_for_consumption(decoded_root.cell())?
+                .join(decoded_root.path()),
+            ProjectRelativePathBuf::unchecked_new("pkg/src.cpp".into())
         );
         Ok(())
     }
@@ -1006,6 +1052,28 @@ mod tests {
         assert!(
             fs.validate_canonical_cell(CellName::testing_new("sample"))
                 .is_err()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn physical_handoff_revalidates_local_cell_root() -> buck2_error::Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::create_dir(temp.path().join("cell"))?;
+        std::fs::create_dir(temp.path().join("replacement"))?;
+
+        let mut fs = local_artifact_fs_with_cell_name_and_path("sample", "cell")?;
+        fs.project_filesystem =
+            ProjectRoot::new_unchecked(AbsNormPathBuf::new(temp.path().to_path_buf()).unwrap());
+        let cell = CellName::testing_new("sample");
+        fs.validate_canonical_cell(cell)?;
+
+        std::fs::remove_dir(temp.path().join("cell"))?;
+        std::os::unix::fs::symlink("replacement", temp.path().join("cell"))?;
+        assert!(
+            fs.resolve_cell_source_root_for_consumption(cell).is_err(),
+            "physical byte lookup must reject a cell root rebound through a symlink"
         );
         Ok(())
     }
