@@ -93,6 +93,34 @@ enum ConcurrencyHandlerError {
     ExitOnDaemonNotIdle,
 }
 
+/// Teardown that must confirm quiescence before DICE state turnover.
+///
+/// [`Self::cleanup`] is called twice, once to start teardown and once to await it, so
+/// implementations must be idempotent and must not return until their resources are gone.
+#[async_trait]
+pub trait CommandCleanup: Send + Sync + 'static {
+    async fn cleanup(&self);
+}
+
+struct CommandCleanupHolder(Arc<dyn CommandCleanup>);
+
+pub trait SetCommandCleanup {
+    fn set_command_cleanup(&mut self, cleanup: Arc<dyn CommandCleanup>);
+}
+
+impl SetCommandCleanup for UserComputationData {
+    fn set_command_cleanup(&mut self, cleanup: Arc<dyn CommandCleanup>) {
+        self.data.set(CommandCleanupHolder(cleanup));
+    }
+}
+
+fn command_cleanup(data: &UserComputationData) -> Option<Arc<dyn CommandCleanup>> {
+    data.data
+        .get::<CommandCleanupHolder>()
+        .ok()
+        .map(|holder| holder.0.dupe())
+}
+
 #[derive(Clone, Dupe, Copy, Debug)]
 pub enum RunState {
     NestedSameState,
@@ -135,6 +163,10 @@ struct ConcurrencyHandlerData {
     cleanup_epoch: usize,
     /// Whether this has been tainted previously.
     previously_tainted: bool,
+    /// Registered before a command becomes active, so an empty active set implies every admitted
+    /// command's cleanup is known. See [`CommandCleanup`].
+    #[allocative(skip)]
+    pending_cleanups: Vec<Arc<dyn CommandCleanup>>,
 }
 
 #[derive(Allocative, Display, Copy, Clone, Dupe, PartialEq, Eq, Hash)]
@@ -221,18 +253,35 @@ impl ConcurrencyHandlerData {
         if !self.has_no_active_commands() {
             return false;
         }
-
         tracing::info!("Transitioning ActiveDice to cleanup");
 
         // When releasing the active DICE, if any work is ongoing, place it in a clean up
         // state. Callers will wait until it goes idle.
+        let cleanups = std::mem::take(&mut self.pending_cleanups);
+        let idle = dice.wait_for_idle();
         self.cleanup_epoch += 1;
         self.dice_status = DiceStatus::Cleanup {
-            future: dice.wait_for_idle().boxed().shared(),
+            future: async move {
+                // A task of a prior version can still be terminating, and it holds the
+                // transaction data these services live in.
+                idle.await;
+                run_cleanups(cleanups).await;
+            }
+            .boxed()
+            .shared(),
             epoch: self.cleanup_epoch,
         };
 
         true
+    }
+
+    fn start_pending_cleanups(&self) {
+        if self.pending_cleanups.is_empty() {
+            return;
+        }
+        // Detached, and without taking the cleanups: teardown must not depend on anyone awaiting
+        // it, and turnover still has to be able to await the same operation.
+        tokio::task::spawn(run_cleanups(self.pending_cleanups.clone()));
     }
 
     /// Attempt a transition to available assuming the cleanup future at `cleanup_epoch` has been
@@ -256,6 +305,10 @@ impl ConcurrencyHandlerData {
             command.notify_tainted()
         }
     }
+}
+
+async fn run_cleanups(cleanups: Vec<Arc<dyn CommandCleanup>>) {
+    futures::future::join_all(cleanups.iter().map(|cleanup| cleanup.cleanup())).await;
 }
 
 #[async_trait]
@@ -342,6 +395,7 @@ impl ConcurrencyHandler {
                 next_command_id: CommandId(0),
                 cleanup_epoch: 0,
                 previously_tainted: false,
+                pending_cleanups: Vec::new(),
             }),
             cond: Condvar::new(),
             dice,
@@ -600,11 +654,7 @@ impl ConcurrencyHandler {
                                 }
                                 // We should probably show more than the first here, but for now
                                 // this is what we have.
-                                //
-                                // Note: unwrap here relies on the fact that transition_to_cleanup
-                                // would have transitioned if we had no active commands.
-
-                                let active_command = data.active_commands.first().unwrap().1;
+                                let (_, active_command) = data.active_commands.first().unwrap();
                                 let trace_id = active_command.trace_id.dupe();
                                 let argv = active_command.format_argv();
 
@@ -678,6 +728,10 @@ impl ConcurrencyHandler {
                 components: current_external_and_local_configs,
             });
         }
+        if let Some(cleanup) = command_cleanup(transaction.per_transaction_data()) {
+            data.pending_cleanups.push(cleanup);
+        }
+
         // create the on exit drop handler, which will take care of notifying tasks.
         let drop_guard = OnExecExit::new(self.dupe(), command_id, command_data, data)?;
         // This adds the task to the list of all tasks (see ::new impl)
@@ -783,8 +837,13 @@ impl OnExecExit {
 
 impl Drop for OnExecExit {
     fn drop(&mut self) {
-        let this = self.0.take().expect("dropped twice");
+        let this = self.0.take().expect("command guard dropped twice");
         tracing::info!("Command has exited: {}", this.1);
+
+        // Never panic in Drop: during daemon teardown this can run without a runtime.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
 
         tokio::task::spawn(async move {
             let mut data = this.0.data.lock().await;
@@ -800,7 +859,9 @@ impl Drop for OnExecExit {
                 // waiting command might not still be forced to wait. In reality, it is probably not
                 // a terrible issue, as we are unlikely to have many concurrent commands, and people
                 // are unlikely to usually care about the precise order they get to run.
-                this.0.cond.notify_all()
+                this.0.cond.notify_all();
+                // Start teardown now rather than making the next command pay for it.
+                data.start_pending_cleanups();
             }
         });
     }
@@ -1247,6 +1308,234 @@ mod tests {
 
         assert!(arrived.load(Ordering::Relaxed));
 
+        Ok(())
+    }
+
+    struct RecordingCleanup {
+        ran: Arc<AtomicBool>,
+        gate: Option<Arc<RwLock<()>>>,
+    }
+
+    #[async_trait]
+    impl CommandCleanup for RecordingCleanup {
+        async fn cleanup(&self) {
+            if let Some(gate) = &self.gate {
+                drop(gate.read().await);
+            }
+            self.ran.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A same-state updater that attaches `cleanup` to the command's transaction data.
+    struct WithCleanup(Arc<dyn CommandCleanup>);
+
+    #[async_trait]
+    impl DiceUpdater for WithCleanup {
+        async fn update(
+            &self,
+            ctx: DiceTransactionUpdater,
+            _early_timings: &mut EarlyCommandTimingBuilder,
+        ) -> buck2_error::Result<(DiceTransactionUpdater, UserComputationData)> {
+            let mut data = UserComputationData::default();
+            data.set_command_cleanup(self.0.dupe());
+            Ok((ctx, data))
+        }
+    }
+
+    fn recording_cleanup(
+        gate: Option<&Arc<RwLock<()>>>,
+    ) -> (Arc<RecordingCleanup>, Arc<AtomicBool>) {
+        let ran = Arc::new(AtomicBool::new(false));
+        let cleanup = Arc::new(RecordingCleanup {
+            ran: ran.dupe(),
+            gate: gate.map(|gate| gate.dupe()),
+        });
+        (cleanup, ran)
+    }
+
+    async fn enter_test<F, Fut>(
+        concurrency: &Arc<ConcurrencyHandler>,
+        updates: &dyn DiceUpdater,
+        project_root: &ProjectRoot,
+        exec: F,
+    ) -> buck2_error::Result<()>
+    where
+        F: FnOnce(DiceTransaction, EarlyCommandTimingBuilder) -> Fut,
+        Fut: Future<Output = ()> + Send,
+    {
+        concurrency
+            .enter(
+                null_sink_with_trace(TraceId::new()),
+                updates,
+                exec,
+                false,
+                Vec::new(),
+                None,
+                CancellationContext::testing(),
+                PreemptibleWhen::Never,
+                LockedPreviousCommandData::default().into(),
+                project_root,
+                ExitWhen::ExitNever,
+                EarlyCommandTimingBuilder::new(Instant::now()),
+            )
+            .await
+    }
+
+    async fn wait_until(flag: &AtomicBool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !flag.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("condition not reached in time")
+    }
+
+    /// The property the barrier exists for: a command requiring different daemon state is not
+    /// admitted until the previous command's services are confirmed gone.
+    #[tokio::test]
+    async fn cleanup_completes_before_different_state_admission() -> buck2_error::Result<()> {
+        let dice = make_default_dice().await;
+        let concurrency = ConcurrencyHandler::new(dice.dupe());
+        let project_root_temp = ProjectRootTemp::new()?;
+
+        let gate = Arc::new(RwLock::new(()));
+        let held = gate.write().await;
+        let (cleanup, ran) = recording_cleanup(Some(&gate));
+
+        enter_test(
+            &concurrency,
+            &WithCleanup(cleanup),
+            project_root_temp.path(),
+            |_, _timing| async move {},
+        )
+        .await?;
+
+        let admitted = Arc::new(AtomicBool::new(false));
+        let different = tokio::spawn({
+            let concurrency = concurrency.dupe();
+            let admitted = admitted.dupe();
+            let project_root = project_root_temp.path().dupe();
+            async move {
+                enter_test(
+                    &concurrency,
+                    &CtxDifferent,
+                    &project_root,
+                    |_, _timing| async move {
+                        admitted.store(true, Ordering::SeqCst);
+                    },
+                )
+                .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !admitted.load(Ordering::SeqCst),
+            "a different-state command was admitted before cleanup completed"
+        );
+
+        drop(held);
+        different.await??;
+        assert!(ran.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    /// Cleanup must not run while a same-state command is still active: a DICE task it shares with
+    /// the finished command keeps using that command's services.
+    #[tokio::test]
+    async fn cleanup_waits_for_the_last_same_state_command() -> buck2_error::Result<()> {
+        let dice = make_default_dice().await;
+        let concurrency = ConcurrencyHandler::new(dice.dupe());
+        let project_root_temp = ProjectRootTemp::new()?;
+
+        let (cleanup_a, ran_a) = recording_cleanup(None);
+
+        let block_b = Arc::new(RwLock::new(()));
+        let blocked_b = block_b.write().await;
+        let barrier = Arc::new(Barrier::new(3));
+
+        let fut_a = tokio::spawn({
+            let concurrency = concurrency.dupe();
+            let barrier = barrier.dupe();
+            let project_root = project_root_temp.path().dupe();
+            async move {
+                enter_test(
+                    &concurrency,
+                    &WithCleanup(cleanup_a),
+                    &project_root,
+                    |_, _timing| async move {
+                        barrier.wait().await;
+                    },
+                )
+                .await
+            }
+        });
+
+        let fut_b = tokio::spawn({
+            let concurrency = concurrency.dupe();
+            let barrier = barrier.dupe();
+            let block_b = block_b.dupe();
+            let project_root = project_root_temp.path().dupe();
+            async move {
+                enter_test(
+                    &concurrency,
+                    &NoChanges,
+                    &project_root,
+                    |_, _timing| async move {
+                        barrier.wait().await;
+                        drop(block_b.read().await);
+                    },
+                )
+                .await
+            }
+        });
+
+        barrier.wait().await;
+        fut_a.await??;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !ran_a.load(Ordering::SeqCst),
+            "cleanup ran while a same-state command was still active"
+        );
+
+        drop(blocked_b);
+        fut_b.await??;
+        wait_until(&ran_a).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_command_still_runs_its_cleanup() -> buck2_error::Result<()> {
+        let dice = make_default_dice().await;
+        let concurrency = ConcurrencyHandler::new(dice.dupe());
+        let project_root_temp = ProjectRootTemp::new()?;
+
+        let (cleanup, ran) = recording_cleanup(None);
+        let entered = Arc::new(AtomicBool::new(false));
+
+        let fut = tokio::spawn({
+            let concurrency = concurrency.dupe();
+            let entered = entered.dupe();
+            let project_root = project_root_temp.path().dupe();
+            async move {
+                enter_test(
+                    &concurrency,
+                    &WithCleanup(cleanup),
+                    &project_root,
+                    |_, _timing| async move {
+                        entered.store(true, Ordering::SeqCst);
+                        futures::future::pending::<()>().await;
+                    },
+                )
+                .await
+            }
+        });
+
+        wait_until(&entered).await;
+        fut.abort();
+
+        wait_until(&ran).await;
         Ok(())
     }
 
