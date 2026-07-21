@@ -182,7 +182,7 @@ async fn ensure_uploaded(
         let mut dir = ActionDirectoryBuilder::empty();
         let values = ctx.ensure_artifact_group(artifact_group).await?;
         for (artifact, value) in values.iter() {
-            let path = artifact.resolve_path(
+            let path = artifact.resolve_path_for_execution(
                 &artifact_fs,
                 if artifact.path_resolution_requires_artifact_value() {
                     Some(value.content_based_path_hash())

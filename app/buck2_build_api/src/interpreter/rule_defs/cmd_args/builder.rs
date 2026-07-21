@@ -15,6 +15,8 @@ use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_core::cells::cell_path::CellPathRef;
 use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_core::execution_types::executor_config::PathSeparatorKind;
+use buck2_core::fs::artifact_path_resolver::ArtifactFs;
+use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
@@ -43,8 +45,42 @@ use crate::interpreter::rule_defs::cmd_args::traits::ArtifactPathMapper;
 enum CommandLineOptionsError {
     #[error("Path `{0}` does not have {1} parent(s)")]
     TooManyParentCalls(String, u32),
+    #[error(
+        "A path relative to canonical cell `{0}` must remain in that cell; target `{1}` would cross a canonical cell boundary"
+    )]
+    CanonicalCellRelativePathEscape(String, String),
+    #[error(
+        "Canonical cell path `{0}` cannot be rendered without an artifact dependency; pass a source artifact from that cell instead"
+    )]
+    CanonicalCellPathWithoutArtifact(String),
     #[error("Command line args in this position do not support write-to-file macros")]
     WriteToFileMacroNotSupported,
+}
+
+fn ensure_canonical_relative_to_stays_in_cell(
+    fs: &ArtifactFs,
+    origin: &ProjectRelativePath,
+    result: &ProjectRelativePath,
+) -> buck2_error::Result<()> {
+    let Some(cell) = fs
+        .decode_source_execution_path(origin)?
+        .map(|path| path.cell())
+    else {
+        return Ok(());
+    };
+    if fs
+        .decode_source_execution_path(result)?
+        .as_ref()
+        .map(|path| path.cell())
+        != Some(cell)
+    {
+        return Err(CommandLineOptionsError::CanonicalCellRelativePathEscape(
+            cell.to_string(),
+            result.to_string(),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 pub(crate) fn compute_relative_to_path<'v>(
@@ -82,12 +118,14 @@ pub(crate) fn compute_relative_to_path<'v>(
         RelativeOrigin::ProjectRoot(_) => ProjectRelativePath::empty().to_owned(),
     };
 
+    let origin_path = path.clone();
     let path_str = path.to_string();
     for _ in 0..parents {
         if !path.pop() {
             return Err(CommandLineOptionsError::TooManyParentCalls(path_str, parents).into());
         }
     }
+    ensure_canonical_relative_to_stays_in_cell(fs.fs(), &origin_path, &path)?;
     Ok(path)
 }
 
@@ -352,7 +390,13 @@ impl<'v, 'a> CommandLineBuilder<'v, 'a> {
     }
 
     pub fn push_cell_path(&mut self, path: CellPathRef) -> buck2_error::Result<()> {
-        self.write_project_path(self.fs.fs().resolve_cell_path_for_execution(path)?)
+        if self.fs.fs().cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
+            return Err(CommandLineOptionsError::CanonicalCellPathWithoutArtifact(
+                path.to_string(),
+            )
+            .into());
+        }
+        self.write_project_path(self.fs.fs().resolve_cell_path(path)?)
     }
 
     pub fn push_project_path(&mut self, path: ProjectRelativePathBuf) -> buck2_error::Result<()> {
@@ -360,6 +404,10 @@ impl<'v, 'a> CommandLineBuilder<'v, 'a> {
     }
 
     fn write_project_path(&mut self, mut path: ProjectRelativePathBuf) -> buck2_error::Result<()> {
+        // Every artifact on every command line passes through here: only pay for the copy when
+        // canonical mode can actually reject the result.
+        let canonical = self.fs.fs().cell_source_path_mode() == CellSourcePathMode::CanonicalV1;
+        let original_path = canonical.then(|| path.clone());
         let ArtifactOptions {
             relative_to,
             absolute_prefix,
@@ -379,8 +427,12 @@ impl<'v, 'a> CommandLineBuilder<'v, 'a> {
         for _ in 0..*parent {
             path.pop();
         }
+        if let Some(original_path) = &original_path {
+            ensure_canonical_relative_to_stays_in_cell(self.fs.fs(), original_path, &path)?;
+        }
 
         let mut rendered = if let Some(relative_to) = relative_to {
+            ensure_canonical_relative_to_stays_in_cell(self.fs.fs(), relative_to, &path)?;
             let p = relative_to
                 .as_forward_relative_path()
                 .as_relative_path()
@@ -513,7 +565,11 @@ pub(crate) fn path_format_absolute<'p>(
 
 #[cfg(test)]
 mod tests {
+    use buck2_core::cells::cell_path::CellPath;
+    use buck2_core::cells::name::CellName;
+    use buck2_core::cells::paths::CellRelativePathBuf;
     use buck2_core::execution_types::executor_config::PathSeparatorKind;
+    use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
     use buck2_fs::paths::RelativePath;
 
     use super::*;
@@ -535,5 +591,120 @@ mod tests {
             path_format(RelativePath::unchecked_new("a/b"), windows),
             "a\\b"
         );
+    }
+
+    fn canonical_artifact_fs() -> buck2_error::Result<ArtifactFs> {
+        Ok(ArtifactFs::testing_new_with_mode(
+            CellSourcePathMode::CanonicalV1,
+            &[("root", ""), ("sample", "workspace/sample")],
+        ))
+    }
+
+    #[test]
+    fn canonical_relative_to_parent_cannot_escape_cell_root() -> buck2_error::Result<()> {
+        let fs = canonical_artifact_fs()?;
+        let root = fs.resolve_cell_path_for_execution(
+            CellPath::new(
+                CellName::testing_new("sample"),
+                CellRelativePathBuf::unchecked_new(String::new()),
+            )
+            .as_ref(),
+        )?;
+        let inside =
+            root.join(buck2_fs::paths::forward_rel_path::ForwardRelativePath::unchecked_new("pkg"));
+
+        ensure_canonical_relative_to_stays_in_cell(&fs, &inside, &root)?;
+        let escaped = root.parent().expect("canonical cell root has a parent");
+        let error = ensure_canonical_relative_to_stays_in_cell(&fs, &inside, escaped)
+            .expect_err("relative_to parent traversal must not leave the canonical cell");
+        assert!(
+            error
+                .to_string()
+                .contains("cross a canonical cell boundary")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_artifact_parent_cannot_escape_cell_root() -> buck2_error::Result<()> {
+        let fs = canonical_artifact_fs()?;
+        let executor_fs = ExecutorFs::new(&fs, PathSeparatorKind::Unix);
+        let mapper = buck2_hash::BuckHashMap::<&Artifact, ContentBasedPathHash>::default();
+        let root = fs.resolve_cell_path_for_execution(
+            CellPath::new(
+                CellName::testing_new("sample"),
+                CellRelativePathBuf::unchecked_new(String::new()),
+            )
+            .as_ref(),
+        )?;
+        let source = root.join(
+            buck2_fs::paths::forward_rel_path::ForwardRelativePath::unchecked_new("pkg/file"),
+        );
+        let mut args = Vec::new();
+        let mut builder = CommandLineBuilder::new(&mut args, &mapper, &executor_fs);
+
+        builder.merge_and_push_scope(
+            StringOptions::default(),
+            ArtifactOptions {
+                parent: 2,
+                ..DEFAULT_ARTIFACT_OPTIONS
+            },
+        );
+        builder.write_project_path(source.clone())?;
+        builder.pop_scope();
+
+        builder.merge_and_push_scope(
+            StringOptions::default(),
+            ArtifactOptions {
+                parent: 3,
+                ..DEFAULT_ARTIFACT_OPTIONS
+            },
+        );
+        let error = builder
+            .write_project_path(source)
+            .expect_err("artifact parent traversal must not leave the canonical cell");
+        assert!(
+            error
+                .to_string()
+                .contains("cross a canonical cell boundary")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_canonical_cell_path_requires_artifact_dependency() -> buck2_error::Result<()> {
+        let fs = canonical_artifact_fs()?;
+        let executor_fs = ExecutorFs::new(&fs, PathSeparatorKind::Unix);
+        let mapper = buck2_hash::BuckHashMap::<&Artifact, ContentBasedPathHash>::default();
+        let mut args = Vec::new();
+        let mut builder = CommandLineBuilder::new(&mut args, &mapper, &executor_fs);
+        let sample = CellPath::new(
+            CellName::testing_new("sample"),
+            CellRelativePathBuf::unchecked_new(String::new()),
+        );
+
+        let error = builder
+            .push_cell_path(sample.as_ref())
+            .expect_err("a bare non-root cell root has no input that can realize its view");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be rendered without an artifact dependency")
+        );
+        let root = CellPath::new(
+            CellName::testing_new("root"),
+            CellRelativePathBuf::unchecked_new(String::new()),
+        );
+        let error = builder
+            .push_cell_path(root.as_ref())
+            .expect_err("a bare root cell path also has no declared input dependency");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be rendered without an artifact dependency")
+        );
+        drop(builder);
+        assert!(args.is_empty());
+        Ok(())
     }
 }
