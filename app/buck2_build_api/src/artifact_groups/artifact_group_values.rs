@@ -282,8 +282,8 @@ impl ArtifactGroupValuesDyn for ArtifactGroupValues {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     use buck2_artifact::actions::key::ActionIndex;
     use buck2_artifact::artifact::artifact_type::testing::BuildArtifactTestingExt;
@@ -291,22 +291,26 @@ mod tests {
     use buck2_artifact::artifact::source_artifact::SourceArtifact;
     use buck2_common::file_ops::metadata::FileMetadata;
     use buck2_common::file_ops::metadata::TrackedFileDigest;
-    use buck2_core::cells::CellAliasResolver;
-    use buck2_core::cells::CellResolver;
-    use buck2_core::cells::cell_root_path::CellRootPathBuf;
-    use buck2_core::cells::external::ExternalCellOrigin;
-    use buck2_core::cells::external::GitCellSetup;
-    use buck2_core::cells::instance::CellInstance;
-    use buck2_core::cells::name::CellName;
-    use buck2_core::cells::nested::NestedCells;
     use buck2_core::configuration::data::ConfigurationData;
-    use buck2_core::fs::buck_out_path::BuckOutPathResolver;
-    use buck2_core::fs::project::ProjectRoot;
+    use buck2_core::execution_types::executor_config::CommandGenerationOptions;
+    use buck2_core::execution_types::executor_config::OutputPathsBehavior;
+    use buck2_core::execution_types::executor_config::PathSeparatorKind;
+    use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
     use buck2_core::fs::project_rel_path::ProjectRelativePath;
-    use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
     use buck2_core::package::source_path::SourcePath;
     use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
-    use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
+    use buck2_directory::directory::fingerprinted_directory::FingerprintedDirectory;
+    use buck2_execute::digest::CasDigestToReExt;
+    use buck2_execute::execute::cache_uploader::NoOpCacheUploader;
+    use buck2_execute::execute::command_executor::CommandExecutor;
+    use buck2_execute::execute::prepared::NoOpCommandOptionalExecutor;
+    use buck2_execute::execute::request::ActionMetadataBlobData;
+    use buck2_execute::execute::request::CommandExecutionInput;
+    use buck2_execute::execute::request::CommandExecutionPaths;
+    use buck2_execute::execute::request::CommandExecutionRequest;
+    use buck2_execute::execute::testing_dry_run::DryRunExecutor;
+    use dupe::Dupe;
+    use remote_execution as RE;
 
     use super::*;
 
@@ -321,63 +325,212 @@ mod tests {
         (Artifact::from(artifact), value)
     }
 
-    fn external_artifact_fs() -> buck2_error::Result<ArtifactFs> {
-        let root_name = CellName::testing_new("root");
-        let external_name = CellName::testing_new("sample");
-        let root_path = CellRootPathBuf::testing_new("");
-        let external_path = CellRootPathBuf::testing_new("declared/sample");
-        let roots = [
-            (root_name, root_path.as_path()),
-            (external_name, external_path.as_path()),
-        ];
-        let cells = CellResolver::new(
-            vec![
-                CellInstance::new(
-                    root_name,
-                    root_path.clone(),
-                    None,
-                    NestedCells::from_cell_roots(&roots, &root_path),
-                )?,
-                CellInstance::new(
-                    external_name,
-                    external_path.clone(),
-                    Some(ExternalCellOrigin::Git(GitCellSetup {
-                        git_origin: Arc::from("https://example.com/sample.git"),
-                        commit: Arc::from("0123456789abcdef0123456789abcdef01234567"),
-                        object_format: None,
-                    })),
-                    NestedCells::from_cell_roots(&roots, &external_path),
-                )?,
-            ],
-            CellAliasResolver::new(root_name, Default::default())?,
-        )?;
-        Ok(ArtifactFs::new(
-            cells,
-            BuckOutPathResolver::new(ProjectRelativePathBuf::unchecked_new("buck-out/v2".into())),
-            ProjectRoot::new_unchecked(
-                AbsNormPathBuf::new(
-                    Path::new(if cfg!(windows) {
-                        "C:\\project"
-                    } else {
-                        "/project"
-                    })
-                    .to_owned(),
-                )
-                .unwrap(),
-            ),
+    fn source_artifact_fs(
+        cell_name: &str,
+        physical_root: &str,
+        external: bool,
+        mode: CellSourcePathMode,
+    ) -> buck2_error::Result<ArtifactFs> {
+        let external_cells: &[&str] = if external { &[cell_name] } else { &[] };
+        Ok(ArtifactFs::testing_new_with_mode_and_external(
+            mode,
+            &[("root", ""), (cell_name, physical_root)],
+            external_cells,
         ))
+    }
+
+    fn standalone_or_nested_sample_fs(nested: bool) -> buck2_error::Result<ArtifactFs> {
+        Ok(if nested {
+            ArtifactFs::testing_new_with_mode(
+                CellSourcePathMode::CanonicalV1,
+                &[("workspace", ""), ("sample", "checkout/sample")],
+            )
+        } else {
+            ArtifactFs::testing_new_with_mode(CellSourcePathMode::CanonicalV1, &[("sample", "")])
+        })
+    }
+
+    fn source_value(content: &[u8], digest_config: DigestConfig) -> ArtifactValue {
+        source_value_with_executable(content, false, digest_config)
+    }
+
+    fn source_value_with_executable(
+        content: &[u8],
+        is_executable: bool,
+        digest_config: DigestConfig,
+    ) -> ArtifactValue {
+        ArtifactValue::file(FileMetadata {
+            digest: TrackedFileDigest::from_content(content, digest_config.cas_digest_config()),
+            is_executable,
+        })
+    }
+
+    fn source_input_root_digest_for_value(
+        artifact_fs: &ArtifactFs,
+        cell_name: &str,
+        value: ArtifactValue,
+        digest_config: DigestConfig,
+    ) -> buck2_error::Result<TrackedFileDigest> {
+        let artifact = Artifact::from(SourceArtifact::new(SourcePath::testing_new(
+            &format!("{cell_name}//pkg"),
+            "src.cpp",
+        )));
+        let paths = CommandExecutionPaths::new(
+            vec![CommandExecutionInput::Artifact(Box::new(
+                ArtifactGroupValues::from_artifact(artifact, value),
+            ))],
+            Default::default(),
+            artifact_fs,
+            digest_config,
+            None,
+        )?;
+        Ok(paths.input_directory().fingerprint().dupe())
+    }
+
+    fn source_input_root_digest(
+        artifact_fs: &ArtifactFs,
+        cell_name: &str,
+        content: &[u8],
+        digest_config: DigestConfig,
+    ) -> buck2_error::Result<TrackedFileDigest> {
+        source_input_root_digest_for_value(
+            artifact_fs,
+            cell_name,
+            source_value(content, digest_config),
+            digest_config,
+        )
+    }
+
+    fn re_action_digest_for_value(
+        artifact_fs: &ArtifactFs,
+        cell_name: &str,
+        value: ArtifactValue,
+        digest_config: DigestConfig,
+    ) -> buck2_error::Result<TrackedFileDigest> {
+        let source = SourcePath::testing_new(&format!("{cell_name}//pkg"), "src.cpp");
+        let argument = artifact_fs.resolve_source_for_execution(source.as_ref())?;
+        let command = RE::Command {
+            arguments: vec!["tool".to_owned(), argument.as_str().to_owned()],
+            ..Default::default()
+        };
+        let command_digest = TrackedFileDigest::from_content(
+            &ActionMetadataBlobData::from_message(&command).0,
+            digest_config.cas_digest_config(),
+        );
+        let action = RE::Action {
+            input_root_digest: Some(
+                source_input_root_digest_for_value(artifact_fs, cell_name, value, digest_config)?
+                    .to_grpc(),
+            ),
+            command_digest: Some(command_digest.to_grpc()),
+            ..Default::default()
+        };
+        Ok(TrackedFileDigest::from_content(
+            &ActionMetadataBlobData::from_message(&action).0,
+            digest_config.cas_digest_config(),
+        ))
+    }
+
+    fn re_action_digest(
+        artifact_fs: &ArtifactFs,
+        cell_name: &str,
+        content: &[u8],
+        digest_config: DigestConfig,
+    ) -> buck2_error::Result<TrackedFileDigest> {
+        re_action_digest_for_value(
+            artifact_fs,
+            cell_name,
+            source_value(content, digest_config),
+            digest_config,
+        )
+    }
+
+    fn request_action_digest(
+        artifact_fs: &ArtifactFs,
+        cell_name: &str,
+        content: &[u8],
+        digest_config: DigestConfig,
+    ) -> buck2_error::Result<buck2_execute::execute::action_digest::ActionDigest> {
+        let source_path = SourcePath::testing_new(&format!("{cell_name}//pkg"), "src.cpp");
+        let source = Artifact::from(SourceArtifact::new(source_path.clone()));
+        let paths = CommandExecutionPaths::new(
+            vec![CommandExecutionInput::Artifact(Box::new(
+                ArtifactGroupValues::from_artifact(source, source_value(content, digest_config)),
+            ))],
+            Default::default(),
+            artifact_fs,
+            digest_config,
+            None,
+        )?;
+        let request = CommandExecutionRequest::new(
+            vec!["tool".to_owned()],
+            vec![
+                artifact_fs
+                    .resolve_source_for_execution(source_path.as_ref())?
+                    .as_str()
+                    .to_owned(),
+            ],
+            paths,
+            Default::default(),
+        );
+        let executor = CommandExecutor::new(
+            Arc::new(DryRunExecutor::new(
+                Arc::new(Mutex::new(Vec::new())),
+                artifact_fs.clone(),
+            )),
+            Arc::new(NoOpCommandOptionalExecutor {}),
+            Arc::new(NoOpCommandOptionalExecutor {}),
+            Arc::new(NoOpCacheUploader {}),
+            artifact_fs.clone(),
+            CommandGenerationOptions {
+                path_separator: PathSeparatorKind::Unix,
+                output_paths_behavior: OutputPathsBehavior::Compatibility,
+                use_bazel_protocol_remote_persistent_workers: false,
+                network_access: None,
+            },
+            RE::Platform::default(),
+        );
+        Ok(executor
+            .prepare_action(&request, digest_config, false)?
+            .digest())
+    }
+
+    impl ArtifactGroupValuesData {
+        fn value(mut self, v: &(Artifact, ArtifactValue)) -> Self {
+            self.values.push((v.0.dupe(), v.1.dupe()));
+            self
+        }
+
+        fn chain(mut self, child: &ArtifactGroupValues) -> Self {
+            self.children.push(child.dupe());
+            self
+        }
+
+        fn build(self) -> ArtifactGroupValues {
+            ArtifactGroupValues(Arc::new(self))
+        }
+    }
+
+    fn builder() -> ArtifactGroupValuesData {
+        ArtifactGroupValuesData {
+            values: Default::default(),
+            children: Default::default(),
+            directory: None,
+        }
     }
 
     #[test]
     fn execution_api_preserves_external_input_and_action_digests() -> buck2_error::Result<()> {
         let digest_config = DigestConfig::testing_default();
-        let artifact_fs = external_artifact_fs()?;
+        let artifact_fs = source_artifact_fs(
+            "sample",
+            "declared/sample",
+            true,
+            CellSourcePathMode::Physical,
+        )?;
         let source_path = SourcePath::testing_new("sample//pkg", "src.cpp");
         let artifact = Artifact::from(SourceArtifact::new(source_path));
-        let value = ArtifactValue::file(FileMetadata {
-            digest: TrackedFileDigest::from_content(b"source", digest_config.cas_digest_config()),
-            is_executable: false,
-        });
+        let value = source_value(b"source", digest_config);
 
         let legacy_path = artifact.resolve_path(&artifact_fs, None)?;
         assert_eq!(
@@ -405,30 +558,6 @@ mod tests {
             .shared(&*INTERNER);
         assert_eq!(legacy_input.fingerprint(), migrated_input.fingerprint());
         Ok(())
-    }
-
-    impl ArtifactGroupValuesData {
-        fn value(mut self, v: &(Artifact, ArtifactValue)) -> Self {
-            self.values.push((v.0.dupe(), v.1.dupe()));
-            self
-        }
-
-        fn chain(mut self, child: &ArtifactGroupValues) -> Self {
-            self.children.push(child.dupe());
-            self
-        }
-
-        fn build(self) -> ArtifactGroupValues {
-            ArtifactGroupValues(Arc::new(self))
-        }
-    }
-
-    fn builder() -> ArtifactGroupValuesData {
-        ArtifactGroupValuesData {
-            values: Default::default(),
-            children: Default::default(),
-            directory: None,
-        }
     }
 
     #[test]
@@ -490,5 +619,136 @@ mod tests {
 
         let all = ArtifactGroupValues::iter_many([&r1, &r2]).collect::<Vec<_>>();
         assert_eq!(all, vec![&a1, &a2, &a3]);
+    }
+
+    #[test]
+    fn canonical_source_input_and_action_digests_ignore_cell_origin() -> buck2_error::Result<()> {
+        let digest_config = DigestConfig::testing_default();
+        let local = source_artifact_fs(
+            "sample",
+            "workspace/sample",
+            false,
+            CellSourcePathMode::CanonicalV1,
+        )?;
+        let external = source_artifact_fs(
+            "sample",
+            "declared/sample",
+            true,
+            CellSourcePathMode::CanonicalV1,
+        )?;
+
+        let local_input = source_input_root_digest(&local, "sample", b"identical", digest_config)?;
+        let external_input =
+            source_input_root_digest(&external, "sample", b"identical", digest_config)?;
+        assert_eq!(local_input, external_input);
+        assert_eq!(
+            re_action_digest(&local, "sample", b"identical", digest_config)?,
+            re_action_digest(&external, "sample", b"identical", digest_config)?,
+        );
+
+        // Physical mode inserts the source under its declared location, so these trees do differ:
+        // without this the test would pass even if canonical normalization regressed.
+        let local_physical = source_artifact_fs(
+            "sample",
+            "workspace/sample",
+            false,
+            CellSourcePathMode::Physical,
+        )?;
+        let external_physical = source_artifact_fs(
+            "sample",
+            "declared/sample",
+            true,
+            CellSourcePathMode::Physical,
+        )?;
+        assert_ne!(
+            source_input_root_digest(&local_physical, "sample", b"identical", digest_config,)?,
+            source_input_root_digest(&external_physical, "sample", b"identical", digest_config,)?,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_topology_switch_uses_identical_action_cache_key() -> buck2_error::Result<()> {
+        let digest_config = DigestConfig::testing_default();
+        let local = source_artifact_fs(
+            "sample",
+            "workspace/sample",
+            false,
+            CellSourcePathMode::CanonicalV1,
+        )?;
+        let external = source_artifact_fs(
+            "sample",
+            "declared/sample",
+            true,
+            CellSourcePathMode::CanonicalV1,
+        )?;
+
+        let local_digest = request_action_digest(&local, "sample", b"identical", digest_config)?;
+        let external_digest =
+            request_action_digest(&external, "sample", b"identical", digest_config)?;
+        assert_eq!(
+            local_digest, external_digest,
+            "the external topology must query the exact RE Action digest produced by the local topology",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_source_input_digest_tracks_cell_identity() -> buck2_error::Result<()> {
+        let digest_config = DigestConfig::testing_default();
+        let sample = source_artifact_fs(
+            "sample",
+            "workspace/sample",
+            false,
+            CellSourcePathMode::CanonicalV1,
+        )?;
+        let other = source_artifact_fs(
+            "other",
+            "workspace/other",
+            false,
+            CellSourcePathMode::CanonicalV1,
+        )?;
+
+        assert_ne!(
+            source_input_root_digest(&sample, "sample", b"version one", digest_config)?,
+            source_input_root_digest(&other, "other", b"version one", digest_config)?,
+            "the canonical cell-name component must keep distinct cells disjoint",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_root_and_nested_cell_share_input_and_action_digests() -> buck2_error::Result<()> {
+        let digest_config = DigestConfig::testing_default();
+        let standalone = standalone_or_nested_sample_fs(false)?;
+        let nested = standalone_or_nested_sample_fs(true)?;
+        assert_eq!(
+            source_input_root_digest(&standalone, "sample", b"identical", digest_config)?,
+            source_input_root_digest(&nested, "sample", b"identical", digest_config)?,
+        );
+        assert_eq!(
+            request_action_digest(&standalone, "sample", b"identical", digest_config)?,
+            request_action_digest(&nested, "sample", b"identical", digest_config)?,
+        );
+
+        let root_source = Artifact::from(SourceArtifact::new(SourcePath::testing_new(
+            "sample//pkg",
+            "src.cpp",
+        )));
+        assert_ne!(
+            root_source.resolve_path(&standalone, None)?,
+            root_source.resolve_path_for_execution(&standalone, None)?,
+        );
+
+        let (generated, value) = artifact("generated.txt");
+        assert_eq!(
+            generated.resolve_path(&standalone, Some(&value.content_based_path_hash()))?,
+            generated
+                .resolve_path_for_execution(&standalone, Some(&value.content_based_path_hash()),)?,
+        );
+
+        Ok(())
     }
 }
