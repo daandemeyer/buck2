@@ -38,7 +38,9 @@ use buck2_core::configuration::pair::Configuration;
 use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
+use buck2_core::fs::buck_out_path::BuckOutNamespace;
 use buck2_core::fs::buck_out_path::BuildArtifactPath;
+use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::soft_error;
 use buck2_directory::directory::directory::Directory;
@@ -47,6 +49,7 @@ use buck2_directory::directory::directory_ref::DirectoryRef;
 use buck2_directory::directory::directory_selector::DirectorySelector;
 use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_directory::directory::find::find;
+use buck2_directory::directory::find::find_entry_or_prefix;
 use buck2_directory::directory::fingerprinted_directory::FingerprintedDirectory;
 use buck2_error::BuckErrorContext;
 use buck2_error::internal_error;
@@ -801,7 +804,7 @@ impl DepFileBundle {
             .ok_or_else(|| buck2_error::internal_error!("Dep files should have been declared"))?
             .unshare()
             .filter(dep_files, fs)?
-            .fingerprint(digest_config);
+            .fingerprint(digest_config, fs)?;
 
         let different_digest_count = computed_filtered_fingerprints
             .tagged
@@ -1204,7 +1207,7 @@ async fn dep_files_match(
             .expect("Must have declared inputs when we have dep-files!")
             .unshare()
             .filter(dep_files, ctx.fs())?
-            .fingerprint(digest_config);
+            .fingerprint(digest_config, ctx.fs())?;
         *previous_fingerprints == new_fingerprints
     };
 
@@ -1265,7 +1268,7 @@ fn compute_fingerprints(
 ) -> buck2_error::Result<StoredFingerprints> {
     let filtered_directories = directories
         .filter(dep_files, fs)?
-        .fingerprint(digest_config);
+        .fingerprint(digest_config, fs)?;
     if keep_directories {
         Ok(StoredFingerprints::Dirs(filtered_directories))
     } else {
@@ -1532,8 +1535,9 @@ impl PartitionedInputs<ActionDirectoryBuilder> {
     fn fingerprint(
         self,
         digest_config: DigestConfig,
-    ) -> PartitionedInputs<ActionImmutableDirectory> {
-        PartitionedInputs {
+        fs: &ArtifactFs,
+    ) -> buck2_error::Result<PartitionedInputs<ActionImmutableDirectory>> {
+        Ok(PartitionedInputs {
             untagged: self
                 .untagged
                 .fingerprint(digest_config.as_directory_serializer()),
@@ -1541,16 +1545,62 @@ impl PartitionedInputs<ActionDirectoryBuilder> {
                 .tagged
                 .into_iter()
                 .map(|(k, v)| {
-                    (
+                    let serializer = TaggedInputsDirectorySerializer {
+                        cas_digest_config: digest_config.cas_digest_config(),
+                    };
+                    buck2_error::Ok((
                         k,
-                        v.fingerprint(&TaggedInputsDirectorySerializer {
-                            cas_digest_config: digest_config.cas_digest_config(),
-                        }),
-                    )
+                        fingerprint_tagged_inputs(
+                            v,
+                            fs,
+                            digest_config.as_directory_serializer(),
+                            &serializer,
+                        )?,
+                    ))
                 })
-                .collect(),
+                .collect::<buck2_error::Result<_>>()?,
+        })
+    }
+}
+
+/// The hash-name normalizer rewrites *any* directory component that looks like a content hash, so
+/// the content-hash namespaces are isolated and fingerprinted first: applied to the whole tree it
+/// would also rewrite source directories that merely happen to be named like one, making two
+/// different source trees share a dep-file key.
+fn fingerprint_tagged_inputs(
+    mut builder: ActionDirectoryBuilder,
+    fs: &ArtifactFs,
+    ordinary_serializer: &ReDirectorySerializer,
+    content_hash_serializer: &TaggedInputsDirectorySerializer,
+) -> buck2_error::Result<ActionImmutableDirectory> {
+    for namespace in BuckOutNamespace::ALL
+        .into_iter()
+        .filter(|namespace| namespace.is_content_hash_capable())
+    {
+        let prefix = fs
+            .buck_out_path_resolver()
+            .namespace_path(namespace)
+            .as_forward_relative_path()
+            .to_buf();
+        let Some(entry) = builder.remove_prefix(&prefix)? else {
+            continue;
+        };
+        let entry = match entry {
+            DirectoryEntry::Dir(directory) => DirectoryEntry::Dir(
+                directory
+                    .fingerprint(content_hash_serializer)
+                    .into_builder(),
+            ),
+            DirectoryEntry::Leaf(leaf) => DirectoryEntry::Leaf(leaf),
+        };
+        let replaced = builder.insert(&prefix, entry)?;
+        if replaced.is_some() {
+            return Err(buck2_error::internal_error!(
+                "Reinserting isolated dep-file fingerprint subtree `{prefix}` unexpectedly replaced an entry"
+            ));
         }
     }
+    Ok(builder.fingerprint(ordinary_serializer))
 }
 
 impl PartitionedInputs<ActionImmutableDirectory> {
@@ -1764,6 +1814,226 @@ pub(crate) struct ConcreteDepFiles {
     contents: StdBuckHashMap<Arc<str>, String>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum CanonicalDepFilePath {
+    ProjectRelative(ProjectRelativePathBuf),
+    OutsideProject,
+}
+
+/// Never consults the host filesystem. `.` and `..` are rejected rather than collapsed, and
+/// absolute paths are accepted only lexically beneath the project root; anything else errors, which
+/// falls the affected tag back to its full declared input directory.
+fn normalize_canonical_dep_file_path(
+    path: &str,
+    fs: &ArtifactFs,
+) -> buck2_error::Result<CanonicalDepFilePath> {
+    let system_path = std::path::Path::new(path);
+    let relative = if system_path.is_absolute() {
+        match strip_project_root_lexical(system_path, fs.fs().root().as_path()) {
+            Some(suffix) => {
+                let suffix = suffix.to_str().ok_or_else(|| {
+                    buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Input,
+                        "dep-file path is not UTF-8"
+                    )
+                })?;
+                ForwardRelativePathNormalizer::normalize_path(suffix)
+                    .buck_error_context(
+                        "absolute dep-file path is not a normalized path beneath the project root",
+                    )?
+                    .into_owned()
+            }
+            None => return Ok(CanonicalDepFilePath::OutsideProject),
+        }
+    } else {
+        ForwardRelativePathNormalizer::normalize_path(path)
+            .buck_error_context("dep-file path is not a normalized project-relative path")?
+            .into_owned()
+    };
+    Ok(CanonicalDepFilePath::ProjectRelative(
+        ProjectRelativePathBuf::from(relative),
+    ))
+}
+
+/// Purely lexical: no canonicalization, no on-disk case correction, no symlink resolution. Only the
+/// Windows drive letter compares case-insensitively; every other component is byte-exact.
+fn strip_project_root_lexical<'a>(
+    path: &'a std::path::Path,
+    root: &std::path::Path,
+) -> Option<&'a std::path::Path> {
+    fn component_eq(a: &std::path::Component, b: &std::path::Component) -> bool {
+        #[cfg(windows)]
+        if let (std::path::Component::Prefix(a), std::path::Component::Prefix(b)) = (a, b) {
+            use std::path::Prefix;
+            // Long-path-aware tools emit verbatim (`\\?\`) spellings, so treating them as foreign
+            // would silently disable pruning for the tag.
+            return match (a.kind(), b.kind()) {
+                (
+                    Prefix::Disk(a) | Prefix::VerbatimDisk(a),
+                    Prefix::Disk(b) | Prefix::VerbatimDisk(b),
+                ) => a.eq_ignore_ascii_case(&b),
+                (
+                    Prefix::UNC(a_server, a_share) | Prefix::VerbatimUNC(a_server, a_share),
+                    Prefix::UNC(b_server, b_share) | Prefix::VerbatimUNC(b_server, b_share),
+                ) => a_server == b_server && a_share == b_share,
+                _ => a == b,
+            };
+        }
+        a == b
+    }
+
+    let mut suffix = path.components();
+    for root_component in root.components() {
+        let mut peek = suffix.clone();
+        match peek.next() {
+            Some(path_component) if component_eq(&root_component, &path_component) => {
+                suffix = peek;
+            }
+            _ => return None,
+        }
+    }
+    Some(suffix.as_path())
+}
+
+/// Maximum number of declared relative symlinks a single dep-file line may resolve through.
+const DEP_FILE_SYMLINK_RESOLUTION_LIMIT: u32 = 32;
+
+/// Selects `path` only when the finalized declared tree proves that it is an input.
+///
+/// A path terminating on, or traversing through, a declared relative symlink selects both the
+/// symlink node and its lexically resolved target, recursively: the node alone fingerprints the
+/// target string, so a change to the target's *content* would leave the filtered fingerprint
+/// unchanged and permit a stale dep-file hit. External symlink targets are untracked content, so
+/// there the node is the only possible selection.
+///
+/// Resolution is purely lexical within the declared tree. Escaping the tree root, failing the
+/// membership proof, or chaining beyond [`DEP_FILE_SYMLINK_RESOLUTION_LIMIT`] is an error, which the
+/// caller turns into per-tag fallback rather than a silent drop.
+fn select_declared_path_or_symlink_prefix(
+    path: &ForwardRelativePath,
+    selector: &mut DirectorySelector,
+    builder: &ActionDirectoryBuilder,
+) -> buck2_error::Result<()> {
+    select_declared_path_or_symlink_prefix_impl(path, selector, builder, 0)
+}
+
+fn select_declared_path_or_symlink_prefix_impl(
+    path: &ForwardRelativePath,
+    selector: &mut DirectorySelector,
+    builder: &ActionDirectoryBuilder,
+    depth: u32,
+) -> buck2_error::Result<()> {
+    if depth > DEP_FILE_SYMLINK_RESOLUTION_LIMIT {
+        return Err(buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "Dep-file path `{path}` resolves through more than {DEP_FILE_SYMLINK_RESOLUTION_LIMIT} declared symlinks (likely a symlink cycle)"
+        ));
+    }
+
+    let Some((entry, remaining)) = find_entry_or_prefix(builder.as_ref(), path.iter())? else {
+        return Err(buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "Dep-file path `{path}` is not a declared input"
+        ));
+    };
+
+    if remaining.is_empty() {
+        selector.select(path);
+        // A line naming a symlink means the tool read the target's content through the link.
+        if let DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(symlink)) = entry {
+            let resolved = resolve_declared_symlink_target_lexically(
+                path,
+                path.iter().count(),
+                symlink.target().as_str(),
+                &remaining,
+            )?;
+            return select_declared_path_or_symlink_prefix_impl(
+                &resolved,
+                selector,
+                builder,
+                depth + 1,
+            );
+        }
+        return Ok(());
+    }
+
+    let DirectoryEntry::Leaf(member) = entry else {
+        return Err(buck2_error::internal_error!(
+            "Directory prefix lookup returned a directory with remaining path `{remaining}`"
+        ));
+    };
+
+    let prefix_len = path.iter().count() - remaining.iter().count();
+    let prefix: ForwardRelativePathBuf = path.iter().take(prefix_len).collect();
+    match member {
+        ActionDirectoryMember::Symlink(symlink) => {
+            selector.select(&prefix);
+            let resolved = resolve_declared_symlink_target_lexically(
+                path,
+                prefix_len,
+                symlink.target().as_str(),
+                &remaining,
+            )?;
+            select_declared_path_or_symlink_prefix_impl(&resolved, selector, builder, depth + 1)
+        }
+        ActionDirectoryMember::ExternalSymlink(_) => {
+            selector.select(&prefix);
+            Ok(())
+        }
+        ActionDirectoryMember::File(_) => Err(buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "Dep-file path `{path}` traverses a declared regular file"
+        )),
+    }
+}
+
+/// `symlink_path_len` is the number of leading components of `path` that name the symlink itself, so
+/// the target resolves against components `0..symlink_path_len - 1`.
+///
+/// `..` may only cancel *prefix* components, which `find_entry_or_prefix` traversed as `Dir` entries
+/// and so proved to be plain directories, making the kernel agree with the lexical pop. Cancelling a
+/// component introduced by the target string itself (e.g. target `dir/../f`) is an error: `dir` may
+/// be a symlink to a different parent, in which case lexical collapse names a different file than
+/// the tool read, and store and check would fingerprint it symmetrically, replaying a stale hit.
+fn resolve_declared_symlink_target_lexically(
+    path: &ForwardRelativePath,
+    symlink_path_len: usize,
+    target: &str,
+    remaining: &ForwardRelativePath,
+) -> buck2_error::Result<ForwardRelativePathBuf> {
+    let mut resolved: Vec<&FileName> = path
+        .iter()
+        .take(symlink_path_len.saturating_sub(1))
+        .collect();
+    let mut pushed_from_target = false;
+    for component in target.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if pushed_from_target {
+                    return Err(buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Input,
+                        "Dep-file path `{path}` resolves through a declared symlink whose target `{target}` cancels a component it introduced; membership cannot be proven lexically"
+                    ));
+                }
+                if resolved.pop().is_none() {
+                    return Err(buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Input,
+                        "Dep-file path `{path}` resolves through a declared symlink whose target `{target}` escapes the declared input tree"
+                    ));
+                }
+            }
+            name => {
+                resolved.push(FileName::new(name).buck_error_context(
+                    "declared symlink target contains an invalid path component",
+                )?);
+                pushed_from_target = true;
+            }
+        }
+    }
+    Ok(resolved.into_iter().chain(remaining.iter()).collect())
+}
+
 impl ConcreteDepFiles {
     fn get_selector(
         &self,
@@ -1771,15 +2041,6 @@ impl ConcreteDepFiles {
         fs: &ArtifactFs,
         builder: &ActionDirectoryBuilder,
     ) -> buck2_error::Result<Option<DirectorySelector>> {
-        // Canonical mode ships without membership pruning: dep-file lines are
-        // spelled in canonical execution paths, which this physical-mode parser
-        // must not be reused for (lexical stripping and `..` handling differ).
-        // Degrade every tag to its full declared-input fingerprint — the
-        // standard action-cache-equivalent, so staleness is impossible — until
-        // the membership-check pruning implementation lands.
-        if fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
-            return Ok(None);
-        }
         let dep_file = match self.contents.get(label) {
             Some(dep_file) => dep_file,
             None => return Ok(None),
@@ -1792,11 +2053,57 @@ impl ConcreteDepFiles {
                 continue;
             }
 
-            let path = ForwardRelativePathNormalizer::normalize_path(line)
-                .buck_error_context("Invalid line encountered in dep file")?;
+            let path = match fs.cell_source_path_mode() {
+                CellSourcePathMode::Physical => ForwardRelativePathNormalizer::normalize_path(line)
+                    .buck_error_context("Invalid line encountered in dep file")?,
+                CellSourcePathMode::CanonicalV1 => {
+                    let normalized = match normalize_canonical_dep_file_path(line, fs)
+                        .buck_error_context("Invalid line encountered in dep file")
+                    {
+                        Ok(path) => path,
+                        Err(e) => {
+                            soft_error!(
+                                "failed_to_normalize_canonical_dep_file_path",
+                                e,
+                                quiet: true
+                            )?;
+                            return Ok(None);
+                        }
+                    };
+                    match normalized {
+                        CanonicalDepFilePath::ProjectRelative(path) => {
+                            Cow::Owned(path.as_forward_relative_path().to_buf())
+                        }
+                        // Nothing outside the project root can be proven to name an input, so the
+                        // tag falls back rather than the line being dropped.
+                        CanonicalDepFilePath::OutsideProject => {
+                            soft_error!(
+                                "failed_to_normalize_canonical_dep_file_path",
+                                buck2_error::buck2_error!(
+                                    buck2_error::ErrorTag::Input,
+                                    "Dep-file path `{line}` is not lexically beneath the project root; canonical dep-file pruning falls back for this tag"
+                                ),
+                                quiet: true
+                            )?;
+                            return Ok(None);
+                        }
+                    }
+                }
+            };
 
             if let Err(e) = Self::add_path_to_selector(path, &mut selector, fs, builder) {
-                soft_error!("failed_to_add_dep_file_path_to_selector", e, error_on_oss: true)?;
+                match fs.cell_source_path_mode() {
+                    CellSourcePathMode::Physical => {
+                        soft_error!(
+                            "failed_to_add_dep_file_path_to_selector",
+                            e,
+                            error_on_oss: true
+                        )?;
+                    }
+                    CellSourcePathMode::CanonicalV1 => {
+                        soft_error!("failed_to_add_dep_file_path_to_selector", e, quiet: true)?;
+                    }
+                }
                 return Ok(None);
             }
         }
@@ -1822,15 +2129,54 @@ impl ConcreteDepFiles {
     ) -> buck2_error::Result<()> {
         if !path.starts_with(fs.buck_out_path_resolver().root()) {
             // This path isn't in buck-out, no content-based hash to replace.
-            selector.select(path.as_ref());
-            return Ok(());
+            return if fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
+                select_declared_path_or_symlink_prefix(path.as_ref(), selector, builder)
+            } else {
+                selector.select(path.as_ref());
+                Ok(())
+            };
+        }
+
+        if fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
+            match fs
+                .buck_out_path_resolver()
+                .classify_namespace(ProjectRelativePath::new(path.as_ref().as_str())?)
+            {
+                Some(BuckOutNamespace::CellSources) => {
+                    return select_declared_path_or_symlink_prefix(
+                        path.as_ref(),
+                        selector,
+                        builder,
+                    );
+                }
+                Some(namespace) if namespace.is_content_hash_capable() => {}
+                Some(namespace) if namespace.is_generated() => {
+                    return select_declared_path_or_symlink_prefix(
+                        path.as_ref(),
+                        selector,
+                        builder,
+                    );
+                }
+                Some(BuckOutNamespace::ExternalCells) | None => {
+                    return Err(buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Input,
+                        "Dep-file path `{path}` is in Buck-out but not in a canonical input or generated-output namespace"
+                    ));
+                }
+                Some(_) => unreachable!("all Buck-out namespaces classified above"),
+            }
         }
 
         let mut before_content_hash_parts = vec![];
         let mut path_iter = path.as_ref().iter();
         // Paths always begin with "buck-out/<ISOLATION_DIR>/<gen or art, etc.>/<CELL>", so
         // we can skip the first 4 segments.
-        for _ in 0..4 {
+        let prefix_components = if fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
+            fs.buck_out_path_resolver().root().iter().count() + 2
+        } else {
+            4
+        };
+        for _ in 0..prefix_components {
             if let Some(segment) = path_iter.next() {
                 before_content_hash_parts.push(segment);
             }
@@ -1847,8 +2193,12 @@ impl ConcreteDepFiles {
         };
 
         if !should_look_for_content_based_hash {
-            selector.select(path.as_ref());
-            return Ok(());
+            return if fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
+                select_declared_path_or_symlink_prefix(path.as_ref(), selector, builder)
+            } else {
+                selector.select(path.as_ref());
+                Ok(())
+            };
         }
 
         for segment in &mut path_iter {
@@ -1866,6 +2216,7 @@ impl ConcreteDepFiles {
                         ));
                     }
                 }
+                let mut selected_any = false;
                 if let Some(dir_in_builder) = dir_in_builder {
                     match dir_in_builder {
                         DirectoryEntry::Dir(d) => {
@@ -1879,6 +2230,7 @@ impl ConcreteDepFiles {
                                             .chain(after.iter())
                                             .collect();
                                     selector.select(&full_path);
+                                    selected_any = true;
                                 }
                             }
                         }
@@ -1891,12 +2243,23 @@ impl ConcreteDepFiles {
                         }
                     }
                 }
+                // Dropping the line would mark a used input as unused and permit a stale hit.
+                if !selected_any && fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
+                    return Err(buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Input,
+                        "Dep-file path `{path}` matches no content-hash variant of a declared input"
+                    ));
+                }
                 return Ok(());
             }
         }
 
-        selector.select(path.as_ref());
-        Ok(())
+        if fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
+            select_declared_path_or_symlink_prefix(path.as_ref(), selector, builder)
+        } else {
+            selector.select(path.as_ref());
+            Ok(())
+        }
     }
 }
 
@@ -2016,13 +2379,562 @@ impl DirectoryDigester<ActionDirectoryMember, TrackedFileDigest>
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
 
     use buck2_artifact::actions::key::ActionIndex;
     use buck2_artifact::artifact::artifact_type::testing::BuildArtifactTestingExt;
+    use buck2_common::external_symlink::ExternalSymlink;
+    use buck2_common::file_ops::metadata::FileMetadata;
+    use buck2_common::file_ops::metadata::Symlink;
     use buck2_core::configuration::data::ConfigurationData;
     use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
+    use buck2_fs::paths::RelativePathBuf;
 
     use super::*;
+
+    fn canonical_artifact_fs() -> buck2_error::Result<ArtifactFs> {
+        Ok(ArtifactFs::testing_new_with_mode(
+            CellSourcePathMode::CanonicalV1,
+            &[("root", ""), ("sample", "declared/sample")],
+        ))
+    }
+
+    fn canonical_artifact_fs_with_external_cell() -> buck2_error::Result<ArtifactFs> {
+        Ok(ArtifactFs::testing_new_with_mode_and_external(
+            CellSourcePathMode::CanonicalV1,
+            &[
+                ("root", ""),
+                ("sample", "declared/sample"),
+                ("ext", "declared/ext"),
+            ],
+            &["ext"],
+        ))
+    }
+
+    fn expected_project_path(path: &str) -> CanonicalDepFilePath {
+        CanonicalDepFilePath::ProjectRelative(ProjectRelativePathBuf::unchecked_new(path.into()))
+    }
+
+    #[test]
+    fn canonical_dep_file_paths_are_lexical_and_do_not_rebind_physical_aliases()
+    -> buck2_error::Result<()> {
+        let fs = canonical_artifact_fs_with_external_cell()?;
+        let canonical_sample = "buck-out/v2/cell_sources/v1/c_73616d706c65/include/header.h";
+
+        assert_eq!(
+            normalize_canonical_dep_file_path("declared/sample/include/header.h", &fs)?,
+            expected_project_path("declared/sample/include/header.h"),
+        );
+        assert_eq!(
+            normalize_canonical_dep_file_path(canonical_sample, &fs)?,
+            expected_project_path(canonical_sample),
+        );
+        assert_eq!(
+            normalize_canonical_dep_file_path(
+                "buck-out/v2/external_cells/git/0123456789abcdef0123456789abcdef01234567/include/header.h",
+                &fs,
+            )?,
+            expected_project_path(
+                "buck-out/v2/external_cells/git/0123456789abcdef0123456789abcdef01234567/include/header.h"
+            ),
+        );
+        assert!(normalize_canonical_dep_file_path("src/./header.h", &fs).is_err());
+        assert!(normalize_canonical_dep_file_path("src/../header.h", &fs).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_dep_file_paths_keep_generated_outputs_out_of_source_decoding()
+    -> buck2_error::Result<()> {
+        let fs = canonical_artifact_fs()?;
+        let generated = "buck-out/v2/art/root/pkg/__target__/0123456789abcdef/header.h";
+        assert_eq!(
+            normalize_canonical_dep_file_path(generated, &fs)?,
+            expected_project_path(generated),
+        );
+        assert_eq!(
+            fs.buck_out_path_resolver()
+                .classify_namespace(ProjectRelativePath::new(generated)?),
+            Some(BuckOutNamespace::Art),
+        );
+        assert_eq!(
+            fs.buck_out_path_resolver()
+                .classify_namespace(ProjectRelativePath::new(
+                    "buck-out/v2/external_cells/git/0123456789abcdef/include/header.h"
+                )?),
+            Some(BuckOutNamespace::ExternalCells),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_dep_file_selector_accepts_logical_source_namespace() -> buck2_error::Result<()> {
+        let fs = canonical_artifact_fs()?;
+        let path = ForwardRelativePath::new(
+            "buck-out/v2/cell_sources/v1/c_73616d706c65/include/header.h",
+        )?;
+        let mut builder = ActionDirectoryBuilder::empty();
+        builder.insert(path, DirectoryEntry::Dir(ActionDirectoryBuilder::empty()))?;
+        let mut selector = DirectorySelector::empty();
+        ConcreteDepFiles::add_path_to_selector(Cow::Borrowed(path), &mut selector, &fs, &builder)?;
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_dep_file_selector_rejects_undeclared_physical_storage() -> buck2_error::Result<()>
+    {
+        // Two external cells aliasing the same physical git root: the undeclared physical
+        // spelling must not be rebound to either of them.
+        let fs = ArtifactFs::testing_new_with_mode_and_external(
+            CellSourcePathMode::CanonicalV1,
+            &[
+                ("root", ""),
+                ("sample", "declared/sample"),
+                ("ext", "declared/ext"),
+                ("ext_alias", "declared/ext_alias"),
+            ],
+            &["ext", "ext_alias"],
+        );
+        let path = ForwardRelativePath::new(
+            "buck-out/v2/external_cells/git/0123456789abcdef0123456789abcdef01234567/include/header.h",
+        )?;
+        assert!(
+            ConcreteDepFiles::add_path_to_selector(
+                Cow::Borrowed(path),
+                &mut DirectorySelector::empty(),
+                &fs,
+                &ActionDirectoryBuilder::empty(),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_dep_file_absolute_project_path_is_relativized() -> buck2_error::Result<()> {
+        let fs = canonical_artifact_fs()?;
+        let path = if cfg!(windows) {
+            r"C:\project\buck-out\v2\cell_sources\v1\c_73616d706c65\include\header.h"
+        } else {
+            "/project/buck-out/v2/cell_sources/v1/c_73616d706c65/include/header.h"
+        };
+        assert_eq!(
+            normalize_canonical_dep_file_path(path, &fs)?,
+            expected_project_path("buck-out/v2/cell_sources/v1/c_73616d706c65/include/header.h"),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_dep_file_absolute_path_with_dotdot_errors_rather_than_collapsing()
+    -> buck2_error::Result<()> {
+        let fs = canonical_artifact_fs()?;
+        // `a/../b` would collapse to a declared path, so pruning on it would use a lexically
+        // laundered path.
+        let inside = if cfg!(windows) {
+            r"C:\project\declared\sample\include\..\header.h"
+        } else {
+            "/project/declared/sample/include/../header.h"
+        };
+        assert!(normalize_canonical_dep_file_path(inside, &fs).is_err());
+
+        let reentrant = if cfg!(windows) {
+            r"C:\project\..\project\declared\sample\header.h"
+        } else {
+            "/project/../project/declared/sample/header.h"
+        };
+        assert!(normalize_canonical_dep_file_path(reentrant, &fs).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_dep_file_absolute_path_outside_project_falls_back() -> buck2_error::Result<()> {
+        let fs = canonical_artifact_fs()?;
+        let outside = if cfg!(windows) {
+            r"C:\toolchain\include\header.h"
+        } else {
+            "/toolchain/include/header.h"
+        };
+        assert_eq!(
+            normalize_canonical_dep_file_path(outside, &fs)?,
+            CanonicalDepFilePath::OutsideProject,
+        );
+        // Shares only a leading string with the project root.
+        let sibling = if cfg!(windows) {
+            r"C:\project2\include\header.h"
+        } else {
+            "/project2/include/header.h"
+        };
+        assert_eq!(
+            normalize_canonical_dep_file_path(sibling, &fs)?,
+            CanonicalDepFilePath::OutsideProject,
+        );
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn canonical_dep_file_case_folded_project_root_is_outside_project() -> buck2_error::Result<()> {
+        // The strip is byte-exact on POSIX; only the Windows drive letter is case-folded.
+        let fs = canonical_artifact_fs()?;
+        assert_eq!(
+            normalize_canonical_dep_file_path(
+                "/PROJECT/buck-out/v2/cell_sources/v1/c_73616d706c65/include/header.h",
+                &fs,
+            )?,
+            CanonicalDepFilePath::OutsideProject,
+        );
+        Ok(())
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn canonical_dep_file_case_folded_spelling_falls_back_rather_than_pruning()
+    -> buck2_error::Result<()> {
+        // POSIX membership checks are byte-exact, so a respelling must not select the declared
+        // entry as though it had matched.
+        let fs = canonical_artifact_fs()?;
+        let declared = "buck-out/v2/cell_sources/v1/c_73616d706c65/include/header.h";
+        let mut builder = ActionDirectoryBuilder::empty();
+        builder.insert(
+            ForwardRelativePath::new(declared)?,
+            DirectoryEntry::Dir(ActionDirectoryBuilder::empty()),
+        )?;
+
+        for respelled in [
+            "buck-out/v2/CELL_SOURCES/v1/c_73616d706c65/include/header.h",
+            "buck-out/v2/cell_sources/v1/c_73616d706c65/include/HEADER.h",
+            "BUCK-OUT/v2/cell_sources/v1/c_73616d706c65/include/header.h",
+        ] {
+            assert!(
+                ConcreteDepFiles::add_path_to_selector(
+                    Cow::Borrowed(ForwardRelativePath::new(respelled)?),
+                    &mut DirectorySelector::empty(),
+                    &fs,
+                    &builder,
+                )
+                .is_err(),
+                "case-folded dep-file path `{respelled}` must fall back, not prune"
+            );
+        }
+
+        ConcreteDepFiles::add_path_to_selector(
+            Cow::Borrowed(ForwardRelativePath::new(declared)?),
+            &mut DirectorySelector::empty(),
+            &fs,
+            &builder,
+        )?;
+        Ok(())
+    }
+
+    /// Holds in both source path modes; canonical paths just make it easier to hit.
+    #[test]
+    fn dep_file_fingerprints_only_rewrite_hashes_in_generated_namespaces() -> buck2_error::Result<()>
+    {
+        fn fingerprint(
+            fs: &ArtifactFs,
+            source_root: &str,
+            source_component: &str,
+            generated_component: &str,
+        ) -> buck2_error::Result<TrackedFileDigest> {
+            let mut builder = ActionDirectoryBuilder::empty();
+            builder.insert(
+                ForwardRelativePath::new(&format!("{source_root}/{source_component}"))?,
+                DirectoryEntry::Dir(ActionDirectoryBuilder::empty()),
+            )?;
+            builder.insert(
+                ForwardRelativePath::new(&format!(
+                    "buck-out/v2/art/root/pkg/__target__/{generated_component}"
+                ))?,
+                DirectoryEntry::Dir(ActionDirectoryBuilder::empty()),
+            )?;
+            let digest_config = DigestConfig::testing_default();
+            let content_hash_serializer = TaggedInputsDirectorySerializer {
+                cas_digest_config: digest_config.cas_digest_config(),
+            };
+            Ok(fingerprint_tagged_inputs(
+                builder,
+                fs,
+                digest_config.as_directory_serializer(),
+                &content_hash_serializer,
+            )?
+            .fingerprint()
+            .dupe())
+        }
+
+        for (fs, source_root) in [
+            (
+                canonical_artifact_fs()?,
+                "buck-out/v2/cell_sources/v1/c_73616d706c65",
+            ),
+            (
+                ArtifactFs::testing_new_with_mode(
+                    CellSourcePathMode::Physical,
+                    &[("root", ""), ("sample", "declared/sample")],
+                ),
+                "declared/sample",
+            ),
+        ] {
+            let baseline = fingerprint(&fs, source_root, "0123456789abcdef", "0123456789abcdef")?;
+            assert_eq!(
+                baseline,
+                fingerprint(&fs, source_root, "0123456789abcdef", "fedcba9876543210")?,
+                "content hashes below art should use the dep-file placeholder ({source_root})",
+            );
+            assert_ne!(
+                baseline,
+                fingerprint(&fs, source_root, "fedcba9876543210", "0123456789abcdef")?,
+                "hash-looking source components must remain part of the fingerprint                  ({source_root})",
+            );
+        }
+        Ok(())
+    }
+
+    fn file_entry(content: &str) -> DirectoryEntry<ActionDirectoryBuilder, ActionDirectoryMember> {
+        DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
+            digest: TrackedFileDigest::from_content(
+                content.as_bytes(),
+                DigestConfig::testing_default().cas_digest_config(),
+            ),
+            is_executable: false,
+        }))
+    }
+
+    fn symlink_entry(
+        target: &str,
+    ) -> DirectoryEntry<ActionDirectoryBuilder, ActionDirectoryMember> {
+        DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(Arc::new(Symlink::new(
+            RelativePathBuf::from(target),
+        ))))
+    }
+
+    fn external_symlink_entry(
+        target: &str,
+    ) -> buck2_error::Result<DirectoryEntry<ActionDirectoryBuilder, ActionDirectoryMember>> {
+        Ok(DirectoryEntry::Leaf(
+            ActionDirectoryMember::ExternalSymlink(Arc::new(ExternalSymlink::new(
+                std::path::PathBuf::from(target),
+                ForwardRelativePathBuf::default(),
+            )?)),
+        ))
+    }
+
+    fn build_tree(
+        entries: Vec<(
+            String,
+            DirectoryEntry<ActionDirectoryBuilder, ActionDirectoryMember>,
+        )>,
+    ) -> buck2_error::Result<ActionDirectoryBuilder> {
+        let mut builder = ActionDirectoryBuilder::empty();
+        for (path, entry) in entries {
+            builder.insert(ForwardRelativePath::new(&path)?, entry)?;
+        }
+        Ok(builder)
+    }
+
+    /// Deliberately does not call `expand_selector_for_dependencies`: the selector built from the
+    /// dep-file line must cover symlink targets by itself.
+    fn filtered_fingerprint_for_line(
+        mut builder: ActionDirectoryBuilder,
+        fs: &ArtifactFs,
+        line: &str,
+    ) -> buck2_error::Result<TrackedFileDigest> {
+        let mut selector = DirectorySelector::empty();
+        ConcreteDepFiles::add_path_to_selector(
+            Cow::Borrowed(ForwardRelativePath::new(line)?),
+            &mut selector,
+            fs,
+            &builder,
+        )?;
+        selector.filter(&mut builder).map_err(|e| {
+            buck2_error::buck2_error!(buck2_error::ErrorTag::Input, "filter failed: {e}")
+        })?;
+        Ok(builder
+            .fingerprint(DigestConfig::testing_default().as_directory_serializer())
+            .fingerprint()
+            .dupe())
+    }
+
+    #[test]
+    fn canonical_dep_file_line_through_symlink_selects_target_subtree() -> buck2_error::Result<()> {
+        let fs = canonical_artifact_fs()?;
+        // Both the logical repo namespace and the canonical cell-sources namespace.
+        for prefix in [
+            "declared/sample",
+            "buck-out/v2/cell_sources/v1/c_73616d706c65",
+        ] {
+            let tree = |content: &str| {
+                build_tree(vec![
+                    (format!("{prefix}/real/header.h"), file_entry(content)),
+                    (format!("{prefix}/link"), symlink_entry("real")),
+                ])
+            };
+            let line = format!("{prefix}/link/header.h");
+            let before = filtered_fingerprint_for_line(tree("before")?, &fs, &line)?;
+            assert_eq!(
+                before,
+                filtered_fingerprint_for_line(tree("before")?, &fs, &line)?,
+                "filtered fingerprint must be deterministic",
+            );
+            assert_ne!(
+                before,
+                filtered_fingerprint_for_line(tree("after")?, &fs, &line)?,
+                "editing content reached through a declared symlink must change the filtered fingerprint",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_dep_file_chained_symlinks_resolve_to_target_subtree() -> buck2_error::Result<()> {
+        let fs = canonical_artifact_fs()?;
+        let tree = |content: &str| {
+            build_tree(vec![
+                (
+                    "declared/sample/real/header.h".to_owned(),
+                    file_entry(content),
+                ),
+                ("declared/sample/link2".to_owned(), symlink_entry("real")),
+                ("declared/sample/link1".to_owned(), symlink_entry("link2")),
+            ])
+        };
+        let line = "declared/sample/link1/header.h";
+        assert_ne!(
+            filtered_fingerprint_for_line(tree("before")?, &fs, line)?,
+            filtered_fingerprint_for_line(tree("after")?, &fs, line)?,
+            "content edits must invalidate through a chain of declared symlinks",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_dep_file_symlink_target_with_dotdot_resolves_lexically() -> buck2_error::Result<()>
+    {
+        let fs = canonical_artifact_fs()?;
+        let tree = |content: &str| {
+            build_tree(vec![
+                (
+                    "declared/sample/real/header.h".to_owned(),
+                    file_entry(content),
+                ),
+                (
+                    "declared/sample/include/link".to_owned(),
+                    symlink_entry("../real"),
+                ),
+            ])
+        };
+        let line = "declared/sample/include/link/header.h";
+        assert_ne!(
+            filtered_fingerprint_for_line(tree("before")?, &fs, line)?,
+            filtered_fingerprint_for_line(tree("after")?, &fs, line)?,
+            "`..` in a declared symlink target must resolve against the symlink's parent",
+        );
+
+        // A target that pops past the tree root cannot be proven a member.
+        let builder = build_tree(vec![(
+            "declared/sample/esc".to_owned(),
+            symlink_entry("../../../outside"),
+        )])?;
+        assert!(
+            ConcreteDepFiles::add_path_to_selector(
+                Cow::Borrowed(ForwardRelativePath::new("declared/sample/esc")?),
+                &mut DirectorySelector::empty(),
+                &fs,
+                &builder,
+            )
+            .is_err(),
+            "symlink target escaping the declared tree must fall back, not prune",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_dep_file_symlink_target_cancelling_own_component_falls_back()
+    -> buck2_error::Result<()> {
+        let fs = canonical_artifact_fs()?;
+        // `d/a` is a symlink to a *nested* directory, so the kernel resolves `d/a/../b` to
+        // `d/sub/b` while lexical collapse names the decoy `d/b`. Selecting the decoy would
+        // fingerprint it symmetrically on store and check, replaying a stale hit.
+        let builder = build_tree(vec![
+            ("declared/sample/d/a".to_owned(), symlink_entry("sub/e")),
+            ("declared/sample/d/sub/b".to_owned(), file_entry("kernel")),
+            ("declared/sample/d/b".to_owned(), file_entry("decoy")),
+            ("declared/sample/d/link".to_owned(), symlink_entry("a/../b")),
+        ])?;
+        assert!(
+            ConcreteDepFiles::add_path_to_selector(
+                Cow::Borrowed(ForwardRelativePath::new("declared/sample/d/link")?),
+                &mut DirectorySelector::empty(),
+                &fs,
+                &builder,
+            )
+            .is_err(),
+            "a `..` cancelling a target-introduced component must fall back, not select the decoy",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_dep_file_symlink_cycle_errors_instead_of_hanging() -> buck2_error::Result<()> {
+        let fs = canonical_artifact_fs()?;
+        let builder = build_tree(vec![
+            ("declared/sample/a".to_owned(), symlink_entry("b")),
+            ("declared/sample/b".to_owned(), symlink_entry("a")),
+        ])?;
+        for line in ["declared/sample/a", "declared/sample/a/header.h"] {
+            assert!(
+                ConcreteDepFiles::add_path_to_selector(
+                    Cow::Borrowed(ForwardRelativePath::new(line)?),
+                    &mut DirectorySelector::empty(),
+                    &fs,
+                    &builder,
+                )
+                .is_err(),
+                "symlink cycle for `{line}` must fall back for the tag, not hang or prune",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_dep_file_line_naming_symlink_leaf_selects_its_target() -> buck2_error::Result<()> {
+        let fs = canonical_artifact_fs()?;
+        let tree = |content: &str| {
+            build_tree(vec![
+                ("declared/sample/real.h".to_owned(), file_entry(content)),
+                ("declared/sample/link.h".to_owned(), symlink_entry("real.h")),
+            ])
+        };
+        let line = "declared/sample/link.h";
+        assert_ne!(
+            filtered_fingerprint_for_line(tree("before")?, &fs, line)?,
+            filtered_fingerprint_for_line(tree("after")?, &fs, line)?,
+            "a dep-file line naming a relative symlink leaf must also select its resolved target",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_dep_file_external_symlink_keeps_symlink_node_selection() -> buck2_error::Result<()>
+    {
+        let fs = canonical_artifact_fs()?;
+        let builder = build_tree(vec![(
+            "declared/sample/ext".to_owned(),
+            external_symlink_entry("/toolchain/include")?,
+        )])?;
+        // External targets are untracked content, so the symlink node alone stays correct.
+        for line in ["declared/sample/ext/header.h", "declared/sample/ext"] {
+            let mut selector = DirectorySelector::empty();
+            ConcreteDepFiles::add_path_to_selector(
+                Cow::Borrowed(ForwardRelativePath::new(line)?),
+                &mut selector,
+                &fs,
+                &builder,
+            )?;
+            assert!(!selector.is_empty());
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_dep_files_visitor_output_collection() {
