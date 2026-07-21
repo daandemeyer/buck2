@@ -622,10 +622,88 @@ mod tests {
     use buck2_hash::BuckIndexSet;
     use sorted_vector_map::SortedVectorMap;
 
+    use std::sync::Mutex;
+
     use super::*;
+    use crate::artifact::artifact_dyn::ArtifactDyn;
+    use crate::artifact::group::artifact_group_values_dyn::ArtifactGroupValuesDyn;
+    use crate::artifact_value::ArtifactValue;
+    use crate::execute::cache_uploader::NoOpCacheUploader;
+    use crate::execute::cell_execution_view::collect_canonical_source_inputs;
+    use crate::execute::prepared::NoOpCommandOptionalExecutor;
+    use crate::execute::request::CommandExecutionInput;
     use crate::execute::request::CommandExecutionOutput;
     use crate::execute::request::CommandExecutionPaths;
     use crate::execute::request::OutputCreationBehavior;
+    use crate::execute::request::WorkerId;
+    use crate::execute::request::WorkerSpec;
+    use crate::execute::testing_dry_run::DryRunExecutor;
+
+    struct TestSourceArtifact(CellPath);
+
+    impl ArtifactDyn for TestSourceArtifact {
+        fn resolve_path(
+            &self,
+            fs: &ArtifactFs,
+            _content_hash: Option<&buck2_core::content_hash::ContentBasedPathHash>,
+        ) -> buck2_error::Result<ProjectRelativePathBuf> {
+            fs.resolve_cell_path(self.0.as_ref())
+        }
+
+        fn resolve_path_for_execution(
+            &self,
+            fs: &ArtifactFs,
+            _content_hash: Option<&buck2_core::content_hash::ContentBasedPathHash>,
+        ) -> buck2_error::Result<ProjectRelativePathBuf> {
+            fs.resolve_cell_path_for_execution(self.0.as_ref())
+        }
+
+        fn resolve_configuration_hash_path(
+            &self,
+            fs: &ArtifactFs,
+        ) -> buck2_error::Result<ProjectRelativePathBuf> {
+            self.resolve_path(fs, None)
+        }
+
+        fn requires_materialization(&self, _fs: &ArtifactFs) -> bool {
+            false
+        }
+
+        fn has_content_based_path(&self) -> bool {
+            false
+        }
+
+        fn is_projected(&self) -> bool {
+            false
+        }
+    }
+
+    struct TestArtifactGroupValues {
+        artifact: TestSourceArtifact,
+        value: ArtifactValue,
+    }
+
+    impl ArtifactGroupValuesDyn for TestArtifactGroupValues {
+        fn iter(&self) -> Box<dyn Iterator<Item = (&dyn ArtifactDyn, &ArtifactValue)> + '_> {
+            Box::new(std::iter::once((
+                &self.artifact as &dyn ArtifactDyn,
+                &self.value,
+            )))
+        }
+
+        fn add_to_directory(
+            &self,
+            builder: &mut crate::directory::LazyActionDirectoryBuilder,
+            artifact_fs: &ArtifactFs,
+        ) -> buck2_error::Result<()> {
+            crate::directory::insert_artifact_lazy(
+                builder,
+                self.artifact
+                    .resolve_path_for_execution(artifact_fs, None)?,
+                &self.value,
+            )
+        }
+    }
 
     fn canonical_artifact_fs() -> buck2_error::Result<ArtifactFs> {
         Ok(ArtifactFs::testing_new_with_mode_and_external(
@@ -767,6 +845,109 @@ mod tests {
             )
             .is_err(),
             "offline-cache cwd must be rejected outright"
+        );
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct RecordingView(Mutex<Vec<CellName>>);
+
+    impl CellExecutionView for RecordingView {
+        fn prepare(
+            &self,
+            _artifact_fs: &ArtifactFs,
+            requirements: &CellExecutionViewRequirements,
+        ) -> buck2_error::Result<()> {
+            self.0.lock().unwrap().extend(requirements.cells());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn execution_view_prepares_canonical_worker_inputs() -> buck2_error::Result<()> {
+        let artifact_fs = canonical_artifact_fs()?;
+        let digest_config = DigestConfig::testing_default();
+        let worker_source = CellPath::new(
+            CellName::testing_new("local"),
+            CellRelativePathBuf::unchecked_new("worker/tool".to_owned()),
+        );
+        let worker_paths = CommandExecutionPaths::new(
+            vec![CommandExecutionInput::Artifact(Box::new(
+                TestArtifactGroupValues {
+                    artifact: TestSourceArtifact(worker_source),
+                    value: ArtifactValue::file(digest_config.empty_file()),
+                },
+            ))],
+            Default::default(),
+            &artifact_fs,
+            digest_config,
+            None,
+        )?;
+        let request_paths = CommandExecutionPaths::new(
+            Vec::new(),
+            Default::default(),
+            &artifact_fs,
+            digest_config,
+            None,
+        )?;
+        let request = CommandExecutionRequest::new(
+            vec!["tool".to_owned()],
+            Vec::new(),
+            request_paths,
+            SortedVectorMap::default(),
+        )
+        .with_worker(Some(WorkerSpec {
+            id: WorkerId(1),
+            exe: vec!["worker".to_owned()],
+            env: SortedVectorMap::default(),
+            concurrency: None,
+            streaming: false,
+            remote_key: None,
+            input_paths: worker_paths,
+        }));
+
+        let view = Arc::new(RecordingView::default());
+        let executor = CommandExecutor::new_with_cell_execution_view(
+            Arc::new(DryRunExecutor::new(
+                Arc::new(Mutex::new(Vec::new())),
+                artifact_fs.clone(),
+            )),
+            Arc::new(NoOpCommandOptionalExecutor {}),
+            Arc::new(NoOpCommandOptionalExecutor {}),
+            Arc::new(NoOpCacheUploader {}),
+            artifact_fs,
+            CommandGenerationOptions {
+                path_separator:
+                    buck2_core::execution_types::executor_config::PathSeparatorKind::Unix,
+                output_paths_behavior: OutputPathsBehavior::Compatibility,
+                use_bazel_protocol_remote_persistent_workers: false,
+                network_access: None,
+            },
+            RE::Platform::default(),
+            Some(view.clone()),
+        );
+
+        executor.prepare_action(&request, digest_config, false)?;
+        assert!(
+            view.0.lock().unwrap().is_empty(),
+            "Action construction and cache selection must not publish the local view",
+        );
+        let mut requirements =
+            collect_canonical_source_inputs(executor.fs(), request.paths().input_directory())?
+                .view_requirements;
+        if let Some(worker) = request.worker() {
+            requirements.merge(
+                collect_canonical_source_inputs(
+                    executor.fs(),
+                    worker.input_paths.input_directory(),
+                )?
+                .view_requirements,
+            );
+        }
+        executor.prepare_materialized_execution_view(&request, requirements)?;
+        assert_eq!(
+            *view.0.lock().unwrap(),
+            vec![CellName::testing_new("local")],
         );
         Ok(())
     }
