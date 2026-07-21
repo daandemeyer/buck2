@@ -112,7 +112,7 @@ async fn query_action_cache_and_download_result(
     if upload_all_actions {
         if let Err(e) = re_client
             .upload(
-                artifact_fs.fs(),
+                artifact_fs,
                 materializer,
                 action_blobs,
                 ProjectRelativePath::empty(),
