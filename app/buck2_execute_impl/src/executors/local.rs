@@ -1109,21 +1109,6 @@ impl LocalExecutor {
         if let (Some(worker_spec), Some(worker_pool), ForkserverAccess::Client(_)) =
             (request.worker(), self.worker_pool.dupe(), &self.forkserver)
         {
-            if self.artifact_fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
-                // Persistent-worker lifecycle is not yet integrated with canonical cell
-                // execution paths: a worker process can outlive its command, and nothing
-                // confirms its exit before the sparse source view may be rebound for a
-                // different cell topology. Reject the combination cleanly; support lands
-                // in a follow-up change. Remote persistent workers are unaffected: they
-                // execute remotely and perform no view I/O.
-                return ControlFlow::Break(manager.error(
-                    "canonical_local_worker_unsupported",
-                    buck2_error::buck2_error!(
-                        buck2_error::ErrorTag::Input,
-                        "Local persistent workers are not yet supported with `cell_execution_paths = canonical_v1`; disable persistent workers or use physical cell execution paths"
-                    ),
-                ));
-            }
             let env = worker_spec
                 .env
                 .iter()
@@ -1403,12 +1388,18 @@ pub async fn materialize_inputs(
     // A source entry can occur only in a generated artifact's dependency tree, so the finalized
     // input directories are inspected rather than just the top-level artifact list.
     if artifact_fs.cell_source_path_mode() == CellSourcePathMode::CanonicalV1 {
-        let mut inputs =
-            collect_canonical_source_inputs(artifact_fs, request.paths().input_directory())?;
-        paths.append(&mut inputs.physical_paths);
-        canonical_sources
-            .view_requirements
-            .merge(inputs.view_requirements);
+        for input_directory in std::iter::once(request.paths().input_directory()).chain(
+            request
+                .worker()
+                .as_ref()
+                .map(|worker| worker.input_paths.input_directory()),
+        ) {
+            let mut inputs = collect_canonical_source_inputs(artifact_fs, input_directory)?;
+            paths.append(&mut inputs.physical_paths);
+            canonical_sources
+                .view_requirements
+                .merge(inputs.view_requirements);
+        }
     }
 
     for input in request.inputs().iter().chain(
