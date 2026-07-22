@@ -68,10 +68,14 @@ and external storage, provided its canonical name stays the same.
 
 This option changes action semantics. For selected local and host consumers Buck2
 creates a sparse execution forest: each cell root is a real directory and its
-declared top-level entries are links to physical source storage. The canonical
-prefix also lengthens every source path by roughly 40 characters (more for long
-cell names). `canonical_v1` is not yet supported on Windows; support (using
-junctions and file symlinks) lands in a follow-up.
+declared top-level entries are links to physical source storage. On Windows,
+directory entries use junctions and file entries require symlink capability.
+The canonical prefix also lengthens every source path by roughly 40 characters
+(more for long cell names); on Windows, tools that are not long-path aware, such
+as `cl.exe` without a long-path manifest, fail on paths past 260 characters even
+when long paths are enabled system-wide. Buck2 logs a warning if even the view's
+own directory paths cross that limit, but deep source paths inside a cell can
+exceed it without a warning; keep checkouts shallow on Windows.
 Changing a cell's topology (moving its root or switching its external origin)
 currently requires `buck2 clean`; live rebinding of the canonical view lands in
 a follow-up.
