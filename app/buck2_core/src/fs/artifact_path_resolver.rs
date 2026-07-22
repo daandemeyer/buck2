@@ -35,11 +35,6 @@ const CELL_SOURCES_V1_PREFIX: &str = "cell_sources/v1";
 const CELL_SOURCES_V1_COMPONENT_PREFIX: &str = "c_";
 const CELL_SOURCES_V1_MAX_CELL_NAME_BYTES: usize = 126;
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum CanonicalSourcePathClass {
-    ReservedBuckOut,
-    Ordinary,
-}
 #[derive(
     Copy,
     Clone,
@@ -134,6 +129,17 @@ impl ArtifactFs {
         cells: &[(&str, &str)],
         external: &[&str],
     ) -> ArtifactFs {
+        Self::testing_new_full(mode, cells, external, &[], None)
+    }
+
+    /// Cells named in `external` get a git origin, cells named in `bundled` a bundled origin.
+    pub fn testing_new_full(
+        mode: CellSourcePathMode,
+        cells: &[(&str, &str)],
+        external: &[&str],
+        bundled: &[&str],
+        project_root: Option<ProjectRoot>,
+    ) -> ArtifactFs {
         use crate::cells::CellAliasResolver;
         use crate::cells::cell_root_path::CellRootPathBuf;
         use crate::cells::external::ExternalCellOrigin;
@@ -157,15 +163,19 @@ impl ArtifactFs {
         let instances = cells
             .iter()
             .map(|(name, path)| {
-                let origin = external.contains(&name.as_str()).then(|| {
-                    ExternalCellOrigin::Git(GitCellSetup {
+                let origin = if bundled.contains(&name.as_str()) {
+                    Some(ExternalCellOrigin::Bundled(*name))
+                } else if external.contains(&name.as_str()) {
+                    Some(ExternalCellOrigin::Git(GitCellSetup {
                         git_origin: std::sync::Arc::from(
                             format!("https://example.com/{name}.git").as_str(),
                         ),
                         commit: std::sync::Arc::from("0123456789abcdef0123456789abcdef01234567"),
                         object_format: None,
-                    })
-                });
+                    }))
+                } else {
+                    None
+                };
                 CellInstance::new(
                     *name,
                     path.clone(),
@@ -180,17 +190,19 @@ impl ArtifactFs {
             CellAliasResolver::new(cells[0].0, Default::default()).unwrap(),
         )
         .unwrap();
-        let project_root = ProjectRoot::new_unchecked(
-            buck2_fs::paths::abs_norm_path::AbsNormPathBuf::new(
-                std::path::Path::new(if cfg!(windows) {
-                    "C:\\project"
-                } else {
-                    "/project"
-                })
-                .to_owned(),
+        let project_root = project_root.unwrap_or_else(|| {
+            ProjectRoot::new_unchecked(
+                buck2_fs::paths::abs_norm_path::AbsNormPathBuf::new(
+                    std::path::Path::new(if cfg!(windows) {
+                        "C:\\project"
+                    } else {
+                        "/project"
+                    })
+                    .to_owned(),
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        );
+        });
         ArtifactFs::new_with_cell_source_path_mode(
             resolver,
             BuckOutPathResolver::new(ProjectRelativePathBuf::unchecked_new("buck-out/v2".into())),
@@ -238,9 +250,7 @@ impl ArtifactFs {
             CellSourcePathMode::Physical => self.resolve_cell_path(path),
             CellSourcePathMode::CanonicalV1 => {
                 self.validate_canonical_cell_layout(path.cell())?;
-                if self.classify_source_cell_path(path.path())
-                    == CanonicalSourcePathClass::ReservedBuckOut
-                {
+                if self.is_reserved_buck_out_source_path(path.path()) {
                     return Err(buck2_error::buck2_error!(
                         buck2_error::ErrorTag::Input,
                         "Source path `{path}` is beneath the reserved top-level `buck-out` subtree in `canonical_v1`",
@@ -301,38 +311,26 @@ impl ArtifactFs {
             }
             // A local cell rooted beneath any isolation dir, not just this daemon's, would treat
             // another daemon's live materializer or view state as portable source.
-            if let Some(first) = physical_root.iter().next() {
-                if self.classify_source_top_level_name(first)
-                    == CanonicalSourcePathClass::ReservedBuckOut
-                {
-                    return Err(buck2_error::buck2_error!(
-                        buck2_error::ErrorTag::Input,
-                        "Local cell `{cell}` has physical source root `{physical_root}` beneath reserved top-level `buck-out` in `canonical_v1`",
-                    ));
-                }
+            if let Some(first) = physical_root.iter().next()
+                && self.is_reserved_buck_out_top_level_name(first)
+            {
+                return Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "Local cell `{cell}` has physical source root `{physical_root}` beneath reserved top-level `buck-out` in `canonical_v1`",
+                ));
             }
         }
         Ok(())
     }
 
-    pub fn classify_source_cell_path(&self, path: &CellRelativePath) -> CanonicalSourcePathClass {
-        match path.iter().next() {
-            Some(component)
-                if self.classify_source_top_level_name(component)
-                    == CanonicalSourcePathClass::ReservedBuckOut =>
-            {
-                CanonicalSourcePathClass::ReservedBuckOut
-            }
-            _ => CanonicalSourcePathClass::Ordinary,
-        }
+    pub fn is_reserved_buck_out_source_path(&self, path: &CellRelativePath) -> bool {
+        path.iter()
+            .next()
+            .is_some_and(|component| self.is_reserved_buck_out_top_level_name(component))
     }
 
-    pub fn classify_source_top_level_name(&self, name: &FileName) -> CanonicalSourcePathClass {
-        if source_component_eq(name.as_str(), "buck-out") {
-            CanonicalSourcePathClass::ReservedBuckOut
-        } else {
-            CanonicalSourcePathClass::Ordinary
-        }
+    pub fn is_reserved_buck_out_top_level_name(&self, name: &FileName) -> bool {
+        source_component_eq(name.as_str(), "buck-out")
     }
 
     pub fn resolve_cell_source_root_physical(
@@ -422,9 +420,7 @@ impl ArtifactFs {
                 "Malformed canonical cell execution path `{path}`: unsupported entry `{version}` in the reserved cell-sources namespace"
             ));
         }
-        let relative = ProjectRelativePathBuf::unchecked_new(
-            namespace_components.as_path().as_str().to_owned(),
-        );
+        let relative = namespace_components.as_path();
         if relative.is_empty() {
             return Ok(None);
         }
@@ -469,10 +465,8 @@ impl ArtifactFs {
                 "Canonical cell execution path `{path}` names cell `{cell}`, which is not configured: {e}"
             )
         })?;
-        let mut components = relative.iter();
-        let _encoded = components.next().expect("checked non-empty path");
         let suffix = CellRelativePath::new(components.as_path()).to_buf();
-        if self.classify_source_cell_path(&suffix) == CanonicalSourcePathClass::ReservedBuckOut {
+        if self.is_reserved_buck_out_source_path(&suffix) {
             return Err(buck2_error::buck2_error!(
                 buck2_error::ErrorTag::Input,
                 "Malformed canonical cell execution path `{path}`: source suffix is beneath reserved top-level `buck-out`"
@@ -552,7 +546,9 @@ impl ArtifactFs {
             current.push(component.as_str());
             match std::fs::symlink_metadata(&current) {
                 Ok(metadata) => {
-                    if metadata.file_type().is_symlink() || metadata_is_reparse_point(&metadata) {
+                    if metadata.file_type().is_symlink()
+                        || buck2_fs::fs_util::is_reparse_point(&metadata)
+                    {
                         return Err(buck2_error::buck2_error!(
                             buck2_error::ErrorTag::Input,
                             "Local cell `{cell}` has source root `{physical_root}` with symlink/junction component `{}`; canonical_v1 requires ordinary local cell roots to use real directory components",
@@ -606,40 +602,27 @@ impl ArtifactFs {
     }
 }
 
-fn strip_project_prefix_for_source_identity(
-    path: &crate::fs::project_rel_path::ProjectRelativePath,
+/// Borrows the suffix: this is on the path of every source resolution in `canonical_v1`, so a
+/// yes/no answer must not cost an allocation.
+fn strip_project_prefix_for_source_identity<'a>(
+    path: &'a crate::fs::project_rel_path::ProjectRelativePath,
     prefix: &crate::fs::project_rel_path::ProjectRelativePath,
-) -> Option<ProjectRelativePathBuf> {
-    if let Some(suffix) = path.strip_prefix_opt(prefix) {
-        return Some(ProjectRelativePathBuf::unchecked_new(
-            suffix.as_str().to_owned(),
-        ));
-    }
-    if !project_path_has_prefix(path, prefix) {
-        return None;
-    }
-
+) -> Option<&'a ForwardRelativePath> {
     let mut components = path.iter();
-    for _ in prefix.iter() {
-        components
-            .next()
-            .expect("prefix was checked component-wise");
+    for expected in prefix.iter() {
+        let actual = components.next()?;
+        if !source_component_eq(actual.as_str(), expected.as_str()) {
+            return None;
+        }
     }
-    Some(ProjectRelativePathBuf::unchecked_new(
-        components.as_path().as_str().to_owned(),
-    ))
+    Some(components.as_path())
 }
 
 fn project_path_has_prefix(
     path: &crate::fs::project_rel_path::ProjectRelativePath,
     prefix: &crate::fs::project_rel_path::ProjectRelativePath,
 ) -> bool {
-    let mut components = path.iter();
-    prefix.iter().all(|expected| {
-        components
-            .next()
-            .is_some_and(|actual| source_component_eq(actual.as_str(), expected.as_str()))
-    })
+    strip_project_prefix_for_source_identity(path, prefix).is_some()
 }
 
 pub(crate) fn source_component_eq(left: &str, right: &str) -> bool {
@@ -653,22 +636,8 @@ pub(crate) fn source_component_eq(left: &str, right: &str) -> bool {
     }
 }
 
-#[cfg(windows)]
-fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn metadata_is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
-    false
-}
-
 #[cfg(test)]
 mod tests {
-    use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 
     use super::ArtifactFs;
     use super::CellSourcePathMode;
@@ -676,16 +645,17 @@ mod tests {
     use crate::cells::name::CellName;
     use crate::cells::paths::CellRelativePathBuf;
     use crate::fs::buck_out_path::BuckOutPathResolver;
-    use crate::fs::project::ProjectRoot;
     use crate::fs::project_rel_path::ProjectRelativePath;
     use crate::fs::project_rel_path::ProjectRelativePathBuf;
     use crate::package::source_path::SourcePath;
 
     fn external_artifact_fs(mode: CellSourcePathMode) -> buck2_error::Result<ArtifactFs> {
-        Ok(ArtifactFs::testing_new_with_mode_and_external(
+        Ok(ArtifactFs::testing_new_full(
             mode,
             &[("root", ""), ("sample", "declared/sample")],
             &["sample"],
+            &[],
+            None,
         ))
     }
 
@@ -1041,24 +1011,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn canonical_local_cell_root_does_not_follow_symlinks() -> buck2_error::Result<()> {
-        let temp = tempfile::tempdir()?;
-        std::fs::create_dir(temp.path().join("real"))?;
-        std::os::unix::fs::symlink("real", temp.path().join("alias"))?;
-
-        let mut fs = local_artifact_fs_with_cell_name_and_path("sample", "alias")?;
-        fs.project_filesystem =
-            ProjectRoot::new_unchecked(AbsNormPathBuf::new(temp.path().to_path_buf()).unwrap());
-        assert!(
-            fs.validate_canonical_cell(CellName::testing_new("sample"))
-                .is_err()
-        );
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn physical_handoff_revalidates_local_cell_root() -> buck2_error::Result<()> {
+        use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
+
+        use crate::fs::project::ProjectRoot;
+
         let temp = tempfile::tempdir()?;
         std::fs::create_dir(temp.path().join("cell"))?;
         std::fs::create_dir(temp.path().join("replacement"))?;
@@ -1072,8 +1029,12 @@ mod tests {
         std::fs::remove_dir(temp.path().join("cell"))?;
         std::os::unix::fs::symlink("replacement", temp.path().join("cell"))?;
         assert!(
+            fs.validate_canonical_cell(cell).is_err(),
+            "a cell root rebound through a symlink must not validate"
+        );
+        assert!(
             fs.resolve_cell_source_root_for_consumption(cell).is_err(),
-            "physical byte lookup must reject a cell root rebound through a symlink"
+            "physical byte lookup must revalidate at the consumption boundary"
         );
         Ok(())
     }
