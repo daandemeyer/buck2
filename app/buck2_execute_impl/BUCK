@@ -85,7 +85,6 @@ rust_library(
         ],
         "ovr_config//os:windows": [
             "fbsource//third-party/rust:junction",
-            "fbsource//third-party/rust:windows-sys",
         ],
     }),
 )
