@@ -14,11 +14,8 @@ use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(unix)]
 use std::sync::atomic::AtomicU64;
-#[cfg(unix)]
 use std::sync::atomic::Ordering;
-#[cfg(unix)]
 use std::time::SystemTime;
 
 use buck2_core::cells::cell_path::CellPath;
@@ -32,7 +29,6 @@ use buck2_execute::execute::cell_execution_view::CellExecutionView;
 use buck2_execute::execute::cell_execution_view::CellExecutionViewRequirements;
 use parking_lot::Mutex;
 
-#[cfg(unix)]
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 const OWNER_MAGIC: &[u8] = b"buck2-cell-execution-view-v1\0";
 
@@ -152,6 +148,8 @@ impl PreparedCell {
 
     fn preflight(&self) -> buck2_error::Result<()> {
         let physical = self.physical_abs();
+        let logical = self.logical_abs();
+        let namespace = Namespace::from_logical_root(&logical)?;
         let metadata = fs::metadata(&physical).buck_error_context(format!(
             "Physical source root `{}` for cell `{}` is not available",
             self.physical, self.cell
@@ -164,6 +162,18 @@ impl PreparedCell {
                 self.cell,
             ));
         }
+        preflight_platform_path(&physical)?;
+        preflight_platform_path(&logical)?;
+        preflight_publication_siblings(&logical)?;
+        preflight_platform_path(namespace.cell_sources)?;
+        preflight_platform_path(namespace.v1)?;
+        preflight_platform_path(&namespace.owners)?;
+        let owner =
+            namespace.owners.join(logical.file_name().ok_or_else(|| {
+                buck2_error::internal_error!("Canonical cell root has no file name")
+            })?);
+        preflight_platform_path(&owner)?;
+        preflight_publication_siblings(&owner)?;
         for directory in &self.empty_directories {
             let source = physical.join(directory.as_str());
             match fs::symlink_metadata(&source) {
@@ -183,6 +193,7 @@ impl PreparedCell {
                     ));
                 }
             }
+            preflight_platform_path(&source)?;
         }
         for entry in &self.entries {
             if entry.iter().count() != 1 {
@@ -193,22 +204,33 @@ impl PreparedCell {
                 ));
             }
             let source = physical.join(entry.as_str());
-            match fs::symlink_metadata(&source) {
-                Ok(_) => {}
+            let source_metadata = match fs::symlink_metadata(&source) {
+                Ok(metadata) => Some(metadata),
                 Err(e)
                     if e.kind() == io::ErrorKind::NotFound
                         && self.bundled
                         && self
                             .empty_directories
                             .iter()
-                            .any(|directory| directory.starts_with(entry)) => {}
+                            .any(|directory| directory.starts_with(entry)) =>
+                {
+                    None
+                }
                 Err(e) => {
                     return Err(e).buck_error_context(format!(
                         "Canonical source view entry `{}` is missing from physical cell `{}`",
                         entry, self.cell
                     ));
                 }
+            };
+            preflight_platform_path(&source)?;
+            if source_metadata.is_none() || source_metadata.as_ref().is_some_and(is_plain_directory)
+            {
+                preflight_junction_target(&source)?;
             }
+            let logical_entry = logical.join(entry.as_str());
+            preflight_platform_path(&logical_entry)?;
+            preflight_publication_siblings(&logical_entry)?;
         }
         Ok(())
     }
@@ -423,9 +445,28 @@ fn is_plain_directory(metadata: &fs::Metadata) -> bool {
     metadata.is_dir() && !metadata.file_type().is_symlink()
 }
 
+#[cfg(windows)]
+fn is_plain_directory(metadata: &fs::Metadata) -> bool {
+    metadata.is_dir() && !is_reparse_point(metadata)
+}
+
 #[cfg(unix)]
 fn is_plain_file(metadata: &fs::Metadata) -> bool {
     metadata.is_file() && !metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn is_plain_file(metadata: &fs::Metadata) -> bool {
+    metadata.is_file() && !is_reparse_point(metadata)
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 fn unexpected_object(path: &Path, role: &str) -> buck2_error::Error {
@@ -518,33 +559,293 @@ fn create_posix_symlink_atomic(target: &Path, link: &Path) -> buck2_error::Resul
     ))
 }
 
-// Canonical cell execution paths are rejected at daemon startup on Windows, so these
-// entry points are unreachable there; they exist only to keep this module compiling
-// until Windows support (junctions and file symlinks) lands.
 #[cfg(windows)]
-fn windows_unsupported() -> buck2_error::Error {
-    buck2_error::buck2_error!(
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WindowsPlant {
+    Junction(PathBuf),
+    FileSymlink(PathBuf),
+    DirectorySymlink(PathBuf),
+}
+
+#[cfg(windows)]
+fn prepare_plant(physical: &Path, logical: &Path) -> buck2_error::Result<()> {
+    let desired = windows_plant(physical)?;
+    match fs::symlink_metadata(logical) {
+        Ok(metadata) if is_reparse_point(&metadata) => {
+            if windows_plant_matches(logical, &desired)? {
+                return Ok(());
+            }
+            Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Environment,
+                "Canonical source view entry `{}` changed while its cell topology is still active; restart the Buck2 daemon or run `buck2 clean`",
+                logical.display()
+            ))
+        }
+        Ok(_) => Err(unexpected_object(logical, "view entry")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => create_windows_plant(&desired, logical),
+        Err(e) => Err(e).buck_error_context("Failed to inspect canonical view entry"),
+    }
+}
+
+#[cfg(windows)]
+fn windows_plant(physical: &Path) -> buck2_error::Result<WindowsPlant> {
+    let metadata = fs::symlink_metadata(physical)
+        .buck_error_context("Failed to inspect physical source entry")?;
+    if metadata.file_type().is_symlink() {
+        if junction::exists(physical)
+            .buck_error_context("Failed to classify physical source reparse point")?
+        {
+            return Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "Source junction `{}` is not supported by canonical cell execution paths",
+                physical.display()
+            ));
+        }
+        let target = fs::read_link(physical)
+            .buck_error_context("Unsupported or unreadable physical source reparse point")?;
+        if target.is_absolute() {
+            return Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "Absolute source symlink `{}` is not supported by canonical cell execution paths",
+                physical.display()
+            ));
+        }
+        let target_metadata = fs::metadata(physical).buck_error_context(
+            "Dangling or racing Windows source symlink is not supported by canonical cell execution paths",
+        )?;
+        return if target_metadata.is_dir() {
+            Ok(WindowsPlant::DirectorySymlink(target))
+        } else if target_metadata.is_file() {
+            Ok(WindowsPlant::FileSymlink(target))
+        } else {
+            Err(unexpected_object(physical, "source symlink target"))
+        };
+    }
+    if metadata.is_dir() {
+        Ok(WindowsPlant::Junction(physical.to_path_buf()))
+    } else if metadata.is_file() {
+        Ok(WindowsPlant::FileSymlink(physical.to_path_buf()))
+    } else {
+        Err(unexpected_object(physical, "source entry"))
+    }
+}
+
+#[cfg(windows)]
+fn windows_plant_matches(path: &Path, desired: &WindowsPlant) -> buck2_error::Result<bool> {
+    match desired {
+        WindowsPlant::Junction(expected) => {
+            if !junction::exists(path)
+                .buck_error_context("Failed to classify canonical source view junction")?
+            {
+                return Ok(false);
+            }
+            let actual = junction::get_target(path)
+                .buck_error_context("Failed to read canonical source view junction")?;
+            Ok(same_target(&actual, expected, path))
+        }
+        WindowsPlant::FileSymlink(expected) | WindowsPlant::DirectorySymlink(expected) => {
+            if junction::exists(path)
+                .buck_error_context("Failed to classify canonical source view symlink")?
+            {
+                return Ok(false);
+            }
+            // Windows refuses to open a file through a directory-flavored symlink and vice
+            // versa, so the flavor must match even when the target text has not changed.
+            {
+                use std::os::windows::fs::FileTypeExt;
+                let file_type = fs::symlink_metadata(path)
+                    .buck_error_context("Failed to inspect canonical source view symlink")?
+                    .file_type();
+                let flavor_matches = match desired {
+                    WindowsPlant::FileSymlink(_) => file_type.is_symlink_file(),
+                    WindowsPlant::DirectorySymlink(_) => file_type.is_symlink_dir(),
+                    WindowsPlant::Junction(_) => false,
+                };
+                if !flavor_matches {
+                    return Ok(false);
+                }
+            }
+            let actual = fs::read_link(path)
+                .buck_error_context("Failed to read canonical source view symlink")?;
+            Ok(same_target(&actual, expected, path))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn create_windows_plant(desired: &WindowsPlant, link: &Path) -> buck2_error::Result<()> {
+    let parent = link.parent().ok_or_else(|| {
+        buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Tier0,
+            "Canonical source view link has no parent"
+        )
+    })?;
+    for _ in 0..32 {
+        let temp = unique_sibling(parent, "tmp");
+        let created = match desired {
+            WindowsPlant::Junction(target) => junction::create(target, &temp),
+            WindowsPlant::FileSymlink(target) => std::os::windows::fs::symlink_file(target, &temp),
+            WindowsPlant::DirectorySymlink(target) => {
+                std::os::windows::fs::symlink_dir(target, &temp)
+            }
+        };
+        match created {
+            Ok(()) => {
+                return match fs::rename(&temp, link) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        let _ignored = remove_windows_link(&temp);
+                        Err(e).buck_error_context("Failed to publish canonical source view link")
+                    }
+                };
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                // `junction::create` is `create_dir` plus setting the reparse point; a failing
+                // reparse step leaves a plain `.tmp_*` directory, which the next daemon's forest
+                // clear would escalate to a clean-required error.
+                if remove_windows_link(&temp).is_err() {
+                    let _ignored = fs::remove_dir(&temp);
+                }
+                return Err(e).buck_error_context(
+                    "Failed to create canonical source view link; Windows file links require symlink capability",
+                );
+            }
+        }
+    }
+    Err(buck2_error::buck2_error!(
         buck2_error::ErrorTag::Environment,
-        "canonical cell execution paths are not yet supported on Windows"
-    )
+        "Could not allocate a temporary canonical source view link"
+    ))
 }
 
 #[cfg(windows)]
-fn prepare_plant(_physical: &Path, _logical: &Path) -> buck2_error::Result<()> {
-    Err(windows_unsupported())
+fn remove_windows_link(path: &Path) -> buck2_error::Result<()> {
+    use std::os::windows::fs::FileTypeExt;
+
+    if junction::exists(path).buck_error_context("Failed to classify stale view link")? {
+        junction::delete(path).buck_error_context("Failed to detach stale view junction")?;
+        return fs::remove_dir(path).buck_error_context("Failed to remove stale view junction");
+    }
+    let file_type = fs::symlink_metadata(path)
+        .buck_error_context("Failed to inspect stale view symlink")?
+        .file_type();
+    if file_type.is_symlink_dir() {
+        fs::remove_dir(path).buck_error_context("Failed to remove stale directory symlink")
+    } else if file_type.is_symlink_file() {
+        fs::remove_file(path).buck_error_context("Failed to remove stale file symlink")
+    } else {
+        Err(unexpected_object(path, "stale view link"))
+    }
 }
 
 #[cfg(windows)]
-fn is_plain_directory(metadata: &fs::Metadata) -> bool {
-    metadata.is_dir() && !metadata.file_type().is_symlink()
+fn same_target(actual: &Path, expected: &Path, link: &Path) -> bool {
+    if actual.is_relative() && expected.is_relative() {
+        // Plants preserve the raw target text: resolving one against the logical forest and the
+        // other against physical storage would make two identical links appear different.
+        return actual == expected;
+    }
+    let actual = if actual.is_absolute() {
+        actual.to_owned()
+    } else {
+        match link.parent() {
+            Some(parent) => parent.join(actual),
+            None => return false,
+        }
+    };
+    let expected = if expected.is_absolute() {
+        expected.to_owned()
+    } else {
+        match link.parent() {
+            Some(parent) => parent.join(expected),
+            None => return false,
+        }
+    };
+    if actual == expected {
+        return true;
+    }
+    match (actual.canonicalize(), expected.canonicalize()) {
+        (Ok(actual), Ok(expected)) => actual == expected,
+        _ => false,
+    }
+}
+
+#[cfg(not(windows))]
+fn preflight_platform_path(_path: &Path) -> buck2_error::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn preflight_junction_target(_path: &Path) -> buck2_error::Result<()> {
+    Ok(())
+}
+
+fn preflight_publication_siblings(path: &Path) -> buck2_error::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        buck2_error::internal_error!("Canonical view publication path has no parent")
+    })?;
+    for role in ["tmp", "old"] {
+        preflight_platform_path(&parent.join(format!(
+            ".{role}_00000000000000000000000000000000_0000000000000000"
+        )))?;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
-fn is_plain_file(metadata: &fs::Metadata) -> bool {
-    metadata.is_file() && !metadata.file_type().is_symlink()
+fn preflight_platform_path(path: &Path) -> buck2_error::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let length = path.as_os_str().encode_wide().count();
+    if length >= 32_767 {
+        return Err(buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Environment,
+            "Canonical source view path `{}` exceeds the Windows absolute path limit",
+            path.display()
+        ));
+    }
+    if path
+        .components()
+        .any(|component| component.as_os_str().encode_wide().count() > 255)
+    {
+        return Err(buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Environment,
+            "Canonical source view path `{}` contains a component longer than 255 UTF-16 code units",
+            path.display()
+        ));
+    }
+    if length >= 260 {
+        // Buck2's own I/O uses `\\?\` paths, but spawned tools get raw ones, and tools without a
+        // long-path manifest (notably cl.exe) fail on them whatever LongPathsEnabled says.
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "Canonical source view path `{}` exceeds 260 UTF-16 code units; \
+                 tools that are not long-path aware may fail to open it",
+                path.display()
+            );
+        });
+    }
+    Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+fn preflight_junction_target(path: &Path) -> buck2_error::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    // junction 2.0 stores an NT substitute name (`\\??\\` + target) and a printable target in the
+    // 16 KiB reparse buffer, which with both terminators leaves 4,089 UTF-16 code units.
+    if path.as_os_str().encode_wide().count() > 4_089 {
+        return Err(buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Environment,
+            "Canonical source directory target `{}` exceeds the Windows junction reparse-buffer limit",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn unique_sibling(parent: &Path, role: &str) -> PathBuf {
     let timestamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -554,6 +855,75 @@ fn unique_sibling(parent: &Path, role: &str) -> PathBuf {
         ".{role}_{timestamp:032x}_{:016x}",
         NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn same_topology_mismatch_requires_restart_without_replacing_junction()
+    -> buck2_error::Result<()> {
+        let project = tempfile::tempdir()?;
+        let physical_a = project.path().join("physical-a");
+        let physical_b = project.path().join("physical-b");
+        let logical = project.path().join("logical");
+        fs::create_dir(&physical_a)?;
+        fs::create_dir(&physical_b)?;
+        junction::create(&physical_a, &logical)?;
+
+        let error = prepare_plant(&physical_b, &logical)
+            .expect_err("a published Windows plant must not be replaced without quiescence");
+        assert!(error.to_string().contains("restart the Buck2 daemon"));
+        assert_eq!(
+            junction::get_target(&logical)?.canonicalize()?,
+            physical_a.canonicalize()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn relative_source_symlink_plants_are_idempotent() -> buck2_error::Result<()> {
+        use std::os::windows::fs::symlink_dir;
+        use std::os::windows::fs::symlink_file;
+
+        let project = tempfile::tempdir()?;
+        let physical = project.path().join("physical");
+        let logical = project.path().join("logical");
+        fs::create_dir(&physical)?;
+        fs::create_dir(&logical)?;
+        fs::write(physical.join("file-target"), b"file")?;
+        fs::create_dir(physical.join("dir-target"))?;
+        if let Err(error) = symlink_file("file-target", physical.join("file-link")) {
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        symlink_dir("dir-target", physical.join("dir-link"))?;
+
+        for name in ["file-link", "dir-link"] {
+            let source = physical.join(name);
+            let plant = logical.join(name);
+            prepare_plant(&source, &plant)?;
+            prepare_plant(&source, &plant)?;
+            assert_eq!(fs::read_link(plant)?, fs::read_link(source)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn namespace_validation_rejects_junctions() -> buck2_error::Result<()> {
+        let project = tempfile::tempdir()?;
+        let target = project.path().join("target");
+        let namespace = project.path().join("cell_sources");
+        fs::create_dir(&target)?;
+        junction::create(&target, &namespace)?;
+
+        assert!(ensure_plain_directory(&namespace).is_err());
+        assert!(target.exists());
+        Ok(())
+    }
 }
 
 #[cfg(all(test, unix))]
