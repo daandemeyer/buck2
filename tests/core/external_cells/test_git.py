@@ -56,15 +56,6 @@ def _init_repo(cwd: Path) -> None:
     _set_revision(rev, cwd=cwd)
 
 
-def _enable_canonical_paths(cwd: Path) -> None:
-    config = cwd / ".buckconfig"
-    config.write_text(
-        config.read_text().replace(
-            "[buck2]\n", "[buck2]\n  cell_execution_paths = canonical_v1\n", 1
-        )
-    )
-
-
 def _replace_external_with_local_checkout(cwd: Path) -> None:
     shutil.copytree(cwd / "template", cwd / "local_libfoo")
     config = cwd / ".buckconfig"
@@ -158,11 +149,10 @@ async def test_noop_commit_change_causes_rebuild(buck: Buck) -> None:
     assert output1 != output2
 
 
-@buck_test()
+@buck_test(extra_buck_config={"buck2": {"cell_execution_paths": "canonical_v1"}})
 async def test_canonical_external_to_local_remote_action_cache_hit(buck: Buck) -> None:
     """The local checkout must query the Action cached by the Git external cell."""
     (buck.cwd / "template" / "src.txt").write_text(random_string())
-    _enable_canonical_paths(buck.cwd)
     _init_repo(cwd=buck.cwd)
 
     await buck.build("libfoo//:t", "--remote-only")
@@ -183,21 +173,16 @@ async def test_canonical_external_to_local_remote_action_cache_hit(buck: Buck) -
     assert execution_kinds[-1] == 3  # ACTION_EXECUTION_KIND_ACTION_CACHE
 
 
-@buck_test()
+@buck_test(extra_buck_config={"buck2": {"cell_execution_paths": "canonical_v1"}})
 async def test_canonical_run_source_survives_external_to_local_switch(
     buck: Buck,
 ) -> None:
     contents = random_string()
     (buck.cwd / "template" / "src.txt").write_text(contents)
-    _enable_canonical_paths(buck.cwd)
     _init_repo(cwd=buck.cwd)
 
     external = await buck.run("libfoo//:run_source")
     assert external.stdout == contents
-
-    # Changing a cell's topology requires a clean for now; a follow-up rebinds
-    # the canonical view live and removes this.
-    await buck.clean()
 
     _replace_external_with_local_checkout(buck.cwd)
     local = await buck.run("libfoo//:run_source")
