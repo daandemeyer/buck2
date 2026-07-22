@@ -791,7 +791,7 @@ impl DaemonState {
                 cell_source_path_mode: init_ctx.daemon_startup_config.cell_execution_paths,
                 cell_execution_view: cell_execution_view_for_mode(
                     init_ctx.daemon_startup_config.cell_execution_paths,
-                )?,
+                ),
             }))
         };
         let daemon_listener_span = tracing::Span::current();
@@ -992,20 +992,10 @@ impl DaemonState {
     }
 }
 
-fn cell_execution_view_for_mode(
-    mode: CellSourcePathMode,
-) -> buck2_error::Result<Option<Arc<dyn CellExecutionView>>> {
+fn cell_execution_view_for_mode(mode: CellSourcePathMode) -> Option<Arc<dyn CellExecutionView>> {
     match mode {
-        CellSourcePathMode::Physical => Ok(None),
-        CellSourcePathMode::CanonicalV1 => {
-            if cfg!(windows) {
-                return Err(buck2_error::buck2_error!(
-                    buck2_error::ErrorTag::Input,
-                    "cell_execution_paths = canonical_v1 is not yet supported on Windows"
-                ));
-            }
-            Ok(Some(Arc::new(CanonicalCellExecutionView::new())))
-        }
+        CellSourcePathMode::Physical => None,
+        CellSourcePathMode::CanonicalV1 => Some(Arc::new(CanonicalCellExecutionView::new())),
     }
 }
 
@@ -1091,20 +1081,8 @@ mod tests {
 
     #[test]
     fn canonical_mode_installs_cell_execution_view() {
-        assert!(
-            cell_execution_view_for_mode(CellSourcePathMode::Physical)
-                .unwrap()
-                .is_none()
-        );
-        if cfg!(windows) {
-            assert!(cell_execution_view_for_mode(CellSourcePathMode::CanonicalV1).is_err());
-        } else {
-            assert!(
-                cell_execution_view_for_mode(CellSourcePathMode::CanonicalV1)
-                    .unwrap()
-                    .is_some()
-            );
-        }
+        assert!(cell_execution_view_for_mode(CellSourcePathMode::Physical).is_none());
+        assert!(cell_execution_view_for_mode(CellSourcePathMode::CanonicalV1).is_some());
     }
 
     #[tokio::test]

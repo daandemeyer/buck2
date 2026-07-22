@@ -562,3 +562,36 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn clean_does_not_follow_canonical_cell_view_junction() -> buck2_error::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let buck_out = temp.path().join("buck-out");
+        let generated = buck_out.join("v2/gen/output");
+        let canonical_cell = buck_out.join("v2/cell_sources/v1/c_73616d706c65");
+        let canonical_entry = canonical_cell.join("src");
+        let physical_cell = temp.path().join("physical-sample");
+        let physical_source = physical_cell.join("src/source.cpp");
+
+        fs::create_dir_all(generated.parent().unwrap())?;
+        fs::write(&generated, b"generated")?;
+        fs::create_dir_all(&canonical_cell)?;
+        fs::create_dir_all(physical_source.parent().unwrap())?;
+        fs::write(&physical_source, b"source")?;
+        junction::create(physical_cell.join("src"), &canonical_entry)?;
+
+        clean_buck_out(&AbsNormPathBuf::new(buck_out.clone())?, ConsoleType::None)?;
+
+        assert!(physical_source.exists());
+        assert!(!generated.exists());
+        assert!(!canonical_entry.exists());
+        assert!(!canonical_cell.exists());
+        Ok(())
+    }
+}
