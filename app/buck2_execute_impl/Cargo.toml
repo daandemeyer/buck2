@@ -65,5 +65,9 @@ buck2_forkserver_proto.workspace = true
 buck2_forkserver.workspace = true
 buck2_forkserver_proto.workspace = true
 
+[target.'cfg(target_os = "windows")'.dependencies]
+junction.workspace = true
+windows-sys.workspace = true
+
 [lints]
 workspace = true
