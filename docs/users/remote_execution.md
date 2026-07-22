@@ -76,9 +76,6 @@ as `cl.exe` without a long-path manifest, fail on paths past 260 characters even
 when long paths are enabled system-wide. Buck2 logs a warning if even the view's
 own directory paths cross that limit, but deep source paths inside a cell can
 exceed it without a warning; keep checkouts shallow on Windows.
-Changing a cell's topology (moving its root or switching its external origin)
-currently requires `buck2 clean`; live rebinding of the canonical view lands in
-a follow-up.
 `--no-buckd` is supported; the client holds the normal daemon lifecycle lock from
 before it replaces any existing daemon until its own process exits.
 
