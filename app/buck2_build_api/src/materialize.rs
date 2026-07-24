@@ -115,9 +115,7 @@ pub async fn prepare_materialized_artifact_group_values_for_local_consumption(
     }
 
     prepare_materialized_cell_execution_view(
-        ctx.per_transaction_data()
-            .get_cell_execution_view()
-            .as_deref(),
+        &*ctx.per_transaction_data().get_cell_execution_view(),
         &artifact_fs,
         canonical_sources.view_requirements,
         None,

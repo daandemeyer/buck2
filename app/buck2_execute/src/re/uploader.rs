@@ -62,6 +62,7 @@ use crate::directory::ActionFingerprintedDirectoryRef;
 use crate::directory::ActionImmutableDirectory;
 use crate::directory::ReDirectorySerializer;
 use crate::execute::blobs::ActionBlobs;
+use crate::execute::cell_execution_view::physical_source_root;
 use crate::materialize::materializer::ArtifactNotMaterializedReason;
 use crate::materialize::materializer::CasDownloadInfo;
 use crate::materialize::materializer::MaterializationPurpose;
@@ -87,15 +88,8 @@ fn source_upload_path(
     let Some(cell_path) = artifact_fs.decode_source_execution_leaf_path(&execution_path)? else {
         return Ok(execution_path);
     };
-    let physical_root = match physical_roots.get(&cell_path.cell()) {
-        Some(root) => root.clone(),
-        None => {
-            let root = artifact_fs.resolve_cell_source_root_for_consumption(cell_path.cell())?;
-            physical_roots.insert(cell_path.cell(), root.clone());
-            root
-        }
-    };
-    let physical_path = physical_root.join(cell_path.path());
+    let physical_path =
+        physical_source_root(artifact_fs, cell_path.cell(), physical_roots)?.join(cell_path.path());
     tracing::debug!(
         source_identity = %cell_path,
         execution_path = %execution_path,
@@ -806,14 +800,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use buck2_common::file_ops::metadata::FileMetadata;
     use buck2_core::cells::cell_path::CellPath;
     use buck2_core::cells::name::CellName;
     use buck2_core::cells::paths::CellRelativePathBuf;
     use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
 
     use super::*;
-    use crate::directory::ActionDirectoryBuilder;
 
     fn canonical_external_fs() -> buck2_error::Result<ArtifactFs> {
         Ok(ArtifactFs::testing_new_with_mode_and_external(
@@ -824,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn uploader_reads_physical_bytes_without_renaming_merkle_leaf() -> buck2_error::Result<()> {
+    fn canonical_source_leaf_uploads_from_its_physical_root() -> buck2_error::Result<()> {
         let artifact_fs = canonical_external_fs()?;
         let logical_leaf = artifact_fs.resolve_cell_path_for_execution(
             CellPath::new(
@@ -841,26 +833,11 @@ mod tests {
                 ),
             );
 
-        let mut builder = ActionDirectoryBuilder::empty();
-        builder.insert(
-            &logical_leaf,
-            DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
-                digest: DigestConfig::testing_default().empty_file().digest,
-                is_executable: false,
-            })),
-        )?;
-        let directory =
-            builder.fingerprint(DigestConfig::testing_default().as_directory_serializer());
-        let merkle_names = directory
-            .unordered_walk_leaves()
-            .paths()
-            .map(|path| path.to_string())
-            .collect::<Vec<_>>();
-
-        assert_eq!(merkle_names, vec![logical_leaf.as_str()]);
+        assert_ne!(logical_leaf, physical_leaf);
         assert_eq!(
             source_upload_path(&artifact_fs, logical_leaf, &mut StdBuckHashMap::default())?,
-            physical_leaf
+            physical_leaf,
+            "a canonical source leaf must be read from its revalidated physical root"
         );
         Ok(())
     }

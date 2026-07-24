@@ -146,7 +146,7 @@ struct CommandExecutorData {
     options: CommandGenerationOptions,
     re_platform: RE::Platform,
     cache_uploader: Arc<dyn UploadCache>,
-    cell_execution_view: Option<Arc<dyn CellExecutionView>>,
+    cell_execution_view: Arc<dyn CellExecutionView>,
 }
 
 impl CommandExecutor {
@@ -158,28 +158,7 @@ impl CommandExecutor {
         artifact_fs: ArtifactFs,
         options: CommandGenerationOptions,
         re_platform: RE::Platform,
-    ) -> Self {
-        Self::new_with_cell_execution_view(
-            inner,
-            action_cache_checker,
-            remote_dep_file_cache_checker,
-            cache_uploader,
-            artifact_fs,
-            options,
-            re_platform,
-            None,
-        )
-    }
-
-    pub fn new_with_cell_execution_view(
-        inner: Arc<dyn PreparedCommandExecutor>,
-        action_cache_checker: Arc<dyn PreparedCommandOptionalExecutor>,
-        remote_dep_file_cache_checker: Arc<dyn PreparedCommandOptionalExecutor>,
-        cache_uploader: Arc<dyn UploadCache>,
-        artifact_fs: ArtifactFs,
-        options: CommandGenerationOptions,
-        re_platform: RE::Platform,
-        cell_execution_view: Option<Arc<dyn CellExecutionView>>,
+        cell_execution_view: Arc<dyn CellExecutionView>,
     ) -> Self {
         Self(Arc::new(CommandExecutorData {
             inner,
@@ -214,7 +193,7 @@ impl CommandExecutor {
     ) -> buck2_error::Result<()> {
         validate_canonical_working_directory(&self.0.artifact_fs, request)?;
         prepare_materialized_cell_execution_view(
-            self.0.cell_execution_view.as_deref(),
+            &*self.0.cell_execution_view,
             &self.0.artifact_fs,
             requirements,
             Some(request.working_directory()),
@@ -374,6 +353,8 @@ impl CommandExecutor {
 #[cfg(test)]
 mod tests {
 
+    use std::sync::Mutex;
+
     use buck2_core::cells::cell_path::CellPath;
     use buck2_core::cells::name::CellName;
     use buck2_core::cells::paths::CellRelativePathBuf;
@@ -382,88 +363,18 @@ mod tests {
     use buck2_hash::BuckIndexSet;
     use sorted_vector_map::SortedVectorMap;
 
-    use std::sync::Mutex;
-
     use super::*;
-    use crate::artifact::artifact_dyn::ArtifactDyn;
-    use crate::artifact::group::artifact_group_values_dyn::ArtifactGroupValuesDyn;
     use crate::artifact_value::ArtifactValue;
     use crate::execute::cache_uploader::NoOpCacheUploader;
     use crate::execute::cell_execution_view::collect_canonical_source_inputs;
     use crate::execute::prepared::NoOpCommandOptionalExecutor;
-    use crate::execute::request::CommandExecutionInput;
     use crate::execute::request::CommandExecutionOutput;
     use crate::execute::request::CommandExecutionPaths;
     use crate::execute::request::OutputCreationBehavior;
     use crate::execute::request::WorkerId;
     use crate::execute::request::WorkerSpec;
     use crate::execute::testing_dry_run::DryRunExecutor;
-
-    struct TestSourceArtifact(CellPath);
-
-    impl ArtifactDyn for TestSourceArtifact {
-        fn resolve_path(
-            &self,
-            fs: &ArtifactFs,
-            _content_hash: Option<&buck2_core::content_hash::ContentBasedPathHash>,
-        ) -> buck2_error::Result<ProjectRelativePathBuf> {
-            fs.resolve_cell_path(self.0.as_ref())
-        }
-
-        fn resolve_path_for_execution(
-            &self,
-            fs: &ArtifactFs,
-            _content_hash: Option<&buck2_core::content_hash::ContentBasedPathHash>,
-        ) -> buck2_error::Result<ProjectRelativePathBuf> {
-            fs.resolve_cell_path_for_execution(self.0.as_ref())
-        }
-
-        fn resolve_configuration_hash_path(
-            &self,
-            fs: &ArtifactFs,
-        ) -> buck2_error::Result<ProjectRelativePathBuf> {
-            self.resolve_path(fs, None)
-        }
-
-        fn requires_materialization(&self, _fs: &ArtifactFs) -> bool {
-            false
-        }
-
-        fn has_content_based_path(&self) -> bool {
-            false
-        }
-
-        fn is_projected(&self) -> bool {
-            false
-        }
-    }
-
-    struct TestArtifactGroupValues {
-        artifact: TestSourceArtifact,
-        value: ArtifactValue,
-    }
-
-    impl ArtifactGroupValuesDyn for TestArtifactGroupValues {
-        fn iter(&self) -> Box<dyn Iterator<Item = (&dyn ArtifactDyn, &ArtifactValue)> + '_> {
-            Box::new(std::iter::once((
-                &self.artifact as &dyn ArtifactDyn,
-                &self.value,
-            )))
-        }
-
-        fn add_to_directory(
-            &self,
-            builder: &mut crate::directory::LazyActionDirectoryBuilder,
-            artifact_fs: &ArtifactFs,
-        ) -> buck2_error::Result<()> {
-            crate::directory::insert_artifact_lazy(
-                builder,
-                self.artifact
-                    .resolve_path_for_execution(artifact_fs, None)?,
-                &self.value,
-            )
-        }
-    }
+    use crate::execute::testing_source_input::testing_source_input;
 
     fn canonical_artifact_fs() -> buck2_error::Result<ArtifactFs> {
         Ok(ArtifactFs::testing_new_with_mode_and_external(
@@ -540,34 +451,27 @@ mod tests {
             )
             .is_err()
         );
-        // A generated-namespace cwd is accepted only when the request proves the
-        // directory exists by declaring an output at or beneath it.
-        let test_output = CommandExecutionOutput::TestPath {
-            path: BuckOutTestPath::new(
-                ForwardRelativePathBuf::unchecked_new("buck-out/v2/test/base".to_owned()),
-                ForwardRelativePathBuf::unchecked_new("out.txt".to_owned()),
-            ),
-            create: OutputCreationBehavior::Parent,
+        // `create: Parent` creates only `.../base`, so that path justifies itself as a cwd while
+        // `.../base/out.txt` does not.
+        let outputs = || {
+            let mut outputs = BuckIndexSet::default();
+            outputs.insert(CommandExecutionOutput::TestPath {
+                path: BuckOutTestPath::new(
+                    ForwardRelativePathBuf::unchecked_new("buck-out/v2/test/base".to_owned()),
+                    ForwardRelativePathBuf::unchecked_new("out.txt".to_owned()),
+                ),
+                create: OutputCreationBehavior::Parent,
+            });
+            outputs
         };
-        let mut outputs = BuckIndexSet::default();
-        outputs.insert(test_output);
         validate_canonical_working_directory(
             &fs,
             &request_with_outputs(
                 ProjectRelativePathBuf::unchecked_new("buck-out/v2/test/base".to_owned()),
                 ExecutorPreference::Default,
-                outputs,
+                outputs(),
             )?,
         )?;
-        let parent_only_output = CommandExecutionOutput::TestPath {
-            path: BuckOutTestPath::new(
-                ForwardRelativePathBuf::unchecked_new("buck-out/v2/test/base".to_owned()),
-                ForwardRelativePathBuf::unchecked_new("out.txt".to_owned()),
-            ),
-            create: OutputCreationBehavior::Parent,
-        };
-        let mut outputs = BuckIndexSet::default();
-        outputs.insert(parent_only_output);
         assert!(
             validate_canonical_working_directory(
                 &fs,
@@ -576,7 +480,7 @@ mod tests {
                         "buck-out/v2/test/base/out.txt".to_owned()
                     ),
                     ExecutorPreference::Default,
-                    outputs,
+                    outputs(),
                 )?,
             )
             .is_err(),
@@ -632,12 +536,10 @@ mod tests {
             CellRelativePathBuf::unchecked_new("worker/tool".to_owned()),
         );
         let worker_paths = CommandExecutionPaths::new(
-            vec![CommandExecutionInput::Artifact(Box::new(
-                TestArtifactGroupValues {
-                    artifact: TestSourceArtifact(worker_source),
-                    value: ArtifactValue::file(digest_config.empty_file()),
-                },
-            ))],
+            vec![testing_source_input(
+                worker_source,
+                ArtifactValue::file(digest_config.empty_file()),
+            )],
             Default::default(),
             &artifact_fs,
             digest_config,
@@ -667,7 +569,7 @@ mod tests {
         }));
 
         let view = Arc::new(RecordingView::default());
-        let executor = CommandExecutor::new_with_cell_execution_view(
+        let executor = CommandExecutor::new(
             Arc::new(DryRunExecutor::new(
                 Arc::new(Mutex::new(Vec::new())),
                 artifact_fs.clone(),
@@ -684,7 +586,7 @@ mod tests {
                 network_access: None,
             },
             RE::Platform::default(),
-            Some(view.clone()),
+            view.clone(),
         );
 
         executor.prepare_action(&request, digest_config, false)?;
