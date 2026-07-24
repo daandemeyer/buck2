@@ -164,9 +164,8 @@ pub async fn download_action_results<'a>(
                             .await
                         {
                             Ok(materialized_paths) => {
-                                // The materialized canonical source paths are only readable for
-                                // local repro through the execution view; prepare it when the
-                                // daemon has one. Best effort: this is a debug aid.
+                                // Best effort: this is a debug aid, but the materialized canonical
+                                // sources are only readable through the view.
                                 if let Some(view) = cell_execution_view
                                     && let Err(e) = view
                                         .prepare(artifact_fs, &materialized_paths.view_requirements)

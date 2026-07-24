@@ -29,6 +29,7 @@ pub mod request;
 pub mod result;
 pub mod target;
 pub mod testing_dry_run;
+pub mod testing_source_input;
 
 use std::future::Future;
 

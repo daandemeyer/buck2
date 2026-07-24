@@ -300,7 +300,7 @@ impl HasActionExecutor for DiceComputations<'_> {
         let invalidation_tracking_enabled = self.get_invalidation_tracking_config().enabled;
 
         Ok(Arc::new(BuckActionExecutor::new(
-            CommandExecutor::new_with_cell_execution_view(
+            CommandExecutor::new(
                 executor,
                 action_cache_checker,
                 remote_dep_file_cache_checker,
@@ -869,6 +869,7 @@ mod tests {
     use buck2_execute::digest_config::DigestConfig;
     use buck2_execute::execute::blocking::testing::DummyBlockingExecutor;
     use buck2_execute::execute::cache_uploader::NoOpCacheUploader;
+    use buck2_execute::execute::cell_execution_view::NoopCellExecutionView;
     use buck2_execute::execute::clean_output_paths::cleanup_path;
     use buck2_execute::execute::command_executor::ActionExecutionTimingData;
     use buck2_execute::execute::command_executor::CommandExecutor;
@@ -938,6 +939,7 @@ mod tests {
                     network_access: None,
                 },
                 Default::default(),
+                Arc::new(NoopCellExecutionView),
             ),
             Arc::new(DummyBlockingExecutor {
                 fs: project_fs.dupe(),

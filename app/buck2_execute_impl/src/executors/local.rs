@@ -152,7 +152,7 @@ pub struct LocalExecutor {
     worker_pool: Option<Arc<WorkerPool>>,
     memory_tracker: Option<MemoryTrackerHandle>,
     daemon_id: DaemonId,
-    cell_execution_view: Option<Arc<dyn CellExecutionView>>,
+    cell_execution_view: Arc<dyn CellExecutionView>,
 }
 
 impl LocalExecutor {
@@ -168,7 +168,7 @@ impl LocalExecutor {
         worker_pool: Option<Arc<WorkerPool>>,
         memory_tracker: Option<MemoryTrackerHandle>,
         daemon_id: DaemonId,
-        cell_execution_view: Option<Arc<dyn CellExecutionView>>,
+        cell_execution_view: Arc<dyn CellExecutionView>,
     ) -> Self {
         Self {
             artifact_fs,
@@ -597,7 +597,7 @@ impl LocalExecutor {
                 r2?;
 
                 prepare_materialized_cell_execution_view(
-                    self.cell_execution_view.as_deref(),
+                    &*self.cell_execution_view,
                     &self.artifact_fs,
                     materialized_inputs.view_requirements,
                     Some(request.working_directory()),
@@ -1819,99 +1819,20 @@ mod tests {
     use std::str;
 
     use assert_matches::assert_matches;
-    use buck2_build_signals::env::WaitingData;
     use buck2_common::liveliness_observer::NoopLivelinessObserver;
     use buck2_core::cells::CellResolver;
-    use buck2_core::cells::cell_path::CellPath;
     use buck2_core::cells::cell_root_path::CellRootPathBuf;
     use buck2_core::cells::name::CellName;
-    use buck2_core::cells::paths::CellRelativePathBuf;
     use buck2_core::fs::buck_out_path::BuckOutPathResolver;
     use buck2_core::fs::project::ProjectRoot;
     use buck2_core::fs::project::ProjectRootTemp;
-    use buck2_events::dispatch::with_dispatcher_async;
-    use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
-    use buck2_execute::artifact::group::artifact_group_values_dyn::ArtifactGroupValuesDyn;
     use buck2_execute::execute::blocking::testing::DummyBlockingExecutor;
-    use buck2_execute::execute::claim::MutexClaimManager;
-    use buck2_execute::execute::manager::CommandExecutionManager;
-    use buck2_execute::execute::request::CommandExecutionInput;
-    use buck2_execute::execute::request::CommandExecutionPaths;
-    use buck2_execute::execute::request::CommandExecutionRequest;
-    use buck2_execute::execute::result::CommandExecutionStatus;
     use buck2_hash::StdBuckHashMap;
-    use dice_futures::cancellation::CancellationContext;
     use host_sharing::HostSharingStrategy;
 
     use super::*;
     use crate::executors::cell_execution_view::CanonicalCellExecutionView;
     use crate::materializers::deferred::NoDiskDeferredMaterializer;
-
-    struct TestSourceArtifact(CellPath);
-
-    impl ArtifactDyn for TestSourceArtifact {
-        fn resolve_path(
-            &self,
-            fs: &ArtifactFs,
-            _content_hash: Option<&ContentBasedPathHash>,
-        ) -> buck2_error::Result<ProjectRelativePathBuf> {
-            fs.resolve_cell_path(self.0.as_ref())
-        }
-
-        fn resolve_path_for_execution(
-            &self,
-            fs: &ArtifactFs,
-            _content_hash: Option<&ContentBasedPathHash>,
-        ) -> buck2_error::Result<ProjectRelativePathBuf> {
-            fs.resolve_cell_path_for_execution(self.0.as_ref())
-        }
-
-        fn resolve_configuration_hash_path(
-            &self,
-            fs: &ArtifactFs,
-        ) -> buck2_error::Result<ProjectRelativePathBuf> {
-            self.resolve_path(fs, None)
-        }
-
-        fn requires_materialization(&self, _fs: &ArtifactFs) -> bool {
-            false
-        }
-
-        fn has_content_based_path(&self) -> bool {
-            false
-        }
-
-        fn is_projected(&self) -> bool {
-            false
-        }
-    }
-
-    struct TestArtifactGroupValues {
-        artifact: TestSourceArtifact,
-        value: ArtifactValue,
-    }
-
-    impl ArtifactGroupValuesDyn for TestArtifactGroupValues {
-        fn iter(&self) -> Box<dyn Iterator<Item = (&dyn ArtifactDyn, &ArtifactValue)> + '_> {
-            Box::new(std::iter::once((
-                &self.artifact as &dyn ArtifactDyn,
-                &self.value,
-            )))
-        }
-
-        fn add_to_directory(
-            &self,
-            builder: &mut buck2_execute::directory::LazyActionDirectoryBuilder,
-            artifact_fs: &ArtifactFs,
-        ) -> buck2_error::Result<()> {
-            buck2_execute::directory::insert_artifact_lazy(
-                builder,
-                self.artifact
-                    .resolve_path_for_execution(artifact_fs, None)?,
-                &self.value,
-            )
-        }
-    }
 
     fn artifact_fs(project_fs: ProjectRoot) -> ArtifactFs {
         ArtifactFs::new(
@@ -1948,7 +1869,7 @@ mod tests {
             None,
             None,
             DaemonId::new(),
-            None,
+            Arc::new(CanonicalCellExecutionView::new()),
         );
 
         Ok((executor, temp.path().root().to_buf(), temp))
@@ -1994,6 +1915,18 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn canonical_local_execution_observes_logical_source_path() -> buck2_error::Result<()> {
+        use buck2_build_signals::env::WaitingData;
+        use buck2_core::cells::cell_path::CellPath;
+        use buck2_core::cells::paths::CellRelativePathBuf;
+        use buck2_events::dispatch::with_dispatcher_async;
+        use buck2_execute::execute::claim::MutexClaimManager;
+        use buck2_execute::execute::manager::CommandExecutionManager;
+        use buck2_execute::execute::request::CommandExecutionPaths;
+        use buck2_execute::execute::request::CommandExecutionRequest;
+        use buck2_execute::execute::result::CommandExecutionStatus;
+        use buck2_execute::execute::testing_source_input::testing_source_input;
+        use dice_futures::cancellation::CancellationContext;
+
         let temp = ProjectRootTemp::new()?;
         std::fs::create_dir_all(temp.path().root().as_path().join("cell_path"))?;
         std::fs::write(
@@ -2018,12 +1951,10 @@ mod tests {
         let logical_path = artifact_fs.resolve_cell_path_for_execution(source.as_ref())?;
         let digest_config = DigestConfig::testing_default();
         let paths = CommandExecutionPaths::new(
-            vec![CommandExecutionInput::Artifact(Box::new(
-                TestArtifactGroupValues {
-                    artifact: TestSourceArtifact(source),
-                    value: ArtifactValue::file(digest_config.empty_file()),
-                },
-            ))],
+            vec![testing_source_input(
+                source,
+                ArtifactValue::file(digest_config.empty_file()),
+            )],
             Default::default(),
             &artifact_fs,
             digest_config,
@@ -2055,7 +1986,7 @@ mod tests {
             None,
             None,
             DaemonId::new(),
-            Some(Arc::new(CanonicalCellExecutionView::new())),
+            Arc::new(CanonicalCellExecutionView::new()),
         );
         let manager = CommandExecutionManager::new(
             Box::new(MutexClaimManager::new()),

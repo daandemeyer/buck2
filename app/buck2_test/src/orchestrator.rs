@@ -1515,7 +1515,7 @@ impl BuckTestOrchestrator<'_> {
             }
         };
 
-        let executor = CommandExecutor::new_with_cell_execution_view(
+        let executor = CommandExecutor::new(
             executor,
             action_cache_checker,
             Arc::new(NoOpCommandOptionalExecutor {}),
@@ -1552,7 +1552,7 @@ impl BuckTestOrchestrator<'_> {
         } = dice
             .get_command_executor_from_dice(&executor_config)
             .await?;
-        let executor = CommandExecutor::new_with_cell_execution_view(
+        let executor = CommandExecutor::new(
             executor,
             Arc::new(NoOpCommandOptionalExecutor {}),
             Arc::new(NoOpCommandOptionalExecutor {}),
