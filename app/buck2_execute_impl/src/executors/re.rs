@@ -94,7 +94,7 @@ pub struct ReExecutor {
     pub output_trees_download_config: OutputTreesDownloadConfig,
     pub priority: Option<i32>,
     /// Used only for failed-action input repro; ordinary remote execution touches no view.
-    pub cell_execution_view: Option<Arc<dyn CellExecutionView>>,
+    pub cell_execution_view: Arc<dyn CellExecutionView>,
 }
 
 impl ReExecutor {
@@ -489,7 +489,7 @@ impl PreparedCommandExecutor for ReExecutor {
             self.materialize_failed_outputs,
             additional_message,
             &self.output_trees_download_config,
-            self.cell_execution_view.as_deref(),
+            Some(&*self.cell_execution_view),
         )
         .boxed()
         .await;

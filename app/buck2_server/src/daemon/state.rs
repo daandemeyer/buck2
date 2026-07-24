@@ -231,7 +231,7 @@ pub struct DaemonStateData {
 
     /// Canonical source roots published during this daemon lifetime.
     #[allocative(skip)]
-    pub cell_execution_view: Option<Arc<dyn CellExecutionView>>,
+    pub cell_execution_view: Arc<dyn CellExecutionView>,
 }
 
 impl DaemonStateData {
@@ -789,9 +789,7 @@ impl DaemonState {
                         min_free_disk_gb: h.page_out_min_free_disk_gb,
                     }),
                 cell_source_path_mode: init_ctx.daemon_startup_config.cell_execution_paths,
-                cell_execution_view: cell_execution_view_for_mode(
-                    init_ctx.daemon_startup_config.cell_execution_paths,
-                ),
+                cell_execution_view: Arc::new(CanonicalCellExecutionView::new()),
             }))
         };
         let daemon_listener_span = tracing::Span::current();
@@ -992,13 +990,6 @@ impl DaemonState {
     }
 }
 
-fn cell_execution_view_for_mode(mode: CellSourcePathMode) -> Option<Arc<dyn CellExecutionView>> {
-    match mode {
-        CellSourcePathMode::Physical => None,
-        CellSourcePathMode::CanonicalV1 => Some(Arc::new(CanonicalCellExecutionView::new())),
-    }
-}
-
 fn convert_algorithm_kind(kind: DigestAlgorithmFamily) -> buck2_error::Result<DigestAlgorithm> {
     buck2_error::Ok(match kind {
         DigestAlgorithmFamily::Sha1 => DigestAlgorithm::Sha1,
@@ -1078,12 +1069,6 @@ mod tests {
     use indoc::indoc;
 
     use super::*;
-
-    #[test]
-    fn canonical_mode_installs_cell_execution_view() {
-        assert!(cell_execution_view_for_mode(CellSourcePathMode::Physical).is_none());
-        assert!(cell_execution_view_for_mode(CellSourcePathMode::CanonicalV1).is_some());
-    }
 
     #[tokio::test]
     async fn test_from_startup_config_defaults_internal() -> buck2_error::Result<()> {
