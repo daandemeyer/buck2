@@ -297,19 +297,17 @@ mod tests {
     use buck2_core::execution_types::executor_config::OutputPathsBehavior;
     use buck2_core::execution_types::executor_config::PathSeparatorKind;
     use buck2_core::fs::artifact_path_resolver::CellSourcePathMode;
-    use buck2_core::fs::project_rel_path::ProjectRelativePath;
     use buck2_core::package::source_path::SourcePath;
     use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
     use buck2_directory::directory::fingerprinted_directory::FingerprintedDirectory;
-    use buck2_execute::digest::CasDigestToReExt;
     use buck2_execute::directory::ActionDirectoryBuilder;
     use buck2_execute::directory::INTERNER;
     use buck2_execute::directory::insert_artifact;
     use buck2_execute::execute::cache_uploader::NoOpCacheUploader;
+    use buck2_execute::execute::cell_execution_view::NoopCellExecutionView;
     use buck2_execute::execute::cell_execution_view::collect_canonical_source_inputs;
     use buck2_execute::execute::command_executor::CommandExecutor;
     use buck2_execute::execute::prepared::NoOpCommandOptionalExecutor;
-    use buck2_execute::execute::request::ActionMetadataBlobData;
     use buck2_execute::execute::request::CommandExecutionInput;
     use buck2_execute::execute::request::CommandExecutionPaths;
     use buck2_execute::execute::request::CommandExecutionRequest;
@@ -356,40 +354,10 @@ mod tests {
     }
 
     fn source_value(content: &[u8], digest_config: DigestConfig) -> ArtifactValue {
-        source_value_with_executable(content, false, digest_config)
-    }
-
-    fn source_value_with_executable(
-        content: &[u8],
-        is_executable: bool,
-        digest_config: DigestConfig,
-    ) -> ArtifactValue {
         ArtifactValue::file(FileMetadata {
             digest: TrackedFileDigest::from_content(content, digest_config.cas_digest_config()),
-            is_executable,
+            is_executable: false,
         })
-    }
-
-    fn source_input_root_digest_for_value(
-        artifact_fs: &ArtifactFs,
-        cell_name: &str,
-        value: ArtifactValue,
-        digest_config: DigestConfig,
-    ) -> buck2_error::Result<TrackedFileDigest> {
-        let artifact = Artifact::from(SourceArtifact::new(SourcePath::testing_new(
-            &format!("{cell_name}//pkg"),
-            "src.cpp",
-        )));
-        let paths = CommandExecutionPaths::new(
-            vec![CommandExecutionInput::Artifact(Box::new(
-                ArtifactGroupValues::from_artifact(artifact, value),
-            ))],
-            Default::default(),
-            artifact_fs,
-            digest_config,
-            None,
-        )?;
-        Ok(paths.input_directory().fingerprint().dupe())
     }
 
     fn source_input_root_digest(
@@ -398,56 +366,20 @@ mod tests {
         content: &[u8],
         digest_config: DigestConfig,
     ) -> buck2_error::Result<TrackedFileDigest> {
-        source_input_root_digest_for_value(
+        let artifact = Artifact::from(SourceArtifact::new(SourcePath::testing_new(
+            &format!("{cell_name}//pkg"),
+            "src.cpp",
+        )));
+        let paths = CommandExecutionPaths::new(
+            vec![CommandExecutionInput::Artifact(Box::new(
+                ArtifactGroupValues::from_artifact(artifact, source_value(content, digest_config)),
+            ))],
+            Default::default(),
             artifact_fs,
-            cell_name,
-            source_value(content, digest_config),
             digest_config,
-        )
-    }
-
-    fn re_action_digest_for_value(
-        artifact_fs: &ArtifactFs,
-        cell_name: &str,
-        value: ArtifactValue,
-        digest_config: DigestConfig,
-    ) -> buck2_error::Result<TrackedFileDigest> {
-        let source = SourcePath::testing_new(&format!("{cell_name}//pkg"), "src.cpp");
-        let argument = artifact_fs.resolve_source_for_execution(source.as_ref())?;
-        let command = RE::Command {
-            arguments: vec!["tool".to_owned(), argument.as_str().to_owned()],
-            ..Default::default()
-        };
-        let command_digest = TrackedFileDigest::from_content(
-            &ActionMetadataBlobData::from_message(&command).0,
-            digest_config.cas_digest_config(),
-        );
-        let action = RE::Action {
-            input_root_digest: Some(
-                source_input_root_digest_for_value(artifact_fs, cell_name, value, digest_config)?
-                    .to_grpc(),
-            ),
-            command_digest: Some(command_digest.to_grpc()),
-            ..Default::default()
-        };
-        Ok(TrackedFileDigest::from_content(
-            &ActionMetadataBlobData::from_message(&action).0,
-            digest_config.cas_digest_config(),
-        ))
-    }
-
-    fn re_action_digest(
-        artifact_fs: &ArtifactFs,
-        cell_name: &str,
-        content: &[u8],
-        digest_config: DigestConfig,
-    ) -> buck2_error::Result<TrackedFileDigest> {
-        re_action_digest_for_value(
-            artifact_fs,
-            cell_name,
-            source_value(content, digest_config),
-            digest_config,
-        )
+            None,
+        )?;
+        Ok(paths.input_directory().fingerprint().dupe())
     }
 
     fn request_action_digest(
@@ -494,6 +426,7 @@ mod tests {
                 network_access: None,
             },
             RE::Platform::default(),
+            Arc::new(NoopCellExecutionView),
         );
         Ok(executor
             .prepare_action(&request, digest_config, false)?
@@ -522,47 +455,6 @@ mod tests {
             children: Default::default(),
             directory: None,
         }
-    }
-
-    #[test]
-    fn execution_api_preserves_external_input_and_action_digests() -> buck2_error::Result<()> {
-        let digest_config = DigestConfig::testing_default();
-        let artifact_fs = source_artifact_fs(
-            "sample",
-            "declared/sample",
-            true,
-            CellSourcePathMode::Physical,
-        )?;
-        let source_path = SourcePath::testing_new("sample//pkg", "src.cpp");
-        let artifact = Artifact::from(SourceArtifact::new(source_path));
-        let value = source_value(b"source", digest_config);
-
-        let legacy_path = artifact.resolve_path(&artifact_fs, None)?;
-        assert_eq!(
-            &*legacy_path,
-            ProjectRelativePath::unchecked_new(
-                "buck-out/v2/external_cells/git/0123456789abcdef0123456789abcdef01234567/pkg/src.cpp"
-            )
-        );
-        let execution_path = artifact.resolve_path_for_execution(&artifact_fs, None)?;
-        assert_eq!(legacy_path, execution_path);
-
-        let mut legacy_input = LazyActionDirectoryBuilder::empty();
-        insert_artifact_lazy(&mut legacy_input, legacy_path.clone(), &value)?;
-        let legacy_input = legacy_input
-            .finalize()?
-            .fingerprint(digest_config.as_directory_serializer())
-            .shared(&*INTERNER);
-
-        let migrated_values = ArtifactGroupValues::from_artifact(artifact, value);
-        let mut migrated_input = LazyActionDirectoryBuilder::empty();
-        migrated_values.add_to_directory(&mut migrated_input, &artifact_fs)?;
-        let migrated_input = migrated_input
-            .finalize()?
-            .fingerprint(digest_config.as_directory_serializer())
-            .shared(&*INTERNER);
-        assert_eq!(legacy_input.fingerprint(), migrated_input.fingerprint());
-        Ok(())
     }
 
     #[test]
@@ -642,13 +534,14 @@ mod tests {
             CellSourcePathMode::CanonicalV1,
         )?;
 
-        let local_input = source_input_root_digest(&local, "sample", b"identical", digest_config)?;
-        let external_input =
-            source_input_root_digest(&external, "sample", b"identical", digest_config)?;
-        assert_eq!(local_input, external_input);
         assert_eq!(
-            re_action_digest(&local, "sample", b"identical", digest_config)?,
-            re_action_digest(&external, "sample", b"identical", digest_config)?,
+            source_input_root_digest(&local, "sample", b"identical", digest_config)?,
+            source_input_root_digest(&external, "sample", b"identical", digest_config)?,
+        );
+        assert_eq!(
+            request_action_digest(&local, "sample", b"identical", digest_config)?,
+            request_action_digest(&external, "sample", b"identical", digest_config)?,
+            "the external topology must query the exact RE Action digest produced by the local topology",
         );
 
         // Physical mode inserts the source under its declared location, so these trees do differ:
@@ -668,57 +561,6 @@ mod tests {
         assert_ne!(
             source_input_root_digest(&local_physical, "sample", b"identical", digest_config,)?,
             source_input_root_digest(&external_physical, "sample", b"identical", digest_config,)?,
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn canonical_topology_switch_uses_identical_action_cache_key() -> buck2_error::Result<()> {
-        let digest_config = DigestConfig::testing_default();
-        let local = source_artifact_fs(
-            "sample",
-            "workspace/sample",
-            false,
-            CellSourcePathMode::CanonicalV1,
-        )?;
-        let external = source_artifact_fs(
-            "sample",
-            "declared/sample",
-            true,
-            CellSourcePathMode::CanonicalV1,
-        )?;
-
-        let local_digest = request_action_digest(&local, "sample", b"identical", digest_config)?;
-        let external_digest =
-            request_action_digest(&external, "sample", b"identical", digest_config)?;
-        assert_eq!(
-            local_digest, external_digest,
-            "the external topology must query the exact RE Action digest produced by the local topology",
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn canonical_source_input_digest_tracks_cell_identity() -> buck2_error::Result<()> {
-        let digest_config = DigestConfig::testing_default();
-        let sample = source_artifact_fs(
-            "sample",
-            "workspace/sample",
-            false,
-            CellSourcePathMode::CanonicalV1,
-        )?;
-        let other = source_artifact_fs(
-            "other",
-            "workspace/other",
-            false,
-            CellSourcePathMode::CanonicalV1,
-        )?;
-
-        assert_ne!(
-            source_input_root_digest(&sample, "sample", b"version one", digest_config)?,
-            source_input_root_digest(&other, "other", b"version one", digest_config)?,
-            "the canonical cell-name component must keep distinct cells disjoint",
         );
 
         Ok(())

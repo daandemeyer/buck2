@@ -39,7 +39,7 @@ pub struct CommandExecutorResponse {
     pub remote_dep_file_cache_checker: Arc<dyn PreparedCommandOptionalExecutor>,
     pub cache_uploader: Arc<dyn UploadCache>,
     pub output_trees_download_config: OutputTreesDownloadConfig,
-    pub cell_execution_view: Option<Arc<dyn CellExecutionView>>,
+    pub cell_execution_view: Arc<dyn CellExecutionView>,
 }
 
 pub trait SetCommandExecutor {
@@ -47,27 +47,28 @@ pub trait SetCommandExecutor {
 }
 
 pub trait SetCellExecutionView {
-    fn set_cell_execution_view(&mut self, view: Option<Arc<dyn CellExecutionView>>);
+    fn set_cell_execution_view(&mut self, view: Arc<dyn CellExecutionView>);
 }
 
 pub trait GetCellExecutionView {
-    fn get_cell_execution_view(&self) -> Option<Arc<dyn CellExecutionView>>;
+    fn get_cell_execution_view(&self) -> Arc<dyn CellExecutionView>;
 }
 
-struct CellExecutionViewHolder(Option<Arc<dyn CellExecutionView>>);
+struct CellExecutionViewHolder(Arc<dyn CellExecutionView>);
 
 impl SetCellExecutionView for UserComputationData {
-    fn set_cell_execution_view(&mut self, view: Option<Arc<dyn CellExecutionView>>) {
+    fn set_cell_execution_view(&mut self, view: Arc<dyn CellExecutionView>) {
         self.data.set(CellExecutionViewHolder(view));
     }
 }
 
 impl GetCellExecutionView for UserComputationData {
-    fn get_cell_execution_view(&self) -> Option<Arc<dyn CellExecutionView>> {
+    fn get_cell_execution_view(&self) -> Arc<dyn CellExecutionView> {
         self.data
             .get::<CellExecutionViewHolder>()
-            .ok()
-            .and_then(|holder| holder.0.dupe())
+            .expect("cell execution view is installed for every command")
+            .0
+            .dupe()
     }
 }
 

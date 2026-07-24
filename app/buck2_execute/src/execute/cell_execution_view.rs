@@ -22,6 +22,7 @@ use buck2_directory::directory::directory::Directory;
 use buck2_directory::directory::directory_iterator::DirectoryIterator;
 use buck2_directory::directory::directory_ref::DirectoryRef;
 use buck2_directory::directory::entry::DirectoryEntry;
+use buck2_hash::StdBuckHashMap;
 
 use crate::directory::ActionImmutableDirectory;
 
@@ -34,6 +35,18 @@ pub trait CellExecutionView: Send + Sync + 'static {
         artifact_fs: &ArtifactFs,
         requirements: &CellExecutionViewRequirements,
     ) -> buck2_error::Result<()>;
+}
+
+pub struct NoopCellExecutionView;
+
+impl CellExecutionView for NoopCellExecutionView {
+    fn prepare(
+        &self,
+        _artifact_fs: &ArtifactFs,
+        _requirements: &CellExecutionViewRequirements,
+    ) -> buck2_error::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -107,12 +120,27 @@ pub struct CanonicalSourceInputs {
     pub physical_paths: Vec<ProjectRelativePathBuf>,
 }
 
+/// Validation is repeated at each byte-consumption boundary, so `cache` must be scoped to a single
+/// upload or handoff rather than to the daemon.
+pub fn physical_source_root<'a>(
+    artifact_fs: &ArtifactFs,
+    cell: CellName,
+    cache: &'a mut StdBuckHashMap<CellName, ProjectRelativePathBuf>,
+) -> buck2_error::Result<&'a ProjectRelativePathBuf> {
+    match cache.entry(cell) {
+        std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            Ok(entry.insert(artifact_fs.resolve_cell_source_root_for_consumption(cell)?))
+        }
+    }
+}
+
 pub fn collect_canonical_source_inputs(
     artifact_fs: &ArtifactFs,
     directory: &ActionImmutableDirectory,
 ) -> buck2_error::Result<CanonicalSourceInputs> {
     let mut view_requirements = CellExecutionViewRequirements::default();
-    let mut physical_roots = BTreeMap::new();
+    let mut physical_roots = StdBuckHashMap::default();
     let mut physical_paths = BTreeSet::new();
     for (path, entry) in directory.unordered_walk().with_paths() {
         let path = ProjectRelativePath::new(path.as_str())?;
@@ -135,17 +163,8 @@ pub fn collect_canonical_source_inputs(
                 view_requirements.add_empty_directory(cell_path.clone());
             }
             if !matches!(entry, DirectoryEntry::Dir(_)) {
-                let physical_root = match physical_roots.get(&cell_path.cell()) {
-                    Some(root) => root,
-                    None => {
-                        let root = artifact_fs
-                            .resolve_cell_source_root_for_consumption(cell_path.cell())?;
-                        physical_roots.insert(cell_path.cell(), root);
-                        physical_roots
-                            .get(&cell_path.cell())
-                            .expect("physical root was just inserted")
-                    }
-                };
+                let physical_root =
+                    physical_source_root(artifact_fs, cell_path.cell(), &mut physical_roots)?;
                 physical_paths.insert(physical_root.join(cell_path.path()));
             }
         }
@@ -157,26 +176,20 @@ pub fn collect_canonical_source_inputs(
     })
 }
 
+/// The daemon holds a view unconditionally; this is the single place that consults the mode.
 pub fn prepare_materialized_cell_execution_view(
-    view: Option<&dyn CellExecutionView>,
+    view: &dyn CellExecutionView,
     artifact_fs: &ArtifactFs,
     mut requirements: CellExecutionViewRequirements,
     working_directory: Option<&ProjectRelativePath>,
 ) -> buck2_error::Result<()> {
-    match artifact_fs.cell_source_path_mode() {
-        CellSourcePathMode::Physical => Ok(()),
-        CellSourcePathMode::CanonicalV1 => {
-            let view = view.ok_or_else(|| {
-                buck2_error::internal_error!(
-                    "Canonical cell execution paths require the daemon-owned cell execution view"
-                )
-            })?;
-            if let Some(working_directory) = working_directory
-                && let Some(cwd) = artifact_fs.decode_source_execution_path(working_directory)?
-            {
-                requirements.add_cell(cwd.cell());
-            }
-            view.prepare(artifact_fs, &requirements)
-        }
+    if artifact_fs.cell_source_path_mode() == CellSourcePathMode::Physical {
+        return Ok(());
     }
+    if let Some(working_directory) = working_directory
+        && let Some(cwd) = artifact_fs.decode_source_execution_path(working_directory)?
+    {
+        requirements.add_cell(cwd.cell());
+    }
+    view.prepare(artifact_fs, &requirements)
 }
