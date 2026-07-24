@@ -98,7 +98,7 @@ pub struct CommandExecutorFactory {
     deduplicate_get_digests_ttl_calls: bool,
     output_trees_download_config: OutputTreesDownloadConfig,
     daemon_id: DaemonId,
-    cell_execution_view: Option<Arc<dyn CellExecutionView>>,
+    cell_execution_view: Arc<dyn CellExecutionView>,
 }
 
 impl CommandExecutorFactory {
@@ -125,7 +125,7 @@ impl CommandExecutorFactory {
         deduplicate_get_digests_ttl_calls: bool,
         output_trees_download_config: OutputTreesDownloadConfig,
         daemon_id: DaemonId,
-        cell_execution_view: Option<Arc<dyn CellExecutionView>>,
+        cell_execution_view: Arc<dyn CellExecutionView>,
     ) -> Self {
         let cache_upload_permission_checker = Arc::new(ActionCacheUploadPermissionChecker::new());
 
