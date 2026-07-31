@@ -152,7 +152,7 @@ impl Drop for ProjectionTaskCompletionHandle {
             // Attempt to enforce that this handle was completed or cancelled. Cancellation paths
             // tend to be a bit poorly tested though, so do that in unit tests only.
             #[cfg(not(test))]
-            t.cancel(TransactionCancelled);
+            t.cancel(TransactionCancelled::Cancelled);
             #[cfg(test)]
             {
                 drop(t);
