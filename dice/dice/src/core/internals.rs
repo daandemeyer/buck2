@@ -458,7 +458,7 @@ mod tests {
         });
         finished_cancelling_tasks
             .as_ref()
-            .cancel(TransactionCancelled);
+            .cancel(TransactionCancelled::Cancelled);
 
         finished_cancelling_tasks.as_ref().await_termination().await;
 

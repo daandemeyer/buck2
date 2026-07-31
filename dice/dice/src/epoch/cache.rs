@@ -31,8 +31,15 @@ use crate::epoch::task::projections::ProjectionTaskCompletionHandle;
 use crate::key::DiceKey;
 use crate::value::DiceComputedValue;
 
+/// Why a task terminated without producing a value. Both arms are terminal: unlike a worker-level
+/// cancellation, neither is retried by starting a new generation.
 #[derive(Debug, Copy, Clone, Dupe)]
-pub(crate) struct TransactionCancelled;
+pub(crate) enum TransactionCancelled {
+    Cancelled,
+    /// The key's `compute` panicked. Recorded distinctly so it surfaces as a panic rather than as
+    /// a cancellation the user never asked for.
+    KeyPanicked,
+}
 
 /// A `Result`-like wrapper that also represents transaction cancellation.
 ///
@@ -51,8 +58,12 @@ impl<T> TransactionResult<T> {
         Self(Err(token))
     }
 
+    pub(crate) const fn make_panicked() -> Self {
+        Self(Err(TransactionCancelled::KeyPanicked))
+    }
+
     pub(crate) const fn make_cancelled() -> Self {
-        Self(Err(TransactionCancelled))
+        Self(Err(TransactionCancelled::Cancelled))
     }
 
     pub(crate) fn unpack(self) -> Result<T, TransactionCancelled> {
@@ -64,7 +75,10 @@ impl<T> TransactionResult<T> {
     }
 
     pub(crate) fn into_dice_result(self) -> DiceResult<T> {
-        self.0.map_err(|_| DiceError::transaction_cancelled())
+        self.0.map_err(|e| match e {
+            TransactionCancelled::Cancelled => DiceError::transaction_cancelled(),
+            TransactionCancelled::KeyPanicked => DiceError::key_panicked(),
+        })
     }
 }
 
@@ -152,7 +166,7 @@ impl SharedCache {
         key: DiceKey,
     ) -> SharedCacheInsert<DiceTaskRef<'_>, PreparedDiceTask<'_>> {
         if self.data.is_cancelled.load(Ordering::Relaxed) {
-            return SharedCacheInsert::cancelled(TransactionCancelled);
+            return SharedCacheInsert::cancelled(TransactionCancelled::Cancelled);
         }
 
         let maybe_prepared_task = DiceTask::prepare(key, |task| {
@@ -170,7 +184,7 @@ impl SharedCache {
         });
 
         if self.data.is_cancelled.load(Ordering::Relaxed) {
-            return SharedCacheInsert::cancelled(TransactionCancelled);
+            return SharedCacheInsert::cancelled(TransactionCancelled::Cancelled);
         }
 
         match maybe_prepared_task {
@@ -184,7 +198,7 @@ impl SharedCache {
         key: DiceKey,
     ) -> SharedCacheInsert<ArcBorrow<'_, ProjectionTask>, ProjectionTaskCompletionHandle> {
         if self.data.is_cancelled.load(Ordering::Relaxed) {
-            return SharedCacheInsert::cancelled(TransactionCancelled);
+            return SharedCacheInsert::cancelled(TransactionCancelled::Cancelled);
         }
 
         let maybe_prepared_task = ProjectionTask::prepare(key, |task| {
@@ -202,14 +216,14 @@ impl SharedCache {
         });
 
         if self.data.is_cancelled.load(Ordering::Relaxed) {
-            return SharedCacheInsert::cancelled(TransactionCancelled);
+            return SharedCacheInsert::cancelled(TransactionCancelled::Cancelled);
         }
 
         match maybe_prepared_task {
             Ok(handle) => {
                 if self.data.is_cancelled.load(Ordering::Relaxed) {
-                    handle.cancel(TransactionCancelled);
-                    return SharedCacheInsert::cancelled(TransactionCancelled);
+                    handle.cancel(TransactionCancelled::Cancelled);
+                    return SharedCacheInsert::cancelled(TransactionCancelled::Cancelled);
                 }
                 SharedCacheInsert::Inserted(handle)
             }
@@ -252,7 +266,7 @@ impl SharedCache {
             .iter()
             .filter_map(|entry| {
                 let task = DiceTaskRef { internal: entry };
-                if task.cancel(TransactionCancelled) {
+                if task.cancel(TransactionCancelled::Cancelled) {
                     Some(task.clone_arc())
                 } else {
                     None
@@ -369,7 +383,7 @@ mod tests {
         });
         finished_cancelling_tasks
             .as_ref()
-            .cancel(TransactionCancelled);
+            .cancel(TransactionCancelled::Cancelled);
         finished_cancelling_tasks.as_ref().await_termination().await;
 
         finished_cancelling_tasks
