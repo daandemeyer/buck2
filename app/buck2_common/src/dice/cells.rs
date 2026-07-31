@@ -10,12 +10,17 @@
 
 //! Core dice computations relating to cells
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use allocative::Allocative;
 use async_trait::async_trait;
 use buck2_core::cells::CellAliasResolver;
 use buck2_core::cells::CellResolver;
+use buck2_core::cells::execution_name::CellExecutionNames;
 use buck2_core::cells::name::CellName;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
+use buck2_error::BuckErrorContext;
 use derive_more::Display;
 use dice::CancellationContext;
 use dice::DiceComputations;
@@ -38,6 +43,8 @@ pub trait HasCellResolver {
     async fn get_cell_resolver(&mut self) -> buck2_error::Result<CellResolver>;
 
     async fn is_cell_resolver_key_set(&mut self) -> buck2_error::Result<bool>;
+
+    async fn get_cell_execution_names(&mut self) -> buck2_error::Result<Arc<CellExecutionNames>>;
 
     async fn get_cell_alias_resolver(
         &mut self,
@@ -95,6 +102,10 @@ impl HasCellResolver for DiceComputations<'_> {
         Ok(self.compute(&CellResolverKey).await?.is_some())
     }
 
+    async fn get_cell_execution_names(&mut self) -> buck2_error::Result<Arc<CellExecutionNames>> {
+        self.compute(&CellExecutionNamesKey).await?
+    }
+
     async fn get_cell_alias_resolver(
         &mut self,
         cell: CellName,
@@ -108,6 +119,61 @@ impl HasCellResolver for DiceComputations<'_> {
     ) -> buck2_error::Result<CellAliasResolver> {
         let cell = self.get_cell_resolver().await?.find(dir);
         self.get_cell_alias_resolver(cell).await
+    }
+}
+
+/// Execution names come from exactly one place: the root cell's `[cell_execution_names]`. Letting a
+/// cell declare its own would mean reading every cell's `.buckconfig` from under `get_artifact_fs`,
+/// which is on essentially every build path, and an external cell's is only readable once the cell
+/// is materialized, so every declared cell would be fetched on every command.
+#[derive(Clone, Dupe, Display, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("{:?}", self)]
+#[pagable_typetag(dice::DiceKeyDyn)]
+struct CellExecutionNamesKey;
+
+#[async_trait]
+impl Key for CellExecutionNamesKey {
+    type Value = buck2_error::Result<Arc<CellExecutionNames>>;
+
+    async fn compute(
+        &self,
+        ctx: &mut DiceComputations,
+        _cancellations: &CancellationContext,
+    ) -> Self::Value {
+        let resolver = ctx.get_cell_resolver().await?;
+        let root_config = ctx.get_legacy_config_for_cell(resolver.root_cell()).await?;
+        let root_aliases = resolver.root_cell_cell_alias_resolver();
+        let mut configured: BTreeMap<CellName, String> = BTreeMap::new();
+        for (alias, name) in
+            BuckConfigBasedCells::get_cell_execution_names_from_config(&root_config)?
+        {
+            let cell = root_aliases
+                .resolve(alias.as_str())
+                .with_buck_error_context(|| {
+                    format!("`[cell_execution_names]` names `{alias}`, which is not a known cell")
+                })?;
+            configured.insert(cell, name);
+        }
+
+        let names = resolver.cells().map(|(cell, _)| {
+            let name = configured
+                .get(&cell)
+                .cloned()
+                .unwrap_or_else(|| cell.as_str().to_owned());
+            (cell, name)
+        });
+        Ok(Arc::new(CellExecutionNames::new(names)?))
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        match (x, y) {
+            (Ok(x), Ok(y)) => x == y,
+            (_, _) => false,
+        }
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        OkPagableValueSerialize::<Self::Value>::new()
     }
 }
 

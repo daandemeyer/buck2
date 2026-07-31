@@ -17,7 +17,7 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use buck2_build_api::actions::artifact::get_artifact_fs::GetArtifactFs;
+use buck2_build_api::context::HasBuildContextData;
 use buck2_common::dice::data::HasIoProvider;
 use buck2_common::file_ops::delegate::FileOpsDelegate;
 use buck2_common::file_ops::metadata::FileDigestConfig;
@@ -421,13 +421,17 @@ pub(crate) async fn get_file_ops_delegate(
             ctx: &mut DiceComputations,
             cancellations: &CancellationContext,
         ) -> Self::Value {
-            let artifact_fs = ctx.get_artifact_fs().await?;
+            // Deliberately not `get_artifact_fs`: only the Buck-out resolver and project root are
+            // needed here, neither depends on cell execution names, and depending on them would
+            // put this delegate downstream of a computation that resolves cell configs.
+            let buck_out_resolver = ctx.get_buck_out_path().await?;
+            let project_root = ctx.global_data().get_io_provider().project_root().dupe();
             let ops = GitFileOpsDelegate {
-                buck_out_resolver: artifact_fs.buck_out_path_resolver().clone(),
+                buck_out_resolver,
                 cell: self.0,
                 setup: self.1.dupe(),
                 io: FsIoProvider::new(
-                    artifact_fs.fs().dupe(),
+                    project_root,
                     ctx.global_data().get_digest_config().cas_digest_config(),
                     false,
                 ),

@@ -43,7 +43,11 @@ const OWNER_MAGIC: &[u8] = b"buck2-cell-execution-view-v1\0";
 pub struct CanonicalCellExecutionView {
     /// Lets a fresh daemon tell first publication from republication, so it only clears a forest
     /// it has not yet handed to a consumer. The mutex also orders topology replacement.
-    prepared_cells: Mutex<BTreeSet<CellName>>,
+    ///
+    /// Keyed on execution name, not cell name, because that is what selects the `c_*` directory.
+    /// Keying it on the cell name would make a rename under a pinned execution name look like a
+    /// first use and clear a forest this daemon has already published to a live worker.
+    prepared_cells: Mutex<BTreeSet<String>>,
 }
 
 impl CanonicalCellExecutionView {
@@ -68,9 +72,9 @@ impl CellExecutionView for CanonicalCellExecutionView {
             cell.preflight()?;
         }
         for cell in &prepared {
-            let first_use_in_daemon = !prepared_cells.contains(&cell.cell);
+            let first_use_in_daemon = !prepared_cells.contains(&cell.execution_name);
             cell.prepare(first_use_in_daemon)?;
-            prepared_cells.insert(cell.cell);
+            prepared_cells.insert(cell.execution_name.clone());
         }
         Ok(())
     }
@@ -78,6 +82,7 @@ impl CellExecutionView for CanonicalCellExecutionView {
 
 struct PreparedCell {
     cell: CellName,
+    execution_name: String,
     physical: ProjectRelativePathBuf,
     logical: ProjectRelativePathBuf,
     entries: Vec<CellRelativePathBuf>,
@@ -110,6 +115,7 @@ impl PreparedCell {
             );
             cells.push(PreparedCell {
                 cell,
+                execution_name: artifact_fs.cell_execution_name(cell).to_owned(),
                 physical,
                 logical,
                 entries,
@@ -227,7 +233,12 @@ impl PreparedCell {
 
         let logical = self.logical_abs();
         let namespace = Namespace::from_logical_root(&logical)?;
-        namespace.ensure(self.cell, &self.physical, first_use_in_daemon)?;
+        namespace.ensure(
+            self.cell,
+            &self.execution_name,
+            &self.physical,
+            first_use_in_daemon,
+        )?;
         for entry in &self.entries {
             let physical_entry = self.physical_abs().join(entry.as_str());
             let logical_entry = logical.join(entry.as_str());
@@ -286,9 +297,14 @@ impl<'a> Namespace<'a> {
         })
     }
 
+    /// The record identifies the forest by execution name rather than cell name, because the
+    /// execution name is what selects this `c_*` directory. Keying it on the cell name instead
+    /// would make renaming a cell while pinning its execution name a clean-required mismatch, and
+    /// that rename is exactly what pinning exists to make free.
     fn ensure(
         &self,
         cell: CellName,
+        execution_name: &str,
         physical: &ProjectRelativePathBuf,
         first_use_in_daemon: bool,
     ) -> buck2_error::Result<()> {
@@ -310,8 +326,8 @@ impl<'a> Namespace<'a> {
             )
         })?;
         let owner = self.owners.join(name);
-        let expected = owner_contents(cell, physical);
-        let expected_prefix = owner_prefix(cell);
+        let expected = owner_contents(execution_name, physical);
+        let expected_prefix = owner_prefix(execution_name);
         match fs::symlink_metadata(&owner) {
             Ok(metadata) => {
                 if !is_plain_file(&metadata) {
@@ -325,8 +341,9 @@ impl<'a> Namespace<'a> {
                 {
                     return Err(buck2_error::buck2_error!(
                         buck2_error::ErrorTag::Environment,
-                        "Canonical cell owner record `{}` is not owned by cell `{}`; run `buck2 clean`",
+                        "Canonical cell owner record `{}` is not owned by execution name `{}` (cell `{}`); run `buck2 clean`",
                         owner.display(),
+                        execution_name,
                         cell
                     ));
                 }
@@ -393,16 +410,16 @@ impl<'a> Namespace<'a> {
     }
 }
 
-fn owner_prefix(cell: CellName) -> Vec<u8> {
-    let mut contents = Vec::with_capacity(OWNER_MAGIC.len() + cell.as_str().len() + 1);
+fn owner_prefix(execution_name: &str) -> Vec<u8> {
+    let mut contents = Vec::with_capacity(OWNER_MAGIC.len() + execution_name.len() + 1);
     contents.extend_from_slice(OWNER_MAGIC);
-    contents.extend_from_slice(cell.as_str().as_bytes());
+    contents.extend_from_slice(execution_name.as_bytes());
     contents.push(0);
     contents
 }
 
-fn owner_contents(cell: CellName, physical: &ProjectRelativePathBuf) -> Vec<u8> {
-    let mut contents = owner_prefix(cell);
+fn owner_contents(execution_name: &str, physical: &ProjectRelativePathBuf) -> Vec<u8> {
+    let mut contents = owner_prefix(execution_name);
     contents.extend_from_slice(physical.as_str().as_bytes());
     contents.push(0);
     contents
@@ -1007,15 +1024,36 @@ mod tests {
         artifact_fs_in(project, "declared/sample", &["sample"])
     }
 
+    fn renamed_artifact_fs(project: &TempDir, sample_root: &str) -> ArtifactFs {
+        ArtifactFs::testing_new_full(
+            CellSourcePathMode::CanonicalV1,
+            &[("root", ""), ("sample_v2", sample_root)],
+            &[],
+            &[],
+            Some(ProjectRoot::new_unchecked(
+                AbsNormPathBuf::new(project.path().to_owned()).expect("absolute temp directory"),
+            )),
+        )
+        .testing_with_execution_names(&[("sample_v2", "sample")])
+        .expect("execution names")
+    }
+
     fn requirements(entries: &[&str]) -> CellExecutionViewRequirements {
-        requirements_with_empty(entries, &[])
+        requirements_for(CellName::testing_new("sample"), entries, &[])
     }
 
     fn requirements_with_empty(
         entries: &[&str],
         empty_directories: &[&str],
     ) -> CellExecutionViewRequirements {
-        let cell = CellName::testing_new("sample");
+        requirements_for(CellName::testing_new("sample"), entries, empty_directories)
+    }
+
+    fn requirements_for(
+        cell: CellName,
+        entries: &[&str],
+        empty_directories: &[&str],
+    ) -> CellExecutionViewRequirements {
         let mut requirements = CellExecutionViewRequirements::default();
         requirements.add_cell(cell);
         for entry in entries {
@@ -1142,7 +1180,111 @@ mod tests {
                     .join("buck-out/v2/cell_sources/v1/.owners/c_73616d706c65")
             )?,
             owner_contents(
-                CellName::testing_new("sample"),
+                "sample",
+                &ProjectRelativePathBuf::unchecked_new("sample-b".to_owned())
+            )
+        );
+        Ok(())
+    }
+
+    /// Renaming a cell while pinning its execution name must not disturb the forest: same
+    /// directory, same owner record, no clearing, no `buck2 clean`.
+    #[test]
+    fn pinned_execution_name_survives_a_cell_rename() -> buck2_error::Result<()> {
+        let project = TempDir::new()?;
+        fs::create_dir_all(project.path().join("sample-a"))?;
+        fs::write(project.path().join("sample-a/LICENSE"), "a")?;
+
+        CanonicalCellExecutionView::new().prepare(
+            &artifact_fs(&project, "sample-a"),
+            &requirements(&["LICENSE"]),
+        )?;
+        let owner = project
+            .path()
+            .join("buck-out/v2/cell_sources/v1/.owners/c_73616d706c65");
+        let before = fs::read(&owner)?;
+        let plant_before = fs::symlink_metadata(project.path().join(LOGICAL).join("LICENSE"))?;
+
+        CanonicalCellExecutionView::new().prepare(
+            &renamed_artifact_fs(&project, "sample-a"),
+            &requirements_for(CellName::testing_new("sample_v2"), &["LICENSE"], &[]),
+        )?;
+
+        assert_eq!(
+            fs::read(&owner)?,
+            before,
+            "rename must not rewrite the owner record"
+        );
+        assert_eq!(
+            fs::read_to_string(project.path().join(LOGICAL).join("LICENSE"))?,
+            "a"
+        );
+        assert!(
+            plant_before.file_type().is_symlink()
+                && fs::symlink_metadata(project.path().join(LOGICAL).join("LICENSE"))?
+                    .file_type()
+                    .is_symlink()
+        );
+        Ok(())
+    }
+
+    /// A rename under a pinned execution name selects the same `c_*` directory, so it must not look
+    /// like a first use to the daemon that already published it: clearing there would pull the
+    /// forest out from under a live worker holding those paths.
+    #[test]
+    fn rename_does_not_reclear_a_published_forest() -> buck2_error::Result<()> {
+        let project = TempDir::new()?;
+        fs::create_dir_all(project.path().join("sample-a"))?;
+        fs::write(project.path().join("sample-a/LICENSE"), "a")?;
+        fs::write(project.path().join("sample-a/OTHER"), "o")?;
+
+        let view = CanonicalCellExecutionView::new();
+        view.prepare(
+            &artifact_fs(&project, "sample-a"),
+            &requirements(&["LICENSE", "OTHER"]),
+        )?;
+        view.prepare(
+            &renamed_artifact_fs(&project, "sample-a"),
+            &requirements_for(CellName::testing_new("sample_v2"), &["LICENSE"], &[]),
+        )?;
+
+        assert!(
+            project.path().join(LOGICAL).join("OTHER").exists(),
+            "rename must not clear plants the same daemon already published"
+        );
+        Ok(())
+    }
+
+    /// The physical root still rebinds under a pinned execution name; only the label is stable.
+    #[test]
+    fn pinned_execution_name_still_rebinds_on_a_moved_checkout() -> buck2_error::Result<()> {
+        let project = TempDir::new()?;
+        fs::create_dir_all(project.path().join("sample-a"))?;
+        fs::create_dir_all(project.path().join("sample-b"))?;
+        fs::write(project.path().join("sample-a/LICENSE"), "a")?;
+        fs::write(project.path().join("sample-b/LICENSE"), "b")?;
+
+        CanonicalCellExecutionView::new().prepare(
+            &artifact_fs(&project, "sample-a"),
+            &requirements(&["LICENSE"]),
+        )?;
+        CanonicalCellExecutionView::new().prepare(
+            &renamed_artifact_fs(&project, "sample-b"),
+            &requirements_for(CellName::testing_new("sample_v2"), &["LICENSE"], &[]),
+        )?;
+
+        assert_eq!(
+            fs::read_to_string(project.path().join(LOGICAL).join("LICENSE"))?,
+            "b"
+        );
+        assert_eq!(
+            fs::read(
+                project
+                    .path()
+                    .join("buck-out/v2/cell_sources/v1/.owners/c_73616d706c65")
+            )?,
+            owner_contents(
+                "sample",
                 &ProjectRelativePathBuf::unchecked_new("sample-b".to_owned())
             )
         );

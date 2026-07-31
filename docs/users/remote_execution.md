@@ -60,18 +60,63 @@ cell_execution_paths = canonical_v1
 
 The default, `physical`, preserves existing paths and action digests. In
 `canonical_v1`, every cell's sources, including the root cell, appear to actions
-below a versioned path derived from the canonical cell name, such as
+below a versioned path derived from the cell's execution name, such as
 `buck-out/v2/cell_sources/v1/c_73616d706c65/...`. Identical cell contents, commands,
 configuration, and execution platform can therefore share full remote action-cache
 entries when a cell moves between a standalone project, a nested workspace checkout,
-and external storage, provided its canonical name stays the same.
+and external storage, provided its execution name stays the same.
+
+### Execution names
+
+By default a cell's execution name is its cell name, which is the label the root
+`.buckconfig` mounts it under. Renaming a cell would therefore move every one of its
+sources and invalidate its share of the action cache, and two workspaces that vendor
+one repository under different names cannot share cache entries for it. The root cell
+can pin any cell's execution name to break that coupling:
+
+```ini
+[cells]
+sample_v2 = third-party/sample
+
+[cell_execution_names]
+sample_v2 = sample
+```
+
+This is also how to keep cache entries when moving a cell between a Git origin and a
+local checkout under a different name: pin both spellings to the same execution name.
+
+Execution names are set only here, in the root cell. Letting each cell declare its own
+would mean reading every cell's `.buckconfig` on every command, which for an external
+cell also means fetching it. Workspaces that vendor a repository under different names
+must therefore agree on the execution name by convention rather than by reading it out
+of the cell.
+
+`[cell_execution_names]` cannot be given on the command line. A `-c`/`--config` override
+applies to every cell's merged configuration; `[cells]` is banned for the same reason.
+
+Execution names must be unique across cells, and are rejected if empty, longer than 126
+UTF-8 bytes, or containing a path separator. A cell given an execution name no longer
+answers to its own name: only one spelling of a source reaches actions. The setting is
+inert in `physical` mode.
+
+Changing a cell's execution name leaves its previous execution forest and ownership
+record in Buck-out. They are inert, but they retain links into the checkout until the
+next `buck2 clean`, so a workspace that migrates execution names repeatedly accumulates
+one orphaned forest per migration.
+
+The literal on-disk spelling, `c_` followed by the hex-encoded execution name, is not
+a stable interface and may change with the layout version. Do not hard-code it in
+rules or tooling.
+
+Workspaces sharing an action cache must agree on execution names, as they must on
+every other part of the layout. Changing one is a cache migration for that cell.
 
 This option changes action semantics. For selected local and host consumers Buck2
 creates a sparse execution forest: each cell root is a real directory and its
 declared top-level entries are links to physical source storage. On Windows,
 directory entries use junctions and file entries require symlink capability.
 The canonical prefix also lengthens every source path by roughly 40 characters
-(more for long cell names); on Windows, tools that are not long-path aware, such
+(more for long execution names); on Windows, tools that are not long-path aware, such
 as `cl.exe` without a long-path manifest, fail on paths past 260 characters even
 when long paths are enabled system-wide. Buck2 logs a warning if even the view's
 own directory paths cross that limit, but deep source paths inside a cell can

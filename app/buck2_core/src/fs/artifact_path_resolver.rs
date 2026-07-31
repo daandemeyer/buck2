@@ -8,7 +8,9 @@
  * above-listed licenses.
  */
 
+use std::collections::BTreeMap;
 use std::io;
+use std::sync::Arc;
 
 use allocative::Allocative;
 use buck2_fs::paths::file_name::FileName;
@@ -21,6 +23,7 @@ use serde::Serialize;
 use crate::cells::CellResolver;
 use crate::cells::cell_path::CellPath;
 use crate::cells::cell_path::CellPathRef;
+use crate::cells::execution_name::CellExecutionNames;
 use crate::cells::name::CellName;
 use crate::cells::paths::CellRelativePath;
 use crate::content_hash::ContentBasedPathHash;
@@ -33,7 +36,7 @@ use crate::package::source_path::SourcePathRef;
 
 const CELL_SOURCES_V1_PREFIX: &str = "cell_sources/v1";
 const CELL_SOURCES_V1_COMPONENT_PREFIX: &str = "c_";
-const CELL_SOURCES_V1_MAX_CELL_NAME_BYTES: usize = 126;
+const CELL_SOURCES_V1_MAX_EXECUTION_NAME_BYTES: usize = 126;
 
 #[derive(
     Copy,
@@ -84,6 +87,7 @@ pub struct ArtifactFs {
     buck_out_path_resolver: BuckOutPathResolver,
     project_filesystem: ProjectRoot,
     cell_source_path_mode: CellSourcePathMode,
+    cell_execution_names: Arc<CellExecutionNames>,
 }
 
 impl ArtifactFs {
@@ -106,16 +110,39 @@ impl ArtifactFs {
         project_filesystem: ProjectRoot,
         cell_source_path_mode: CellSourcePathMode,
     ) -> Self {
+        Self::new_with_execution_names(
+            buck_path_resolver,
+            buck_out_path_resolver,
+            project_filesystem,
+            cell_source_path_mode,
+            Arc::new(CellExecutionNames::identity()),
+        )
+    }
+
+    pub fn new_with_execution_names(
+        buck_path_resolver: CellResolver,
+        buck_out_path_resolver: BuckOutPathResolver,
+        project_filesystem: ProjectRoot,
+        cell_source_path_mode: CellSourcePathMode,
+        cell_execution_names: Arc<CellExecutionNames>,
+    ) -> Self {
         Self {
             cell_resolver: buck_path_resolver,
             buck_out_path_resolver,
             project_filesystem,
             cell_source_path_mode,
+            cell_execution_names,
         }
     }
 
     pub fn cell_source_path_mode(&self) -> CellSourcePathMode {
         self.cell_source_path_mode
+    }
+
+    /// The name this cell contributes to its canonical execution path. Callers that render or
+    /// compare execution paths must go through this rather than [`CellName::as_str`].
+    pub fn cell_execution_name(&self, cell: CellName) -> &str {
+        self.cell_execution_names.execution_name(cell)
     }
 
     /// `cells` are `(name, project-relative root)` pairs; the first entry is the root alias cell.
@@ -130,6 +157,29 @@ impl ArtifactFs {
         external: &[&str],
     ) -> ArtifactFs {
         Self::testing_new_full(mode, cells, external, &[], None)
+    }
+
+    /// `execution_names` are `(cell, execution name)` pairs; cells left out keep their own name.
+    /// A pair naming a cell this `ArtifactFs` does not have is an error rather than a silent
+    /// no-op, so a typo cannot turn a test of this feature into a test of the identity mapping.
+    pub fn testing_with_execution_names(
+        self,
+        execution_names: &[(&str, &str)],
+    ) -> buck2_error::Result<ArtifactFs> {
+        let mut names: BTreeMap<CellName, String> = self
+            .cell_resolver
+            .cells()
+            .map(|(cell, _)| (cell, cell.as_str().to_owned()))
+            .collect();
+        for (cell, name) in execution_names {
+            let cell = CellName::unchecked_new(cell)?;
+            self.cell_resolver.get(cell)?;
+            names.insert(cell, (*name).to_owned());
+        }
+        Ok(ArtifactFs {
+            cell_execution_names: Arc::new(CellExecutionNames::new(names)?),
+            ..self
+        })
     }
 
     /// Cells named in `external` get a git origin, cells named in `bundled` a bundled origin.
@@ -249,16 +299,14 @@ impl ArtifactFs {
         match self.cell_source_path_mode {
             CellSourcePathMode::Physical => self.resolve_cell_path(path),
             CellSourcePathMode::CanonicalV1 => {
-                self.validate_canonical_cell_layout(path.cell())?;
+                let root = self.validate_canonical_cell_layout(path.cell())?;
                 if self.is_reserved_buck_out_source_path(path.path()) {
                     return Err(buck2_error::buck2_error!(
                         buck2_error::ErrorTag::Input,
                         "Source path `{path}` is beneath the reserved top-level `buck-out` subtree in `canonical_v1`",
                     ));
                 }
-                Ok(self
-                    .resolve_cell_source_root_for_execution(path.cell())?
-                    .join(path.path()))
+                Ok(root.join(path.path()))
             }
         }
     }
@@ -287,15 +335,30 @@ impl ArtifactFs {
         if self.cell_source_path_mode == CellSourcePathMode::Physical {
             return Ok(());
         }
+        // `CellExecutionNames` enforces uniqueness over the cells it was built from, but it is
+        // constructed separately from this resolver and need not cover the same set. A cell it
+        // omits falls back to its own name, which can collide with a name it did assign, so
+        // uniqueness of the actual roots is checked here rather than assumed.
+        let mut roots: BTreeMap<ProjectRelativePathBuf, CellName> = BTreeMap::new();
         for (cell, _) in self.cell_resolver.cells() {
-            self.validate_canonical_cell_layout(cell)?;
+            let root = self.validate_canonical_cell_layout(cell)?;
+            if let Some(previous) = roots.insert(root.clone(), cell) {
+                return Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "Cells `{previous}` and `{cell}` both resolve to canonical execution root `{root}`; execution names must be unique across cells",
+                ));
+            }
         }
         Ok(())
     }
 
-    fn validate_canonical_cell_layout(&self, cell: CellName) -> buck2_error::Result<()> {
+    /// Returns the cell's canonical execution root, which the checks already have to compute.
+    fn validate_canonical_cell_layout(
+        &self,
+        cell: CellName,
+    ) -> buck2_error::Result<ProjectRelativePathBuf> {
         self.validate_canonical_buck_out_root()?;
-        self.resolve_cell_source_root_for_execution(cell)?;
+        let root = self.resolve_cell_source_root_for_execution(cell)?;
         let instance = self.cell_resolver.get(cell)?;
         if instance.external().is_none() {
             let physical_root = instance.path().as_project_relative_path();
@@ -320,7 +383,7 @@ impl ArtifactFs {
                 ));
             }
         }
-        Ok(())
+        Ok(root)
     }
 
     pub fn is_reserved_buck_out_source_path(&self, path: &CellRelativePath) -> bool {
@@ -438,16 +501,16 @@ impl ArtifactFs {
         let name_bytes = hex::decode(encoded).map_err(|e| {
             buck2_error::buck2_error!(
                 buck2_error::ErrorTag::Input,
-                "Malformed canonical cell execution path `{path}`: invalid cell-name encoding: {e}"
+                "Malformed canonical cell execution path `{path}`: invalid execution-name encoding: {e}"
             )
         })?;
         let name = std::str::from_utf8(&name_bytes).map_err(|e| {
             buck2_error::buck2_error!(
                 buck2_error::ErrorTag::Input,
-                "Malformed canonical cell execution path `{path}`: cell name is not UTF-8: {e}"
+                "Malformed canonical cell execution path `{path}`: execution name is not UTF-8: {e}"
             )
         })?;
-        if name_bytes.len() > CELL_SOURCES_V1_MAX_CELL_NAME_BYTES
+        if name_bytes.len() > CELL_SOURCES_V1_MAX_EXECUTION_NAME_BYTES
             || format!(
                 "{CELL_SOURCES_V1_COMPONENT_PREFIX}{}",
                 hex::encode(&name_bytes)
@@ -455,10 +518,18 @@ impl ArtifactFs {
         {
             return Err(buck2_error::buck2_error!(
                 buck2_error::ErrorTag::Input,
-                "Malformed canonical cell execution path `{path}`: cell-name encoding is not canonical"
+                "Malformed canonical cell execution path `{path}`: execution-name encoding is not canonical"
             ));
         }
-        let cell = CellName::unchecked_new(name)?;
+        let cell = self
+            .cell_execution_names
+            .cell_for_execution_name(name)
+            .ok_or_else(|| {
+                buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "Canonical cell execution path `{path}` uses execution name `{name}`, which no configured cell uses"
+                )
+            })?;
         self.cell_resolver.get(cell).map_err(|e| {
             buck2_error::buck2_error!(
                 buck2_error::ErrorTag::Input,
@@ -506,11 +577,11 @@ impl ArtifactFs {
         &self,
         cell: CellName,
     ) -> buck2_error::Result<ProjectRelativePathBuf> {
-        let name = cell.as_str();
-        if name.len() > CELL_SOURCES_V1_MAX_CELL_NAME_BYTES {
+        let name = self.cell_execution_names.execution_name(cell);
+        if name.len() > CELL_SOURCES_V1_MAX_EXECUTION_NAME_BYTES {
             return Err(buck2_error::buck2_error!(
                 buck2_error::ErrorTag::Input,
-                "Canonical cell name `{name}` is {} UTF-8 bytes; `canonical_v1` supports at most {CELL_SOURCES_V1_MAX_CELL_NAME_BYTES} bytes so its execution path remains portable",
+                "Canonical execution name `{name}` for cell `{cell}` is {} UTF-8 bytes; `canonical_v1` supports at most {CELL_SOURCES_V1_MAX_EXECUTION_NAME_BYTES} bytes so its execution path remains portable",
                 name.len(),
             ));
         }
@@ -639,9 +710,12 @@ pub(crate) fn source_component_eq(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
 
+    use std::sync::Arc;
+
     use super::ArtifactFs;
     use super::CellSourcePathMode;
     use crate::cells::cell_path::CellPath;
+    use crate::cells::execution_name::CellExecutionNames;
     use crate::cells::name::CellName;
     use crate::cells::paths::CellRelativePathBuf;
     use crate::fs::buck_out_path::BuckOutPathResolver;
@@ -776,6 +850,137 @@ mod tests {
             "buck-out/v2/cell_sources/v1/c_73616d706c65/pkg/src.cpp",
         );
         assert_eq!(fs.decode_source_execution_path(path)?, None);
+        Ok(())
+    }
+
+    /// The feature's reason to exist: renaming the cell while pinning its execution name leaves
+    /// every source execution path, and therefore every Action digest, byte-identical.
+    #[test]
+    fn execution_name_survives_a_cell_rename() -> buck2_error::Result<()> {
+        let before = ArtifactFs::testing_new_with_mode(
+            CellSourcePathMode::CanonicalV1,
+            &[("root", ""), ("sample", "third-party/sample")],
+        );
+        let after = ArtifactFs::testing_new_with_mode(
+            CellSourcePathMode::CanonicalV1,
+            &[("root", ""), ("sample_v2", "third-party/sample")],
+        )
+        .testing_with_execution_names(&[("sample_v2", "sample")])?;
+
+        let before_path = before.resolve_source_for_execution(
+            SourcePath::testing_new("sample//pkg", "src.cpp").as_ref(),
+        )?;
+        let after_path = after.resolve_source_for_execution(
+            SourcePath::testing_new("sample_v2//pkg", "src.cpp").as_ref(),
+        )?;
+        assert_eq!(before_path, after_path);
+        assert_eq!(
+            &*after_path,
+            ProjectRelativePath::unchecked_new(
+                "buck-out/v2/cell_sources/v1/c_73616d706c65/pkg/src.cpp"
+            )
+        );
+
+        // The path still decodes, now to the renamed cell.
+        assert_eq!(
+            after.decode_source_execution_path(&after_path)?,
+            Some(SourcePath::testing_new("sample_v2//pkg", "src.cpp").to_cell_path())
+        );
+        Ok(())
+    }
+
+    /// Accepting the cell's own name after it was given a different execution name would give one
+    /// cell two execution paths, and so two Action digests for one source.
+    #[test]
+    fn canonical_decoder_rejects_a_retired_cell_name() -> buck2_error::Result<()> {
+        let fs = ArtifactFs::testing_new_with_mode(
+            CellSourcePathMode::CanonicalV1,
+            &[("root", ""), ("sample_v2", "third-party/sample")],
+        )
+        .testing_with_execution_names(&[("sample_v2", "sample")])?;
+        let retired = ProjectRelativePath::new(&format!(
+            "buck-out/v2/cell_sources/v1/c_{}/pkg/src.cpp",
+            hex::encode("sample_v2")
+        ))?
+        .to_buf();
+        assert!(
+            fs.decode_source_execution_path(&retired).is_err(),
+            "retired cell name must not decode"
+        );
+        Ok(())
+    }
+
+    /// An external cell and a local checkout of the same sources must reach the same execution
+    /// path when pinned to one name: that migration is the reason canonical paths exist.
+    #[test]
+    fn external_and_local_cells_share_a_pinned_execution_name() -> buck2_error::Result<()> {
+        let external = ArtifactFs::testing_new_with_mode_and_external(
+            CellSourcePathMode::CanonicalV1,
+            &[("root", ""), ("sample_v2", "declared/sample")],
+            &["sample_v2"],
+        )
+        .testing_with_execution_names(&[("sample_v2", "sample")])?;
+        let local = ArtifactFs::testing_new_with_mode(
+            CellSourcePathMode::CanonicalV1,
+            &[("root", ""), ("sample_v2", "third-party/sample")],
+        )
+        .testing_with_execution_names(&[("sample_v2", "sample")])?;
+        let source = SourcePath::testing_new("sample_v2//pkg", "src.cpp");
+        assert_eq!(
+            external.resolve_source_for_execution(source.as_ref())?,
+            local.resolve_source_for_execution(source.as_ref())?
+        );
+        assert_eq!(
+            &*external.resolve_source_for_execution(source.as_ref())?,
+            ProjectRelativePath::unchecked_new(
+                "buck-out/v2/cell_sources/v1/c_73616d706c65/pkg/src.cpp"
+            )
+        );
+        // The physical sides still differ; only the execution path is shared.
+        assert_ne!(
+            external.resolve_source(source.as_ref())?,
+            local.resolve_source(source.as_ref())?
+        );
+        Ok(())
+    }
+
+    /// Two cells sharing an execution name would collide in one forest directory.
+    #[test]
+    fn colliding_execution_names_are_rejected() {
+        assert!(
+            ArtifactFs::testing_new_with_mode(
+                CellSourcePathMode::CanonicalV1,
+                &[("root", ""), ("a", "cells/a"), ("b", "cells/b")],
+            )
+            .testing_with_execution_names(&[("a", "shared"), ("b", "shared")])
+            .is_err()
+        );
+    }
+
+    /// `CellExecutionNames` can only enforce uniqueness over the cells it was built from. Here `a`
+    /// is renamed onto `b`'s own name while `b` was never offered to it, so the collision is only
+    /// visible against the resolver: both cells would publish into one forest directory.
+    #[test]
+    fn execution_names_not_covering_every_cell_are_rejected() -> buck2_error::Result<()> {
+        let fs = ArtifactFs::testing_new_with_mode(
+            CellSourcePathMode::CanonicalV1,
+            &[("root", ""), ("a", "cells/a"), ("b", "cells/b")],
+        );
+        let partial = CellExecutionNames::new([(CellName::testing_new("a"), "b".to_owned())])?;
+        let fs = ArtifactFs::new_with_execution_names(
+            fs.cell_resolver().clone(),
+            fs.buck_out_path_resolver().clone(),
+            fs.fs().clone(),
+            CellSourcePathMode::CanonicalV1,
+            Arc::new(partial),
+        );
+
+        assert_eq!(fs.cell_execution_name(CellName::testing_new("a")), "b");
+        assert_eq!(fs.cell_execution_name(CellName::testing_new("b")), "b");
+        assert!(
+            fs.validate_canonical_layout().is_err(),
+            "two cells resolving to one execution root must be rejected"
+        );
         Ok(())
     }
 
