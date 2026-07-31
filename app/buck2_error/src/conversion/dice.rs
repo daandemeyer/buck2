@@ -31,6 +31,7 @@ impl From<dice_error::DiceError> for crate::Error {
                 ErrorTag::DiceUnexpectedCycleGuardType
             }
             DiceErrorImpl::DuplicateActivationData => ErrorTag::DiceDuplicateActivationData,
+            DiceErrorImpl::KeyPanicked => ErrorTag::DiceKeyPanicked,
         };
 
         crate::conversion::from_any_with_tag(value, error_tag)
