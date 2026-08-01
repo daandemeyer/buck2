@@ -606,6 +606,54 @@ impl HydrationConfig {
     }
 }
 
+/// Where `download_file` bytes are shared between projects. Raw values; the
+/// daemon resolves them into a store.
+#[derive(
+    Allocative,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq
+)]
+pub struct DownloadCacheStartupConfig {
+    pub enabled: bool,
+    pub dir: Option<String>,
+    pub gc_max_age_secs: Option<u64>,
+    pub skip_head_request: bool,
+}
+
+impl DownloadCacheStartupConfig {
+    fn new(config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
+        Ok(Self {
+            enabled: config
+                .parse(BuckconfigKeyRef {
+                    section: "buck2",
+                    property: "download_cache_enabled",
+                })?
+                .unwrap_or(false),
+            dir: config
+                .get(BuckconfigKeyRef {
+                    section: "buck2",
+                    property: "download_cache_dir",
+                })
+                .map(|dir| dir.to_owned()),
+            gc_max_age_secs: config.parse(BuckconfigKeyRef {
+                section: "buck2",
+                property: "download_cache_gc_max_age_secs",
+            })?,
+            skip_head_request: config
+                .parse(BuckconfigKeyRef {
+                    section: "buck2",
+                    property: "download_cache_skip_head_request",
+                })?
+                .unwrap_or(false),
+        })
+    }
+}
+
 /// Configurations that are used at startup by the daemon. Those are actually read by the client,
 /// and passed on to the daemon.
 ///
@@ -634,6 +682,9 @@ pub struct DaemonStartupConfig {
     pub daemon_idle_timeout_s: Option<u64>,
     /// Pagable DICE storage settings, or `None` when paging is disabled.
     pub hydration: Option<HydrationConfig>,
+    /// Fixed for the daemon lifetime: the store is built once, with the
+    /// materializer.
+    pub download_cache: DownloadCacheStartupConfig,
 }
 
 impl DaemonStartupConfig {
@@ -758,6 +809,7 @@ impl DaemonStartupConfig {
                 property: "daemon_idle_timeout_s",
             })?,
             hydration: HydrationConfig::from_config(config, settings)?,
+            download_cache: DownloadCacheStartupConfig::new(config)?,
         })
     }
 
@@ -806,6 +858,7 @@ impl DaemonStartupConfig {
             macos_qos_class: None,
             daemon_idle_timeout_s: None,
             hydration: None,
+            download_cache: DownloadCacheStartupConfig::default(),
         }
     }
 }
@@ -818,6 +871,72 @@ mod tests {
     use crate::legacy_configs::configs::testing::parse;
     use crate::settings::parser::resolve_setting_flags;
     use crate::settings::parser::table;
+
+    #[test]
+    fn test_download_cache_defaults() -> buck2_error::Result<()> {
+        let config = parse(&[("config", indoc!(r#""#))], "config")?;
+        let startup_config = DaemonStartupConfig::new(&config, &BuckSettings::empty(), false)?;
+        assert_eq!(
+            startup_config.download_cache,
+            DownloadCacheStartupConfig::default()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_download_cache_configured() -> buck2_error::Result<()> {
+        let config = parse(
+            &[(
+                "config",
+                indoc!(
+                    r#"
+                    [buck2]
+                    download_cache_enabled = true
+                    download_cache_dir = /store
+                    download_cache_gc_max_age_secs = 3600
+                    download_cache_skip_head_request = true
+                    "#
+                ),
+            )],
+            "config",
+        )?;
+        let startup_config = DaemonStartupConfig::new(&config, &BuckSettings::empty(), false)?;
+        assert_eq!(
+            startup_config.download_cache,
+            DownloadCacheStartupConfig {
+                enabled: true,
+                dir: Some("/store".to_owned()),
+                gc_max_age_secs: Some(3600),
+                skip_head_request: true,
+            }
+        );
+        Ok(())
+    }
+
+    /// The startup config is compared against the running daemon's, so a change
+    /// here has to be a change there, or the settings never take effect.
+    #[test]
+    fn test_download_cache_change_restarts_the_daemon() -> buck2_error::Result<()> {
+        let off = parse(&[("config", indoc!(r#""#))], "config")?;
+        let on = parse(
+            &[(
+                "config",
+                indoc!(
+                    r#"
+                    [buck2]
+                    download_cache_enabled = true
+                    "#
+                ),
+            )],
+            "config",
+        )?;
+        let settings = BuckSettings::empty();
+        assert_ne!(
+            DaemonStartupConfig::new(&off, &settings, false)?,
+            DaemonStartupConfig::new(&on, &settings, false)?
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_daemon_idle_timeout_s_default() -> buck2_error::Result<()> {

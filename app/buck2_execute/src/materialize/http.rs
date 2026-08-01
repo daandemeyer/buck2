@@ -306,6 +306,86 @@ pub async fn http_download(
     .map_err(|e| e.into_final())?)
 }
 
+/// Which of an action's declared checksums a stream failed to match.
+pub(crate) struct ChecksumMismatch {
+    pub(crate) family: DigestAlgorithmFamily,
+    pub(crate) kind: &'static str,
+    pub(crate) expected: String,
+    pub(crate) obtained: String,
+}
+
+enum Validator {
+    /// The digest buck2 computes anyway is the checksum we need.
+    PrimaryDigest,
+    ExtraDigest(Box<dyn DynDigest + Send>),
+}
+
+/// Checks a byte stream against every checksum an action declared. Callers that
+/// are computing a [`FileDigest`] over the same bytes pass its algorithm, and
+/// the matching checksum is taken from that digest rather than hashed twice.
+pub(crate) struct ChecksumVerifier<'a> {
+    validators: SmallVec<[(Validator, &'a str, DigestAlgorithmFamily, &'static str); 2]>,
+}
+
+impl<'a> ChecksumVerifier<'a> {
+    pub(crate) fn new(checksum: &'a Checksum, digest: Option<DigestAlgorithmFamily>) -> Self {
+        let mut validators = SmallVec::new();
+        let mut push = |expected: Option<&'a str>, family, kind| {
+            if let Some(expected) = expected {
+                let validator = if digest == Some(family) {
+                    Validator::PrimaryDigest
+                } else if family == DigestAlgorithmFamily::Sha1 {
+                    Validator::ExtraDigest(Box::new(Sha1::new()) as _)
+                } else {
+                    Validator::ExtraDigest(Box::new(Sha256::new()) as _)
+                };
+                validators.push((validator, expected, family, kind));
+            }
+        };
+        push(checksum.sha1(), DigestAlgorithmFamily::Sha1, "sha1");
+        push(checksum.sha256(), DigestAlgorithmFamily::Sha256, "sha256");
+        Self { validators }
+    }
+
+    pub(crate) fn update(&mut self, chunk: &[u8]) {
+        for (validator, _, _, _) in self.validators.iter_mut() {
+            if let Validator::ExtraDigest(hasher) = validator {
+                hasher.update(chunk);
+            }
+        }
+    }
+
+    /// `digest` must be the digest of the same bytes, if one was computed.
+    /// Every declared checksum is reported, not just the first to fail.
+    pub(crate) fn finish(self, digest: Option<&FileDigest>) -> Result<(), Vec<ChecksumMismatch>> {
+        let mut mismatches = Vec::new();
+        for (validator, expected, family, kind) in self.validators {
+            let obtained = match validator {
+                Validator::PrimaryDigest => match digest {
+                    Some(digest) => digest.raw_digest().to_string(),
+                    // Unreachable, but a verifier handed nothing to check
+                    // against must reject rather than pass.
+                    None => "<no digest computed>".to_owned(),
+                },
+                Validator::ExtraDigest(hasher) => hex::encode(hasher.finalize()),
+            };
+            if !obtained.eq_ignore_ascii_case(expected) {
+                mismatches.push(ChecksumMismatch {
+                    family,
+                    kind,
+                    expected: expected.to_owned(),
+                    obtained,
+                });
+            }
+        }
+        if mismatches.is_empty() {
+            Ok(())
+        } else {
+            Err(mismatches)
+        }
+    }
+}
+
 /// Copy a stream into a writer while producing its digest and checksumming it.
 async fn copy_and_hash(
     url: &str,
@@ -318,36 +398,7 @@ async fn copy_and_hash(
     is_vpnless: bool,
 ) -> Result<FileDigest, HttpDownloadError> {
     let mut digester = FileDigest::digester(digest_config);
-
-    // For each checksum entry we have, we're going to add a validator. We might have to create
-    // a new hasher, or reuse the `FileDigest::digester` if it matches.
-
-    enum Validator {
-        PrimaryDigest,
-        ExtraDigest(Box<dyn DynDigest + Send>),
-    }
-
-    let mut validators = SmallVec::<[_; 2]>::new();
-
-    if let Some(sha1) = checksum.sha1() {
-        let validator = if digester.algorithm() == DigestAlgorithmFamily::Sha1 {
-            Validator::PrimaryDigest
-        } else {
-            Validator::ExtraDigest(Box::new(Sha1::new()) as _)
-        };
-
-        validators.push((validator, sha1, "sha1"));
-    }
-
-    if let Some(sha256) = checksum.sha256() {
-        let validator = if digester.algorithm() == DigestAlgorithmFamily::Sha256 {
-            Validator::PrimaryDigest
-        } else {
-            Validator::ExtraDigest(Box::new(Sha256::new()) as _)
-        };
-
-        validators.push((validator, sha256, "sha256"));
-    }
+    let mut verifier = ChecksumVerifier::new(checksum, Some(digester.algorithm()));
 
     let mut buff = DebugBuffer::new(512);
 
@@ -366,11 +417,7 @@ async fn copy_and_hash(
             .map_err(HttpDownloadError::IoError)?;
 
         digester.update(&chunk);
-        for (validator, _expected, _kind) in validators.iter_mut() {
-            if let Validator::ExtraDigest(hasher) = validator {
-                hasher.update(&chunk);
-            }
-        }
+        verifier.update(&chunk);
     }
     writer
         .flush()
@@ -379,38 +426,31 @@ async fn copy_and_hash(
 
     let digest = digester.finalize();
 
-    // Validate
-    for (validator, expected, kind) in validators {
-        let obtained = match validator {
-            Validator::PrimaryDigest => digest.raw_digest().to_string(),
-            Validator::ExtraDigest(hasher) => hex::encode(hasher.finalize()),
+    if let Err(mismatches) = verifier.finish(Some(&digest)) {
+        let mismatch = mismatches.into_iter().next().unwrap();
+        let debug = MaybeResponseDebugInfo {
+            bytes_seen: buff.bytes_seen,
+            buff: buff.to_utf8().map(ToOwned::to_owned),
+            head,
+            is_final: false,
         };
 
-        if expected != obtained {
-            let debug = MaybeResponseDebugInfo {
-                bytes_seen: buff.bytes_seen,
-                buff: buff.to_utf8().map(ToOwned::to_owned),
-                head,
-                is_final: false,
-            };
-
-            if is_vpnless {
-                return Err(HttpDownloadError::MaybeNotAllowedOnVpnless {
-                    kind,
-                    want: expected.to_owned(),
-                    got: obtained,
-                    url: url.to_owned(),
-                    debug,
-                });
-            }
-            return Err(HttpDownloadError::InvalidChecksum {
-                digest_kind: kind,
-                expected: expected.to_owned(),
-                obtained,
+        if is_vpnless {
+            return Err(HttpDownloadError::MaybeNotAllowedOnVpnless {
+                kind: mismatch.kind,
+                want: mismatch.expected,
+                got: mismatch.obtained,
                 url: url.to_owned(),
                 debug,
             });
         }
+        return Err(HttpDownloadError::InvalidChecksum {
+            digest_kind: mismatch.kind,
+            expected: mismatch.expected,
+            obtained: mismatch.obtained,
+            url: url.to_owned(),
+            debug,
+        });
     }
 
     Ok(digest)
