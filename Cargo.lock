@@ -2198,6 +2198,7 @@ dependencies = [
  "dice",
  "dice_futures",
  "digest 0.11.3",
+ "dirs",
  "dupe",
  "either",
  "faccess",
