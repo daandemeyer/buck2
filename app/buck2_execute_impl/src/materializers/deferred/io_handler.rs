@@ -39,6 +39,7 @@ use buck2_execute::directory::ActionSharedDirectory;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::blocking::IoRequest;
 use buck2_execute::execute::clean_output_paths::cleanup_path;
+use buck2_execute::materialize::download_cache::DownloadCache;
 use buck2_execute::materialize::http::http_download;
 use buck2_execute::materialize::materializer::CasDownloadInfo;
 use buck2_execute::materialize::materializer::CasNotFoundError;
@@ -91,6 +92,7 @@ pub struct DefaultIoHandler {
     /// Executor for blocking IO operations
     io_executor: Arc<dyn BlockingExecutor>,
     http_client: HttpClient,
+    download_cache: Option<Arc<DownloadCache>>,
 }
 
 #[derive(Allocative)]
@@ -114,9 +116,11 @@ impl NoDiskIoHandler {
     }
 }
 
+#[derive(Default)]
 struct MaterializationStat {
     file_count: u64,
     total_bytes: u64,
+    from_download_cache: bool,
 }
 
 #[async_trait]
@@ -171,6 +175,7 @@ impl DefaultIoHandler {
         re_client_manager: Arc<ReConnectionManager>,
         io_executor: Arc<dyn BlockingExecutor>,
         http_client: HttpClient,
+        download_cache: Option<Arc<DownloadCache>>,
     ) -> Self {
         Self {
             fs,
@@ -179,6 +184,7 @@ impl DefaultIoHandler {
             re_client_manager,
             io_executor,
             http_client,
+            download_cache,
         }
     }
     /// Materializes an `entry` at `path`, using the materialization `method`
@@ -263,16 +269,47 @@ impl DefaultIoHandler {
             }
             ArtifactMaterializationMethod::HttpDownload { info } => {
                 async {
-                    let downloaded = http_download(
-                        &self.http_client,
-                        &self.fs,
-                        self.digest_config,
-                        &path,
-                        &info.url,
-                        &info.checksum,
-                        info.metadata.is_executable,
-                    )
-                    .await?;
+                    let abs_path = self.fs.resolve(&path);
+                    let cached = match &self.download_cache {
+                        Some(cache) => {
+                            cache
+                                .get(
+                                    &info.checksum,
+                                    Some(info.metadata.digest.size()),
+                                    &abs_path,
+                                    info.metadata.is_executable,
+                                    self.digest_config,
+                                    self.io_executor.as_ref(),
+                                )
+                                .await
+                        }
+                        None => None,
+                    };
+
+                    let downloaded = match cached {
+                        Some(downloaded) => {
+                            stat.from_download_cache = true;
+                            downloaded
+                        }
+                        None => {
+                            let downloaded = http_download(
+                                &self.http_client,
+                                &self.fs,
+                                self.digest_config,
+                                &path,
+                                &info.url,
+                                &info.checksum,
+                                info.metadata.is_executable,
+                            )
+                            .await?;
+                            if let Some(cache) = &self.download_cache {
+                                cache
+                                    .put(&info.checksum, &abs_path, self.io_executor.as_ref())
+                                    .await;
+                            }
+                            downloaded
+                        }
+                    };
 
                     // Check that the size we got was the one that we expected. This isn't strictly
                     // speaking necessary here, but since an invalid size would break actions
@@ -406,10 +443,7 @@ impl IoHandler for DefaultIoHandler {
         event_dispatcher
             .span_async(materialization_start, async move {
                 let path_string = path.as_str().to_owned();
-                let mut stat = MaterializationStat {
-                    file_count: 0,
-                    total_bytes: 0,
-                };
+                let mut stat = MaterializationStat::default();
                 let res = self
                     .materialize_entry_span(
                         path,
@@ -432,6 +466,7 @@ impl IoHandler for DefaultIoHandler {
                         success: error.is_none(),
                         error,
                         method: Some(method.to_proto() as i32),
+                        from_download_cache: stat.from_download_cache.then_some(true),
                     },
                 )
             })
