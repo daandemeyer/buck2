@@ -365,6 +365,26 @@ pub fn copy<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(from: P, to: Q) -> Result<u64,
     })
 }
 
+pub fn hard_link<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(
+    original: P,
+    link: Q,
+) -> Result<(), IoError> {
+    let _guard = IoCounterKey::Hardlink.guard();
+    let original = original.as_ref();
+    let link = link.as_ref();
+    with_retries(|| fs::hard_link(original.as_maybe_relativized(), link.as_maybe_relativized()))
+        .map_err(|e| {
+            IoError::new(e)
+                .context(format!(
+                    "hard_link(original={}, link={})",
+                    original.display(),
+                    link.display()
+                ))
+                .check_eden(original)
+                .check_eden(link)
+        })
+}
+
 pub fn read_link<P: AsRef<AbsPath>>(path: P) -> Result<PathBuf, IoError> {
     let _guard = IoCounterKey::ReadLink.guard();
     with_retries(|| fs::read_link(path.as_ref().as_maybe_relativized()))
@@ -430,6 +450,26 @@ pub fn symlink_metadata<P: AsRef<AbsPath>>(path: P) -> Result<fs::Metadata, IoEr
     let _guard = IoCounterKey::Stat.guard();
     with_retries(|| fs::symlink_metadata(path.as_ref().as_maybe_relativized()))
         .map_err(|e| IoError::new_with_path("symlink_metadata", path, e))
+}
+
+#[cfg(windows)]
+pub fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+pub fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+/// `metadata` must come from [`symlink_metadata`]: a followed stat reports a
+/// symlink-to-file as a plain file, silently defeating this check.
+pub fn is_plain_file(metadata: &fs::Metadata) -> bool {
+    metadata.is_file() && !is_reparse_point(metadata)
 }
 
 pub fn set_permissions<P: AsRef<AbsPath>>(path: P, perm: fs::Permissions) -> Result<(), IoError> {

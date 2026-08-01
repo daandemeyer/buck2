@@ -37,6 +37,7 @@ derive_more.workspace = true
 dice.workspace = true
 dice_futures.workspace = true
 digest.workspace = true
+dirs.workspace = true
 dupe.workspace = true
 either.workspace = true
 faccess.workspace = true
