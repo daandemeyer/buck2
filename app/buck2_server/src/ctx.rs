@@ -436,6 +436,7 @@ impl<'a> ServerCommandContext<'a> {
             default_allow_cache_upload: false,
             action_paths_interner: None,
             deduplicate_get_digests_ttl_calls: false,
+            download_cache: self.base_context.repo.download_cache.dupe(),
         };
 
         let concurrency = self

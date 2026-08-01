@@ -3437,6 +3437,10 @@ message MaterializationEnd {
 
   // The type of entry that was materialized
   optional MaterializationMethod method = 7;
+
+  // For an HTTP download, whether the bytes came from the local download cache
+  // rather than the network.
+  optional bool from_download_cache = 8;
 };
 
 message ExclusiveCommandWaitStart {
