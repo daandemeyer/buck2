@@ -7,3 +7,9 @@ simple_test(
     seed = read_config("test", "seed", ""),
     supports_test_execution_caching = True,
 )
+
+simple_test(
+    name = "failing_cacheable_test",
+    exit_code = 1,
+    supports_test_execution_caching = True,
+)

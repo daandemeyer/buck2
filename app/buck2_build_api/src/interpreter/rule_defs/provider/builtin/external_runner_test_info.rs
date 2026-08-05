@@ -115,7 +115,8 @@ pub struct ExternalRunnerTestInfo<'v> {
     /// command related to test execution, including listing.
     worker: Option<ValueTyped<'v, WorkerInfo<'v>>>,
 
-    /// Whether test execution results can be read from the remote action cache.
+    /// Whether successful test execution results can be reused from DICE or the remote action
+    /// cache.
     supports_test_execution_caching: ValueOfUnchecked<'v, bool>,
 }
 
