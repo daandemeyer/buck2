@@ -237,6 +237,34 @@ As noted above, tests run from the cell root unless `run_from_project_root` is s
 To produce paths relative to the cell root for use by tests, use
 `relative_to(ctx.label.cell_root)` on `cmd_args`.
 
+## Caching Test Executions
+
+Test rules can opt in to test execution caching by setting
+`supports_test_execution_caching` on `ExternalRunnerTestInfo`:
+
+```python
+ExternalRunnerTestInfo(
+    command = ["my_test_binary"],
+    type = "my_test_type",
+    supports_test_execution_caching = True,
+)
+```
+
+Successful test executions are cached in DICE for the lifetime of the Buck2
+daemon. This allows repeated local test invocations to reuse the result as long
+as the test command and its declared dependencies have not changed. Failed and
+timed-out executions are not cached.
+
+When the test uses a remote-enabled executor, Buck2 may also reuse results from
+the RE action cache. Unlike DICE caching, remote action-cache entries can be
+reused after restarting the Buck2 daemon. Buck2 does not upload locally executed
+tests to the remote action cache.
+
+Only opt in tests whose results are determined by their declared inputs. Tests
+that depend on ambient machine state, the network, time, or randomness can
+otherwise return stale results. Test runners can disable caching for an
+individual execution request, for example when performing stress runs.
+
 <FbInternalOnly>
 
 ## Caching Test Listings
