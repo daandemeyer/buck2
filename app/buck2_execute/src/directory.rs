@@ -577,6 +577,14 @@ pub fn relativize_directory(
                     .parent()
                     .is_some_and(|dir| dir.join_normalized(link.target()).is_ok())
             {
+                if link.target().is_empty() {
+                    replacements.insert(
+                        &path,
+                        DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(Arc::new(
+                            Symlink::new(".".into()),
+                        ))),
+                    )?;
+                }
                 continue;
             }
 
