@@ -20,6 +20,8 @@ use buck2_artifact::artifact::artifact_type::BaseArtifactKind;
 use buck2_artifact::artifact::build_artifact::BuildArtifact;
 use buck2_artifact::artifact::source_artifact::SourceArtifact;
 use buck2_common::dice::cells::HasCellResolver;
+use buck2_common::dice::cycles::CycleAdapterDescriptor;
+use buck2_common::dice::cycles::CycleGuard;
 use buck2_common::file_ops::dice::DiceFileComputations;
 use buck2_common::file_ops::metadata::RawPathMetadata;
 use buck2_common::file_ops::metadata::RawSymlink;
@@ -43,10 +45,12 @@ use buck2_execute::directory::INTERNER;
 use buck2_execute::directory::extract_artifact_value;
 use buck2_execute::directory::insert_artifact;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
+use buck2_util::cycle_detector::CycleDescriptor;
 use buck2_util::size_assert;
 use buck2_util::time_span::TimeSpan;
 use derive_more::Display;
 use dice::DiceComputations;
+use dice::DynKey;
 use dice::EqualityBehavior;
 use dice::Key;
 use dice::OkPagableValueSerialize;
@@ -266,111 +270,156 @@ size_assert::words_of_async_fn_future!(ensure_build_artifact_staged, (_, _), 9);
 size_assert::words_of_async_fn_future!(ActionCalculation::build_action, (_, _), 8);
 size_assert::words_of_async_fn_future!(ensure_source_artifact_staged, (_, _), 2);
 
+// We kept running into this performance footgun where a large directory is declared as a source
+// on a toolchain, and then every `BuildKey` using that toolchain ends up taking a DICE edge on
+// `PathMetadataKey` of every file inside that directory, blowing up Buck2's memory use.
+// `DirArtifactValueKey` is an intermediate DICE key to prevent that -  every `BuildKey` using
+// that directory now only depends on one `DirArtifactValueKey`, and that `DirArtifactValueKey`
+// depends on the `PathMetadataKey` of every member of the directory.
+#[derive(Clone, Dupe, Display, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[display("dir_artifact_value({})", _0)]
+#[pagable_typetag(dice::DiceKeyDyn)]
+struct DirArtifactValueKey(Arc<CellPath>);
+
+#[async_trait]
+impl Key for DirArtifactValueKey {
+    type Value = buck2_error::Result<ArtifactValue>;
+
+    async fn compute(
+        &self,
+        ctx: &mut DiceComputations,
+        _cancellation: &CancellationContext,
+    ) -> Self::Value {
+        let files = &DiceFileComputations::read_dir(ctx, self.0.as_ref().as_ref())
+            .await?
+            .included;
+
+        // Symlinks between directories can make this key depend on itself, which DICE would
+        // wait on forever, so the wait on the entries goes through the cycle detector.
+        let entry_values = CycleGuard::<DirArtifactCycleDescriptor>::new(ctx)?
+            .guard_this(ctx.try_compute_join(files.iter(), async |ctx, x| {
+                // TODO(scottcao): This current creates a `DirArtifactValueKey` for each subdir of a source directory.
+                // Instead, this should be 1 key for the entire top-level directory since there's almost
+                // no chance of getting cache hit with a sub-directory.
+                let value =
+                    path_artifact_value(ctx, Arc::new(self.0.as_ref().join(&x.file_name)), None)
+                        .await?;
+                buck2_error::Ok((x.file_name.clone(), value))
+            }))
+            .await
+            .into_result(ctx)
+            .await???;
+
+        enum DepsMerger {
+            None,
+            One(ActionSharedDirectory),
+            Multiple(ActionDirectoryBuilder),
+        }
+
+        let mut entries = SortedVectorMap::new();
+        let mut deps_merger = DepsMerger::None;
+        for (file_name, value) in entry_values {
+            entries.insert(file_name, value.entry().dupe());
+            if let Some(deps) = value.deps() {
+                deps_merger = match deps_merger {
+                    DepsMerger::None => DepsMerger::One(deps.dupe()),
+                    DepsMerger::One(first_deps) => {
+                        let mut builder = first_deps.into_builder();
+                        builder.merge(deps.dupe().into_builder())?;
+                        DepsMerger::Multiple(builder)
+                    }
+                    DepsMerger::Multiple(mut builder) => {
+                        builder.merge(deps.dupe().into_builder())?;
+                        DepsMerger::Multiple(builder)
+                    }
+                }
+            }
+        }
+        let entries = entries.into_iter().collect();
+
+        let digest_config = ctx.global_data().get_digest_config();
+        // A source directory listing is complete content (only ever *interpreted* under
+        // buck-out, but exhaustive is the accurate marking).
+        let d: DirectoryData<_, _, _> = DirectoryData::new(
+            entries,
+            digest_config.as_directory_serializer(),
+            Exhaustiveness::Exhaustive,
+        );
+        let d = INTERNER.intern(d);
+
+        let deps = match deps_merger {
+            DepsMerger::None => None,
+            DepsMerger::One(deps) => Some(deps),
+            DepsMerger::Multiple(builder) => Some(
+                builder
+                    .fingerprint(digest_config.as_directory_serializer())
+                    .shared(&*INTERNER),
+            ),
+        };
+
+        Ok(ArtifactValue::new(ActionDirectoryEntry::Dir(d), deps))
+    }
+
+    fn equality_behavior() -> EqualityBehavior<Self::Value> {
+        EqualityBehavior::Compare(|x, y| match (x, y) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        })
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        OkPagableValueSerialize::<Self::Value>::new()
+    }
+}
+
+#[derive(Debug)]
+pub struct DirArtifactCycleDescriptor;
+
+impl CycleDescriptor for DirArtifactCycleDescriptor {
+    type Key = Arc<CellPath>;
+    type Error = SourceSymlinkError;
+
+    fn cycle_error(cycle: Vec<&Self::Key>) -> Self::Error {
+        SourceSymlinkError::Cycle(cycle.into_iter().map(|p| p.dupe()).collect())
+    }
+}
+
+impl CycleAdapterDescriptor for DirArtifactCycleDescriptor {
+    fn to_key(key: &DynKey) -> Option<Self::Key> {
+        key.downcast_ref::<DirArtifactValueKey>()
+            .map(|key| key.0.dupe())
+    }
+}
+
+#[derive(Debug, Clone, buck2_error::Error)]
+#[buck2(tag = Input)]
+pub enum SourceSymlinkError {
+    #[error("{}", display_symlink_cycle(.0))]
+    Cycle(Vec<Arc<CellPath>>),
+}
+
+fn display_symlink_cycle(cycle: &[Arc<CellPath>]) -> String {
+    use std::fmt::Write;
+
+    let mut s = String::new();
+    writeln!(
+        s,
+        "Symlink cycle detected while reading sources (`->` means \"links to\"):"
+    )
+    .unwrap();
+    for p in cycle {
+        writeln!(s, "  {p} ->").unwrap();
+    }
+    if let Some(first) = cycle.first() {
+        write!(s, "  {first}").unwrap();
+    }
+    s
+}
+
 async fn dir_artifact_value(
     ctx: &mut DiceComputations<'_>,
     cell_path: Arc<CellPath>,
 ) -> buck2_error::Result<ArtifactValue> {
-    // We kept running into this performance footgun where a large directory is declared as a source
-    // on a toolchain, and then every `BuildKey` using that toolchain ends up taking a DICE edge on
-    // `PathMetadataKey` of every file inside that directory, blowing up Buck2's memory use.
-    // `DirArtifactValueKey` is an intermediate DICE key to prevent that -  every `BuildKey` using
-    // that directory now only depends on one `DirArtifactValueKey`, and that `DirArtifactValueKey`
-    // depends on the `PathMetadataKey` of every member of the directory.
-    #[derive(Clone, Dupe, Display, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
-    #[display("dir_artifact_value({})", _0)]
-    #[pagable_typetag(dice::DiceKeyDyn)]
-    struct DirArtifactValueKey(Arc<CellPath>);
-
-    #[async_trait]
-    impl Key for DirArtifactValueKey {
-        type Value = buck2_error::Result<ArtifactValue>;
-
-        async fn compute(
-            &self,
-            ctx: &mut DiceComputations,
-            _cancellation: &CancellationContext,
-        ) -> Self::Value {
-            let files = &DiceFileComputations::read_dir(ctx, self.0.as_ref().as_ref())
-                .await?
-                .included;
-
-            let entry_values = ctx
-                .try_compute_join(files.iter(), async |ctx, x| {
-                    // TODO(scottcao): This current creates a `DirArtifactValueKey` for each subdir of a source directory.
-                    // Instead, this should be 1 key for the entire top-level directory since there's almost
-                    // no chance of getting cache hit with a sub-directory.
-                    let value = path_artifact_value(
-                        ctx,
-                        Arc::new(self.0.as_ref().join(&x.file_name)),
-                        None,
-                    )
-                    .await?;
-                    buck2_error::Ok((x.file_name.clone(), value))
-                })
-                .await?;
-
-            enum DepsMerger {
-                None,
-                One(ActionSharedDirectory),
-                Multiple(ActionDirectoryBuilder),
-            }
-
-            let mut entries = SortedVectorMap::new();
-            let mut deps_merger = DepsMerger::None;
-            for (file_name, value) in entry_values {
-                entries.insert(file_name, value.entry().dupe());
-                if let Some(deps) = value.deps() {
-                    deps_merger = match deps_merger {
-                        DepsMerger::None => DepsMerger::One(deps.dupe()),
-                        DepsMerger::One(first_deps) => {
-                            let mut builder = first_deps.into_builder();
-                            builder.merge(deps.dupe().into_builder())?;
-                            DepsMerger::Multiple(builder)
-                        }
-                        DepsMerger::Multiple(mut builder) => {
-                            builder.merge(deps.dupe().into_builder())?;
-                            DepsMerger::Multiple(builder)
-                        }
-                    }
-                }
-            }
-            let entries = entries.into_iter().collect();
-
-            let digest_config = ctx.global_data().get_digest_config();
-            // A source directory listing is complete content (only ever *interpreted* under
-            // buck-out, but exhaustive is the accurate marking).
-            let d: DirectoryData<_, _, _> = DirectoryData::new(
-                entries,
-                digest_config.as_directory_serializer(),
-                Exhaustiveness::Exhaustive,
-            );
-            let d = INTERNER.intern(d);
-
-            let deps = match deps_merger {
-                DepsMerger::None => None,
-                DepsMerger::One(deps) => Some(deps),
-                DepsMerger::Multiple(builder) => Some(
-                    builder
-                        .fingerprint(digest_config.as_directory_serializer())
-                        .shared(&*INTERNER),
-                ),
-            };
-
-            Ok(ArtifactValue::new(ActionDirectoryEntry::Dir(d), deps))
-        }
-
-        fn equality_behavior() -> EqualityBehavior<Self::Value> {
-            EqualityBehavior::Compare(|x, y| match (x, y) {
-                (Ok(x), Ok(y)) => x == y,
-                _ => false,
-            })
-        }
-
-        fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
-            OkPagableValueSerialize::<Self::Value>::new()
-        }
-    }
-
     ctx.compute(&DirArtifactValueKey(cell_path)).await?.dupe()
 }
 

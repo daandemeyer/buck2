@@ -24,6 +24,7 @@ use buck2_build_api::actions::execute::dice_data::SetReClient;
 use buck2_build_api::actions::execute::dice_data::set_fallback_executor_config;
 use buck2_build_api::actions::impls::run_action_knobs::HasRunActionKnobs;
 use buck2_build_api::actions::impls::run_action_knobs::RunActionKnobs;
+use buck2_build_api::artifact_groups::calculation::DirArtifactCycleDescriptor;
 use buck2_build_api::build::HasCreateUnhashedSymlinkLock;
 use buck2_build_api::build::detailed_aggregated_metrics::dice::HasDetailedAggregatedMetrics;
 use buck2_build_api::build::detailed_aggregated_metrics::dice::SetDetailedAggregatedMetricsEventsHolder;
@@ -679,7 +680,10 @@ struct DiceCommandUpdater<'s, 'a: 's> {
 fn create_cycle_detector() -> Arc<dyn UserCycleDetector> {
     Arc::new(PairDiceCycleDetector(
         CycleDetectorAdapter::<LoadCycleDescriptor>::new(),
-        CycleDetectorAdapter::<ConfiguredGraphCycleDescriptor>::new(),
+        PairDiceCycleDetector(
+            CycleDetectorAdapter::<ConfiguredGraphCycleDescriptor>::new(),
+            CycleDetectorAdapter::<DirArtifactCycleDescriptor>::new(),
+        ),
     ))
 }
 

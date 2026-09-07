@@ -9,6 +9,7 @@
  */
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use buck2_analysis::analysis::calculation::AnalysisKey;
 use buck2_artifact::artifact::artifact_type::Artifact;
@@ -20,12 +21,14 @@ use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_api::artifact_groups::TransitiveSetProjectionKey;
 use buck2_build_api::artifact_groups::TransitiveSetProjectionWrapper;
 use buck2_build_api::artifact_groups::calculation::ArtifactGroupCalculation;
+use buck2_build_api::artifact_groups::calculation::DirArtifactCycleDescriptor;
 use buck2_build_api::artifact_groups::deferred::TransitiveSetKey;
 use buck2_build_api::context::SetBuildContextData;
 use buck2_build_api::interpreter::rule_defs::transitive_set::TransitiveSet;
 use buck2_build_api::interpreter::rule_defs::transitive_set::TransitiveSetOrdering;
 use buck2_build_api::keep_going::HasKeepGoing;
 use buck2_common::dice::cells::SetCellResolver;
+use buck2_common::dice::cycles::CycleDetectorAdapter;
 use buck2_common::dice::data::testing::SetTestingIoProvider;
 use buck2_common::file_ops::metadata::FileMetadata;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
@@ -264,6 +267,7 @@ async fn source_artifact_value(
     fs: &ProjectRootTemp,
     package: &str,
     path: &str,
+    detect_cycles: bool,
 ) -> buck2_error::Result<ArtifactValue> {
     let cell = CellName::testing_new("root");
     let dice_builder = files
@@ -272,7 +276,13 @@ async fn source_artifact_value(
             data.set_testing_io_provider(fs);
             data.set_digest_config(DigestConfig::testing_default());
         });
-    let mut dice = dice_builder.build(UserComputationData::new()).unwrap();
+    let mut extra = UserComputationData::new();
+    if detect_cycles {
+        extra.cycle_detector = Some(Arc::new(
+            CycleDetectorAdapter::<DirArtifactCycleDescriptor>::new(),
+        ));
+    }
+    let mut dice = dice_builder.build(extra).unwrap();
     dice.set_cell_resolver(CellResolver::testing_with_name_and_path(
         cell,
         CellRootPathBuf::testing_new(""),
@@ -316,14 +326,14 @@ async fn test_source_dir_symlinks_to_ancestors_are_leaves() -> buck2_error::Resu
     );
     let fs = ProjectRootTemp::new()?;
 
-    let value = source_artifact_value(&files, &fs, "root//pkg", "dir").await?;
+    let value = source_artifact_value(&files, &fs, "root//pkg", "dir", false).await?;
 
     assert_eq!(symlink_target(&value, "self"), ".");
     assert_eq!(symlink_target(&value, "deeper/up"), "..");
     assert!(value.deps().is_none());
 
     // Reading through such a link still resolves to the target.
-    let value = source_artifact_value(&files, &fs, "root//pkg", "dir/self/file").await?;
+    let value = source_artifact_value(&files, &fs, "root//pkg", "dir/self/file", false).await?;
     assert_eq!(
         value,
         ArtifactValue::file(FileMetadata {
@@ -351,7 +361,7 @@ async fn test_source_dir_symlink_elsewhere_keeps_deps() -> buck2_error::Result<(
     );
     let fs = ProjectRootTemp::new()?;
 
-    let value = source_artifact_value(&files, &fs, "root//pkg", "dir").await?;
+    let value = source_artifact_value(&files, &fs, "root//pkg", "dir", false).await?;
 
     assert_eq!(symlink_target(&value, "link"), "../other");
     let deps = value.deps().expect("the symlink target is a dep");
@@ -360,5 +370,36 @@ async fn test_source_dir_symlink_elsewhere_keeps_deps() -> buck2_error::Result<(
             .unwrap()
             .is_some()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_source_dir_symlink_cycle_is_an_error() -> buck2_error::Result<()> {
+    let _stack_guard = buck2_util::threads::ignore_stack_overflow_checks_for_current_thread();
+    let files = TestFileOps::new_with_files_and_symlinks(
+        btreemap![
+            CellPath::testing_new("root//pkg/a/file") => "a".to_owned(),
+            CellPath::testing_new("root//pkg/b/file") => "b".to_owned(),
+        ],
+        btreemap![
+            CellPath::testing_new("root//pkg/a/link") => RelativePathBuf::from("../b"),
+            CellPath::testing_new("root//pkg/b/link") => RelativePathBuf::from("../a"),
+        ],
+    );
+    let fs = ProjectRootTemp::new()?;
+
+    // Without cycle detection this waits on itself forever.
+    let err = tokio::time::timeout(
+        Duration::from_secs(120),
+        source_artifact_value(&files, &fs, "root//pkg", "a", true),
+    )
+    .await
+    .expect("digest computation hung on a symlink cycle")
+    .unwrap_err();
+
+    let err = format!("{err:#}");
+    assert!(err.contains("Symlink cycle detected"), "{err}");
+    assert!(err.contains("root//pkg/a ->"), "{err}");
+    assert!(err.contains("root//pkg/b ->"), "{err}");
     Ok(())
 }
