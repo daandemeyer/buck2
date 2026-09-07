@@ -19,6 +19,8 @@ stat_path(
 
 copy_tree(name = "ancestors", src = "ancestors")
 
+copy_tree(name = "cycle", src = "cycle")
+
 stub(
     name = "symlink_dep",
     deps = ["//testlink:dep"],
