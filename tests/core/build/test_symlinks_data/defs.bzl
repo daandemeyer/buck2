@@ -103,3 +103,28 @@ copy_tree = rule(
         "src": attrs.source(allow_directory = True),
     },
 )
+
+def _copy_source_dir_impl(ctx: AnalysisContext):
+    if ctx.attrs.relative_symlinks:
+        copied = ctx.actions.copy_dir(
+            ctx.label.name,
+            ctx.attrs.src,
+            has_content_based_path = False,
+            relative_symlinks = True,
+        )
+    else:
+        # Exercise the default by omitting `relative_symlinks` entirely.
+        copied = ctx.actions.copy_dir(
+            ctx.label.name,
+            ctx.attrs.src,
+            has_content_based_path = False,
+        )
+    return [DefaultInfo(default_output = copied)]
+
+copy_source_dir = rule(
+    impl = _copy_source_dir_impl,
+    attrs = {
+        "relative_symlinks": attrs.bool(default = False),
+        "src": attrs.source(allow_directory = True),
+    },
+)
