@@ -216,6 +216,48 @@ async def test_source_dir_symlinks_to_ancestors(buck: Buck) -> None:
     await expect_exec_count(buck, 0)
 
 
+@buck_test(skip_for_os=["windows"])
+async def test_copy_dir_relative_symlinks_are_relocatable(buck: Buck) -> None:
+    source = buck.cwd / "relocatable"
+    setup_symlink(source / "dir" / "link", Path("real"))
+    setup_symlink(source / "sub" / "up", Path(".."))
+
+    relative_result = await asyncio.wait_for(
+        buck.build("//:relocatable_copy"), timeout=SYMLINK_BUILD_TIMEOUT_S
+    )
+    relative_output = relative_result.get_build_report().output_for_target(
+        "root//:relocatable_copy"
+    )
+
+    assert (relative_output / "dir" / "link").readlink() == Path("real")
+    assert (relative_output / "sub" / "up").readlink() == Path("..")
+    assert (relative_output / "dir" / "link").read_text() == "real\n"
+    assert (relative_output / "sub" / "up" / "dir" / "real").read_text() == "real\n"
+
+    relocated = buck.cwd / "relocated"
+    shutil.copytree(relative_output, relocated, symlinks=True)
+    assert (relocated / "dir" / "link").readlink() == Path("real")
+    assert (relocated / "sub" / "up").readlink() == Path("..")
+    assert (relocated / "dir" / "link").read_text() == "real\n"
+    assert (relocated / "sub" / "up" / "dir" / "real").read_text() == "real\n"
+
+    default_result = await asyncio.wait_for(
+        buck.build("//:default_copy"), timeout=SYMLINK_BUILD_TIMEOUT_S
+    )
+    default_output = default_result.get_build_report().output_for_target(
+        "root//:default_copy"
+    )
+    default_file_link = default_output / "dir" / "link"
+    default_up_link = default_output / "sub" / "up"
+
+    assert default_file_link.readlink() != Path("real")
+    assert default_file_link.readlink().parts[0] == ".."
+    assert default_file_link.resolve() == (source / "dir" / "real").resolve()
+    assert default_up_link.readlink() != Path("..")
+    assert default_up_link.readlink().parts[0] == ".."
+    assert default_up_link.resolve() == source.resolve()
+
+
 @buck_test()
 async def test_source_dir_symlink_cycle(buck: Buck) -> None:
     setup_symlink(buck.cwd / "cycle" / "a" / "link", Path("..") / "b")
