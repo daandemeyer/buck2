@@ -16,6 +16,7 @@ import tempfile
 from pathlib import Path
 
 from buck2.tests.e2e_util.api.buck import Buck
+from buck2.tests.e2e_util.asserts import expect_failure
 from buck2.tests.e2e_util.buck_workspace import buck_test
 from buck2.tests.e2e_util.helper.utils import expect_exec_count
 
@@ -213,3 +214,16 @@ async def test_source_dir_symlinks_to_ancestors(buck: Buck) -> None:
 
     await asyncio.wait_for(buck.build("//:ancestors"), timeout=SYMLINK_BUILD_TIMEOUT_S)
     await expect_exec_count(buck, 0)
+
+
+@buck_test()
+async def test_source_dir_symlink_cycle(buck: Buck) -> None:
+    setup_symlink(buck.cwd / "cycle" / "a" / "link", Path("..") / "b")
+    setup_symlink(buck.cwd / "cycle" / "b" / "link", Path("..") / "a")
+
+    failure = await asyncio.wait_for(
+        expect_failure(buck.build("//:cycle"), stderr_regex="Symlink cycle detected"),
+        timeout=SYMLINK_BUILD_TIMEOUT_S,
+    )
+    assert "root//cycle/a ->" in failure.stderr
+    assert "root//cycle/b ->" in failure.stderr
