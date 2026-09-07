@@ -319,12 +319,14 @@ impl Action for AssembledDirAction {
             match copy {
                 CopyMode::Copy {
                     executable_bit_override,
+                    relative_symlinks,
                 } => {
                     let dest_entry = builder.add_copied(
                         value,
                         src.as_ref(),
                         temp_dest.as_ref(),
                         *executable_bit_override,
+                        *relative_symlinks,
                     )?;
                     srcs.push((
                         src,

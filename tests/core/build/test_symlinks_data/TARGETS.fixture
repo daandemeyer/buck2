@@ -1,4 +1,4 @@
-load(":defs.bzl", "copy_tree", "cp", "cp_via_builtin", "stat_path")
+load(":defs.bzl", "copy_source_dir", "copy_tree", "cp", "cp_via_builtin", "stat_path")
 
 cp(name = "cp", src = "src/link/file")
 
@@ -18,6 +18,17 @@ stat_path(
 )
 
 copy_tree(name = "ancestors", src = "ancestors")
+
+copy_source_dir(
+    name = "relocatable_copy",
+    src = "relocatable",
+    relative_symlinks = True,
+)
+
+copy_source_dir(
+    name = "default_copy",
+    src = "relocatable",
+)
 
 copy_tree(name = "cycle", src = "cycle")
 
