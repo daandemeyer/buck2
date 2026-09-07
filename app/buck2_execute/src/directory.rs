@@ -549,6 +549,7 @@ pub fn relativize_directory(
     builder: &mut ActionDirectoryBuilder,
     orig_root: &ProjectRelativePath,
     new_root: &ProjectRelativePath,
+    relative_symlinks: bool,
 ) -> buck2_error::Result<()> {
     let mut replacements = ActionDirectoryBuilder::empty_non_exhaustive();
 
@@ -569,6 +570,10 @@ pub fn relativize_directory(
                 .parent()
                 .internal_error("Symlink has no dir parent")?
                 .join_normalized(link.target())?;
+
+            if relative_symlinks && orig_dest.starts_with(orig_root) {
+                continue;
+            }
 
             let new_dest = new_path
                 .parent()
@@ -978,7 +983,7 @@ mod tests {
         };
 
         // Move directory from a/d0 to b.
-        relativize_directory(&mut dir, &path("a/d0"), &path("b"))?;
+        relativize_directory(&mut dir, &path("a/d0"), &path("b"), false)?;
 
         assert_dirs_eq(&dir, &expected_dir);
 
