@@ -190,6 +190,8 @@ mod tests {
             FileMetadata::empty(digest_config.cas_digest_config()),
         )?;
         insert_symlink(&mut builder, path("dir/link").to_buf(), get_symlink("real"))?;
+        // Source readers normalize a `.` symlink target to the empty relative path.
+        insert_symlink(&mut builder, path("dir/self").to_buf(), get_symlink(""))?;
         insert_symlink(&mut builder, path("sub/up").to_buf(), get_symlink(".."))?;
         insert_symlink(
             &mut builder,
@@ -248,6 +250,7 @@ mod tests {
             symlink_target(&entry, "dir/link")?,
             "../../../source/dir/real"
         );
+        assert_eq!(symlink_target(&entry, "dir/self")?, "../../../source/dir");
         assert_eq!(symlink_target(&entry, "sub/up")?, "../../../source");
         assert_eq!(symlink_target(&entry, "escape")?, "../../outside/target");
         assert_eq!(symlink_target(&entry, "reenter")?, "../../source/dir/real");
@@ -260,6 +263,7 @@ mod tests {
         let entry = copied_symlink_directory(true)?;
 
         assert_eq!(symlink_target(&entry, "dir/link")?, "real");
+        assert_eq!(symlink_target(&entry, "dir/self")?, ".");
         assert_eq!(symlink_target(&entry, "sub/up")?, "..");
         assert_eq!(symlink_target(&entry, "escape")?, "../../outside/target");
         // Leaving the tree and re-entering it by name only works at the source location.
