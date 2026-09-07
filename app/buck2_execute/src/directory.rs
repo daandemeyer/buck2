@@ -1249,6 +1249,63 @@ mod tests {
         Ok(())
     }
 
+    /// A link to `.` reads back from disk as an empty target. It has to be stored, uploaded and
+    /// re-created as `.`, since an empty symlink target cannot be written.
+    #[test]
+    fn test_symlink_to_current_directory_round_trips() -> buck2_error::Result<()> {
+        let digest_config = DigestConfig::testing_default();
+
+        let mut builder = ActionDirectoryBuilder::empty_non_exhaustive();
+        insert_file(
+            &mut builder,
+            path("out/x"),
+            FileMetadata::empty(digest_config.cas_digest_config()),
+        )?;
+        for (link, target) in [
+            ("out/here", "."),
+            ("out/dotslash", "./"),
+            ("out/d/here", "../x"),
+        ] {
+            let target = RelativePathBuf::from_system_path(Path::new(target))?;
+            insert_symlink(&mut builder, path(link), Arc::new(Symlink::new(target)))?;
+        }
+
+        let target = |link: &str| match find(
+            Directory::as_ref(&builder),
+            ForwardRelativePath::new(link)?,
+        )? {
+            Some(DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(s))) => {
+                buck2_error::Ok(s.target().as_str().to_owned())
+            }
+            _ => panic!("`{link}` is not a symlink"),
+        };
+        assert_eq!(target("out/here")?, ".");
+        assert_eq!(target("out/dotslash")?, ".");
+        assert_eq!(target("out/d/here")?, "../x");
+
+        // Following the link does not leave the directory.
+        let value = extract_artifact_value(&builder, &path("out/here"), digest_config)?
+            .internal_error("Not value!")?;
+        assert!(matches!(
+            value.entry(),
+            DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(_))
+        ));
+
+        let dir = builder.fingerprint(digest_config.as_directory_serializer());
+        let tree = directory_to_re_tree(&dir);
+        for node in tree.root.as_ref().unwrap().symlinks.iter() {
+            assert!(
+                !node.target.is_empty(),
+                "`{}` has an empty target",
+                node.name
+            );
+        }
+        let dir2 = re_tree_to_directory(&tree, &jiff::Timestamp::now(), digest_config, true)?;
+        assert_dirs_eq(&dir, &dir2);
+
+        Ok(())
+    }
+
     /// Ensure that we serialize trees the same way RE does. The expected hash was obtained by
     /// running:
     ///
