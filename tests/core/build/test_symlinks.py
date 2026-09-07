@@ -220,6 +220,7 @@ async def test_source_dir_symlinks_to_ancestors(buck: Buck) -> None:
 async def test_copy_dir_relative_symlinks_are_relocatable(buck: Buck) -> None:
     source = buck.cwd / "relocatable"
     setup_symlink(source / "dir" / "link", Path("real"))
+    setup_symlink(source / "dir" / "self", Path("."))
     setup_symlink(source / "sub" / "up", Path(".."))
 
     relative_result = await asyncio.wait_for(
@@ -230,15 +231,21 @@ async def test_copy_dir_relative_symlinks_are_relocatable(buck: Buck) -> None:
     )
 
     assert (relative_output / "dir" / "link").readlink() == Path("real")
+    assert (relative_output / "dir" / "self").readlink() == Path(".")
     assert (relative_output / "sub" / "up").readlink() == Path("..")
     assert (relative_output / "dir" / "link").read_text() == "real\n"
+    assert (relative_output / "dir" / "self").resolve() == (
+        relative_output / "dir"
+    ).resolve()
     assert (relative_output / "sub" / "up" / "dir" / "real").read_text() == "real\n"
 
     relocated = buck.cwd / "relocated"
     shutil.copytree(relative_output, relocated, symlinks=True)
     assert (relocated / "dir" / "link").readlink() == Path("real")
+    assert (relocated / "dir" / "self").readlink() == Path(".")
     assert (relocated / "sub" / "up").readlink() == Path("..")
     assert (relocated / "dir" / "link").read_text() == "real\n"
+    assert (relocated / "dir" / "self").resolve() == (relocated / "dir").resolve()
     assert (relocated / "sub" / "up" / "dir" / "real").read_text() == "real\n"
 
     default_result = await asyncio.wait_for(
