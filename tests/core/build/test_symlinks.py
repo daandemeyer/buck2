@@ -227,3 +227,31 @@ async def test_source_dir_symlink_cycle(buck: Buck) -> None:
     )
     assert "root//cycle/a ->" in failure.stderr
     assert "root//cycle/b ->" in failure.stderr
+
+
+@buck_test()
+async def test_source_symlink_loop(buck: Buck) -> None:
+    setup_symlink(buck.cwd / "loop" / "a" / "l1", Path("..") / "b" / "l2")
+    setup_symlink(buck.cwd / "loop" / "b" / "l2", Path("..") / "a" / "l1")
+
+    failure = await asyncio.wait_for(
+        expect_failure(buck.build("//:loop"), stderr_regex="Symlink cycle detected"),
+        timeout=SYMLINK_BUILD_TIMEOUT_S,
+    )
+    assert "root//loop/a/l1 ->" in failure.stderr
+    assert "root//loop/b/l2 ->" in failure.stderr
+
+
+@buck_test()
+async def test_source_symlink_chain_that_grows(buck: Buck) -> None:
+    # Resolving `a/l` goes `deep/er/path` -> `a/l/path` -> `deep/er/path/path` -> ... forever.
+    setup_symlink(buck.cwd / "grow" / "a" / "l", Path("..") / "deep" / "er" / "path")
+    setup_symlink(buck.cwd / "grow" / "deep" / "er", Path("..") / "a" / "l")
+
+    await asyncio.wait_for(
+        expect_failure(
+            buck.build("//:grow"),
+            stderr_regex="Too many levels of symlinks while reading `root//grow/a/l`",
+        ),
+        timeout=SYMLINK_BUILD_TIMEOUT_S,
+    )

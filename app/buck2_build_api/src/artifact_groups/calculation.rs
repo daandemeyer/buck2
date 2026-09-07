@@ -188,6 +188,7 @@ fn ensure_source_artifact_staged<'a>(
                 dice,
                 Arc::new(source.get_path().to_cell_path()),
                 Some(source.get_path().package()),
+                Vec::new(),
             )
             .await?,
         ))
@@ -301,9 +302,13 @@ impl Key for DirArtifactValueKey {
                 // TODO(scottcao): This current creates a `DirArtifactValueKey` for each subdir of a source directory.
                 // Instead, this should be 1 key for the entire top-level directory since there's almost
                 // no chance of getting cache hit with a sub-directory.
-                let value =
-                    path_artifact_value(ctx, Arc::new(self.0.as_ref().join(&x.file_name)), None)
-                        .await?;
+                let value = path_artifact_value(
+                    ctx,
+                    Arc::new(self.0.as_ref().join(&x.file_name)),
+                    None,
+                    Vec::new(),
+                )
+                .await?;
                 buck2_error::Ok((x.file_name.clone(), value))
             }))
             .await
@@ -396,6 +401,8 @@ impl CycleAdapterDescriptor for DirArtifactCycleDescriptor {
 pub enum SourceSymlinkError {
     #[error("{}", display_symlink_cycle(.0))]
     Cycle(Vec<Arc<CellPath>>),
+    #[error("Too many levels of symlinks while reading `{0}`, gave up at `{1}`")]
+    TooManyLevels(Arc<CellPath>, Arc<CellPath>),
 }
 
 fn display_symlink_cycle(cycle: &[Arc<CellPath>]) -> String {
@@ -423,11 +430,16 @@ async fn dir_artifact_value(
     ctx.compute(&DirArtifactValueKey(cell_path)).await?.dupe()
 }
 
+/// Symlink chains longer than this are treated as loops, like the kernel's `MAXSYMLINKS`.
+const MAX_SYMLINK_HOPS: usize = 40;
+
 #[async_recursion]
 async fn path_artifact_value(
     ctx: &mut DiceComputations<'_>,
     cell_path: Arc<CellPath>,
     label: Option<PackageLabel>,
+    // Paths already passed through by following symlinks to get to `cell_path`.
+    mut followed: Vec<Arc<CellPath>>,
 ) -> buck2_error::Result<ArtifactValue> {
     let raw = match DiceFileComputations::read_path_metadata(ctx, cell_path.as_ref().as_ref()).await
     {
@@ -487,8 +499,17 @@ async fn path_artifact_value(
                 }
             }
 
-            // TODO (T126181780): This should have a limit on recursion.
-            let target_artifact_value = path_artifact_value(ctx, target.dupe(), label).await?;
+            followed.push(cell_path.dupe());
+            if let Some(start) = followed.iter().position(|p| *p == target) {
+                return Err(SourceSymlinkError::Cycle(followed.split_off(start)).into());
+            }
+            if followed.len() > MAX_SYMLINK_HOPS {
+                return Err(
+                    SourceSymlinkError::TooManyLevels(followed[0].dupe(), cell_path).into(),
+                );
+            }
+            let target_artifact_value =
+                path_artifact_value(ctx, target.dupe(), label, followed).await?;
             let root_cell = ctx.get_cell_resolver().await?.root_cell();
             let use_correct_source_symlink_reading = ctx
                 .parse_legacy_config_property(

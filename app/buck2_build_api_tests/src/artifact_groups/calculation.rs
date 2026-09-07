@@ -403,3 +403,60 @@ async fn test_source_dir_symlink_cycle_is_an_error() -> buck2_error::Result<()> 
     assert!(err.contains("root//pkg/b ->"), "{err}");
     Ok(())
 }
+
+#[tokio::test]
+async fn test_source_symlink_loop_is_an_error() -> buck2_error::Result<()> {
+    let _stack_guard = buck2_util::threads::ignore_stack_overflow_checks_for_current_thread();
+    let files = TestFileOps::new_with_files_and_symlinks(
+        btreemap![],
+        btreemap![
+            CellPath::testing_new("root//pkg/a/l1") => RelativePathBuf::from("../b/l2"),
+            CellPath::testing_new("root//pkg/b/l2") => RelativePathBuf::from("../a/l1"),
+        ],
+    );
+    let fs = ProjectRootTemp::new()?;
+
+    // Without the hop tracking this recurses forever.
+    let err = tokio::time::timeout(
+        Duration::from_secs(120),
+        source_artifact_value(&files, &fs, "root//pkg/a", "l1", false),
+    )
+    .await
+    .expect("digest computation hung on a symlink loop")
+    .unwrap_err();
+
+    let err = format!("{err:#}");
+    assert!(err.contains("Symlink cycle detected"), "{err}");
+    assert!(err.contains("root//pkg/a/l1 ->"), "{err}");
+    assert!(err.contains("root//pkg/b/l2 ->"), "{err}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_source_symlink_chain_that_grows_is_an_error() -> buck2_error::Result<()> {
+    let _stack_guard = buck2_util::threads::ignore_stack_overflow_checks_for_current_thread();
+    // Resolving `a/l` goes `deep/er/path` -> `a/l/path` -> `deep/er/path/path` -> ... forever.
+    let files = TestFileOps::new_with_files_and_symlinks(
+        btreemap![],
+        btreemap![
+            CellPath::testing_new("root//pkg/a/l") => RelativePathBuf::from("../deep/er/path"),
+            CellPath::testing_new("root//pkg/deep/er") => RelativePathBuf::from("../a/l"),
+        ],
+    );
+    let fs = ProjectRootTemp::new()?;
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(120),
+        source_artifact_value(&files, &fs, "root//pkg/a", "l", false),
+    )
+    .await
+    .expect("digest computation hung on a growing symlink chain")
+    .unwrap_err();
+
+    let err = format!("{err:#}");
+    assert!(
+        err.contains("Too many levels of symlinks while reading `root//pkg/a/l`"),
+        "{err}"
+    );
+    Ok(())
+}
