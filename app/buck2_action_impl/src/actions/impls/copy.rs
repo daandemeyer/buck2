@@ -55,6 +55,8 @@ pub(crate) enum CopyMode {
     Copy {
         // Override the destination executable bit to +x (true) or -x (false)
         executable_bit_override: Option<bool>,
+        // Preserve relative symlink targets that resolve within a copied directory.
+        relative_symlinks: bool,
     },
     Symlink,
 }
@@ -189,12 +191,14 @@ impl Action for CopyAction {
             match self.copy {
                 CopyMode::Copy {
                     executable_bit_override,
+                    relative_symlinks,
                 } => {
                     builder.add_copied(
                         src_value,
                         src.as_ref(),
                         tmp_dest.as_ref(),
                         executable_bit_override,
+                        relative_symlinks,
                     )?;
                 }
                 CopyMode::Symlink => {
@@ -241,6 +245,7 @@ impl Action for CopyAction {
                         match self.copy {
                             CopyMode::Copy {
                                 executable_bit_override,
+                                ..
                             } => executable_bit_override,
                             CopyMode::Symlink => None,
                         },
