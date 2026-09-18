@@ -26,6 +26,13 @@ copy_source_dir(
 )
 
 copy_source_dir(
+    name = "mtimes_copy",
+    src = "relocatable",
+    preserve_mtimes = True,
+    relative_symlinks = True,
+)
+
+copy_source_dir(
     name = "default_copy",
     src = "relocatable",
 )

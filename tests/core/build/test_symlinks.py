@@ -217,6 +217,43 @@ async def test_source_dir_symlinks_to_ancestors(buck: Buck) -> None:
 
 
 @buck_test(skip_for_os=["windows"])
+async def test_copy_dir_preserve_mtimes(buck: Buck) -> None:
+    source = buck.cwd / "relocatable"
+    setup_symlink(source / "dir" / "link", Path("real"))
+    setup_symlink(source / "sub" / "up", Path(".."))
+
+    paths = [
+        Path("dir/real"),
+        Path("dir/link"),
+        Path("sub/up"),
+        Path("dir"),
+        Path("sub"),
+        Path("."),
+    ]
+    for i, path in enumerate(paths):
+        mtime_ns = (1_000_000_000 + i) * 1_000_000_000 + 123_456_789
+        os.utime(source / path, ns=(mtime_ns, mtime_ns), follow_symlinks=False)
+
+    def mtimes(root: Path) -> list[int]:
+        return [(root / path).lstat().st_mtime_ns for path in paths]
+
+    result = await asyncio.wait_for(
+        buck.build("//:mtimes_copy"), timeout=SYMLINK_BUILD_TIMEOUT_S
+    )
+    output = result.get_build_report().output_for_target("root//:mtimes_copy")
+    assert mtimes(output) == mtimes(source)
+
+    default_result = await asyncio.wait_for(
+        buck.build("//:default_copy"), timeout=SYMLINK_BUILD_TIMEOUT_S
+    )
+    default_output = default_result.get_build_report().output_for_target(
+        "root//:default_copy"
+    )
+    for default_mtime, source_mtime in zip(mtimes(default_output), mtimes(source)):
+        assert default_mtime != source_mtime
+
+
+@buck_test(skip_for_os=["windows"])
 async def test_copy_dir_relative_symlinks_are_relocatable(buck: Buck) -> None:
     source = buck.cwd / "relocatable"
     setup_symlink(source / "dir" / "link", Path("real"))
