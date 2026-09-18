@@ -1283,6 +1283,7 @@ async fn test_a_copy_of_buck_out_content_is_nothing_to_the_core() -> buck2_error
                 dest.clone(),
                 leaf(&file("S")),
                 None,
+                false,
             )],
         )
         .await?;
@@ -1333,12 +1334,14 @@ async fn test_a_copy_from_outside_buck_out_enters_the_store() -> buck2_error::Re
                     a.clone(),
                     leaf(&file("A")),
                     None,
+                    false,
                 ),
                 CopiedArtifact::new(
                     src.clone(),
                     b.clone(),
                     leaf(&file("copied from a source")),
                     None,
+                    false,
                 ),
             ],
         )
@@ -1360,6 +1363,7 @@ async fn test_a_copy_from_outside_buck_out_enters_the_store() -> buck2_error::Re
                 dest.clone(),
                 leaf(&file("copied from a source")),
                 None,
+                false,
             )],
         )
         .await?;
@@ -1367,7 +1371,13 @@ async fn test_a_copy_from_outside_buck_out_enters_the_store() -> buck2_error::Re
             dm.declare_copy_impl(
                 dest.clone(),
                 file("claimed"),
-                vec![CopiedArtifact::new(src, dest, leaf(&file("claimed")), None)],
+                vec![CopiedArtifact::new(
+                    src,
+                    dest,
+                    leaf(&file("claimed")),
+                    None,
+                    false,
+                )],
             )
             .await
             .is_err()

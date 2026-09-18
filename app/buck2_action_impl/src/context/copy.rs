@@ -70,6 +70,7 @@ fn create_assembled_dir_tree<'v>(
                 CopyMode::Copy {
                     executable_bit_override: None,
                     relative_symlinks: false,
+                    preserve_mtimes: false,
                 }
             } else {
                 CopyMode::Symlink
@@ -142,6 +143,7 @@ pub(crate) fn analysis_actions_methods_copy(methods: &mut MethodsBuilder) {
             CopyMode::Copy {
                 executable_bit_override: executable_bit_override.into_option(),
                 relative_symlinks: false,
+                preserve_mtimes: false,
             },
             OutputType::FileOrDirectory,
             has_content_based_path.into_option(),
@@ -177,6 +179,10 @@ pub(crate) fn analysis_actions_methods_copy(methods: &mut MethodsBuilder) {
     ///   directory keep their original targets, making the copied tree relocatable. Symlinks whose
     ///   targets escape the source directory keep pointing at the resolved source location and are
     ///   not relocatable, as in the default behavior. Defaults to `False`.
+    /// * `preserve_mtimes`: if true, the copied files, directories and symlinks keep the
+    ///   modification times of the source. This only holds for the local copy: modification times
+    ///   are not part of an artifact, so they are lost wherever the output is uploaded to or
+    ///   downloaded from remote execution. Defaults to `False`.
     fn copy_dir<'v>(
         this: &AnalysisActions<'v>,
         #[starlark(require = pos)] dest: OutputArtifactArg<'v>,
@@ -184,6 +190,7 @@ pub(crate) fn analysis_actions_methods_copy(methods: &mut MethodsBuilder) {
         #[starlark(require = named, default = NoneOr::None)] has_content_based_path: NoneOr<bool>,
         #[starlark(require = named, default = NoneOr::None)] executable_bit_override: NoneOr<bool>,
         #[starlark(require = named, default = false)] relative_symlinks: bool,
+        #[starlark(require = named, default = false)] preserve_mtimes: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<ValueTyped<'v, StarlarkDeclaredArtifact<'v>>> {
         Ok(copy_file_impl(
@@ -194,6 +201,7 @@ pub(crate) fn analysis_actions_methods_copy(methods: &mut MethodsBuilder) {
             CopyMode::Copy {
                 executable_bit_override: executable_bit_override.into_option(),
                 relative_symlinks,
+                preserve_mtimes,
             },
             OutputType::Directory,
             has_content_based_path.into_option(),
@@ -237,6 +245,7 @@ pub(crate) fn analysis_actions_methods_copy(methods: &mut MethodsBuilder) {
             CopyMode::Copy {
                 executable_bit_override: executable_bit_override.into_option(),
                 relative_symlinks: false,
+                preserve_mtimes: false,
             },
             has_content_based_path.into_option(),
         )?)
