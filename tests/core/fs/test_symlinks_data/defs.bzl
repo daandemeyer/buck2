@@ -105,25 +105,24 @@ copy_tree = rule(
 )
 
 def _copy_source_dir_impl(ctx: AnalysisContext):
+    # Exercise the defaults by omitting the options entirely.
+    kwargs = {}
     if ctx.attrs.relative_symlinks:
-        copied = ctx.actions.copy_dir(
-            ctx.label.name,
-            ctx.attrs.src,
-            has_content_based_path = False,
-            relative_symlinks = True,
-        )
-    else:
-        # Exercise the default by omitting `relative_symlinks` entirely.
-        copied = ctx.actions.copy_dir(
-            ctx.label.name,
-            ctx.attrs.src,
-            has_content_based_path = False,
-        )
+        kwargs["relative_symlinks"] = True
+    if ctx.attrs.preserve_mtimes:
+        kwargs["preserve_mtimes"] = True
+    copied = ctx.actions.copy_dir(
+        ctx.label.name,
+        ctx.attrs.src,
+        has_content_based_path = False,
+        **kwargs
+    )
     return [DefaultInfo(default_output = copied)]
 
 copy_source_dir = rule(
     impl = _copy_source_dir_impl,
     attrs = {
+        "preserve_mtimes": attrs.bool(default = False),
         "relative_symlinks": attrs.bool(default = False),
         "src": attrs.source(allow_directory = True),
     },

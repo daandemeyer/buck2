@@ -60,6 +60,8 @@ pub(crate) enum CopyMode {
         executable_bit_override: Option<bool>,
         // Preserve relative symlink targets that resolve within a copied directory.
         relative_symlinks: bool,
+        // Carry the modification times of the source over to the copy.
+        preserve_mtimes: bool,
     },
     Symlink,
 }
@@ -195,6 +197,7 @@ impl Action for CopyAction {
                 CopyMode::Copy {
                     executable_bit_override,
                     relative_symlinks,
+                    ..
                 } => {
                     builder.add_copied(
                         src_value,
@@ -224,18 +227,27 @@ impl Action for CopyAction {
         // A source file's content is not known to be in the CAS: the probe a write makes spares
         // copying it when the CAS has it, and the rest comes to be as a write's miss does
         // (`produce`). A build artifact's content is the materializer's already, and a symlink
-        // copies nothing; both are declared, which is nothing to the disk-state core.
+        // copies nothing; both are declared, which is nothing to the disk-state core. The
+        // materializer downloads content declared from the CAS, and the downloaded files get the
+        // time of the download. A copy that preserves mtimes therefore skips the probe and makes
+        // the copy here.
         let source_copy = match self.copy {
             CopyMode::Copy {
                 executable_bit_override,
+                preserve_mtimes,
                 ..
-            } if input.is_source() => Some(executable_bit_override),
+            } if input.is_source() => Some((executable_bit_override, preserve_mtimes)),
             _ => None,
         };
         let (execution_kind, declare) = match source_copy {
-            Some(executable_bit_override) => {
-                let files = cas_probe::files_of(value.entry(), &src);
-                match cas_probe::missing(ctx, &files).await {
+            Some((executable_bit_override, preserve_mtimes)) => {
+                let probed = if preserve_mtimes {
+                    None
+                } else {
+                    let files = cas_probe::files_of(value.entry(), &src);
+                    cas_probe::missing(ctx, &files).await
+                };
+                match probed {
                     Some((info, missing)) if missing.is_empty() => {
                         ctx.materializer()
                             .declare_cas_many(
@@ -256,6 +268,7 @@ impl Action for CopyAction {
                                 dest: dest.clone(),
                                 value: value.dupe(),
                                 executable_bit_override,
+                                preserve_mtimes,
                             }],
                             probed.is_some(),
                         )
@@ -287,6 +300,13 @@ impl Action for CopyAction {
                             } => executable_bit_override,
                             CopyMode::Symlink => None,
                         },
+                        matches!(
+                            self.copy,
+                            CopyMode::Copy {
+                                preserve_mtimes: true,
+                                ..
+                            }
+                        ),
                     )],
                 )
                 .await?;
