@@ -580,6 +580,8 @@ pub struct CopiedArtifact {
     pub dest_entry: ActionDirectoryEntry<ActionImmutableDirectory>,
     // Override the destination executable bit to +x (true) or -x (false)
     pub executable_bit_override: Option<bool>,
+    /// Carry the modification times of `src` over to `dest`.
+    pub preserve_mtimes: bool,
 }
 
 impl CopiedArtifact {
@@ -588,12 +590,14 @@ impl CopiedArtifact {
         dest: ProjectRelativePathBuf,
         dest_entry: ActionDirectoryEntry<ActionImmutableDirectory>,
         executable_bit_override: Option<bool>,
+        preserve_mtimes: bool,
     ) -> Self {
         Self {
             src,
             dest,
             dest_entry,
             executable_bit_override,
+            preserve_mtimes,
         }
     }
 }

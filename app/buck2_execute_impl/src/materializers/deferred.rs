@@ -680,6 +680,7 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
                     dest.clone(),
                     value.entry().dupe().map_dir(|d| d.as_immutable()),
                     None,
+                    false,
                 )],
             )
             .await?;
