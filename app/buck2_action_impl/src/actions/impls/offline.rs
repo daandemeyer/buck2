@@ -108,7 +108,7 @@ async fn declare_copy_materialization(
         .declare_copy(
             dest.clone(),
             value,
-            vec![CopiedArtifact::new(src, dest, immutable_entry, None)],
+            vec![CopiedArtifact::new(src, dest, immutable_entry, None, false)],
         )
         .await
 }
