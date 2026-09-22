@@ -365,6 +365,26 @@ pub fn copy<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(from: P, to: Q) -> Result<u64,
     })
 }
 
+pub fn hard_link<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(
+    original: P,
+    link: Q,
+) -> Result<(), IoError> {
+    let _guard = IoCounterKey::Hardlink.guard();
+    let original = original.as_ref();
+    let link = link.as_ref();
+    with_retries(|| fs::hard_link(original.as_maybe_relativized(), link.as_maybe_relativized()))
+        .map_err(|e| {
+            IoError::new(e)
+                .context(format!(
+                    "hard_link(original={}, link={})",
+                    original.display(),
+                    link.display()
+                ))
+                .check_eden(original)
+                .check_eden(link)
+        })
+}
+
 pub fn read_link<P: AsRef<AbsPath>>(path: P) -> Result<PathBuf, IoError> {
     let _guard = IoCounterKey::ReadLink.guard();
     with_retries(|| fs::read_link(path.as_ref().as_maybe_relativized()))
