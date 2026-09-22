@@ -1052,7 +1052,8 @@ impl LocalExecutor {
                 dest: hashed_path,
                 dest_entry: value.entry().dupe().map_dir(|d| d.as_immutable()),
                 executable_bit_override: None,
-                preserve_mtimes: false,
+                // The action set these, and its output should not change by being relocated.
+                preserve_mtimes: true,
             }],
         ));
         Ok(())
