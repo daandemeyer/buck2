@@ -27,6 +27,10 @@ os.makedirs(root, exist_ok=True)
 with open(os.path.join(root, "target"), "w") as f:
     f.write("contents")
 os.symlink("target", os.path.join(root, "profile"))
+os.makedirs(os.path.join(root, "sub"))
+for i, name in enumerate(["target", "profile", "sub", "."]):
+    t = 1_000_000_000 + i
+    os.utime(os.path.join(root, name), (t, t), follow_symlinks=False)
 """
 
 def _projected_symlink_output_impl(ctx):
