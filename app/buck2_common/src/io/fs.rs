@@ -18,7 +18,6 @@ use async_trait::async_trait;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_error::BuckErrorContext;
-use buck2_error::BuckErrorOptionContext;
 use buck2_fs::IoResultExt;
 use buck2_fs::async_fs_util::spawn_blocking;
 use buck2_fs::fs_util;
@@ -268,7 +267,12 @@ fn read_path_metadata<P: AsRef<AbsPath>>(
     }
 
     // If we get here that means we never hit a symlink. So, the metadata we have
-    let meta = meta.internal_error("Attempted to access empty path")?;
+    let meta = match meta {
+        Some(meta) => meta,
+        // An empty `relpath` names `root` itself, and the loop above did not stat it. A symlink
+        // at `root` is not a symlink inside the project, so follow it.
+        None => fs_util::metadata(root).categorize_internal()?,
+    };
     let meta = convert_metadata(&curr, meta, file_digest_config)?;
 
     if cfg!(test) {
@@ -446,6 +450,22 @@ mod tests {
                 FileDigestConfig::source(CasDigestConfig::testing_default())
             ),
             Ok(Some(RawPathMetadata::File(..)))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_root() -> buck2_error::Result<()> {
+        let t = TempDir::new()?;
+
+        assert_matches!(
+            read_path_metadata(
+                AbsPath::new(t.path())?,
+                ForwardRelativePath::empty(),
+                FileDigestConfig::source(CasDigestConfig::testing_default())
+            ),
+            Ok(Some(RawPathMetadata::Directory))
         );
 
         Ok(())
