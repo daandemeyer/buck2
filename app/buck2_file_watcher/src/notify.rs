@@ -290,14 +290,20 @@ impl NotifyFileWatcher {
         let data = Arc::new(Mutex::new(Ok(NotifyFileData::new())));
         let data2 = data.dupe();
         let root2 = root.dupe();
-        let mut watcher = notify::recommended_watcher(move |event| {
-            let mut guard = data2.lock().unwrap();
-            if let Ok(state) = &mut *guard {
-                if let Err(e) = state.process(event, &root2, &cells, &ignore_specs) {
-                    *guard = Err(e);
+        let mut watcher = RecommendedWatcher::new(
+            move |event| {
+                let mut guard = data2.lock().unwrap();
+                if let Ok(state) = &mut *guard {
+                    if let Err(e) = state.process(event, &root2, &cells, &ignore_specs) {
+                        *guard = Err(e);
+                    }
                 }
-            }
-        })
+            },
+            // No access events, which `ignore_event_kind` drops anyway. With inotify, every
+            // directory the registration walk reads queues some, so on a large tree the walk alone
+            // overflows the kernel queue, and the next command starts over.
+            notify::Config::default().with_event_kinds(notify::EventKindMask::CORE),
+        )
         .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::NotifyWatcher))?;
         watcher
             .watch(root.root().as_path(), notify::RecursiveMode::Recursive)
@@ -439,5 +445,80 @@ mod tests {
         );
         assert!(!stats.fresh_instance);
         assert!(stats.incomplete_events_reason.is_none());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    #[cfg(target_os = "linux")]
+    use std::fs;
+    #[cfg(target_os = "linux")]
+    use std::thread::sleep;
+    #[cfg(target_os = "linux")]
+    use std::time::Duration;
+    #[cfg(target_os = "linux")]
+    use std::time::Instant;
+
+    #[cfg(target_os = "linux")]
+    use buck2_core::cells::cell_root_path::CellRootPathBuf;
+    #[cfg(target_os = "linux")]
+    use buck2_fs::fs_util::uncategorized as fs_util;
+    #[cfg(target_os = "linux")]
+    use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
+
+    #[cfg(target_os = "linux")]
+    use super::*;
+
+    /// Wait for the inotify thread to catch up with what the test did.
+    #[cfg(target_os = "linux")]
+    fn wait_for(watcher: &NotifyFileWatcher, done: impl Fn(&NotifyFileData) -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(data) = &*watcher.data.lock().unwrap() {
+                if done(data) {
+                    return true;
+                }
+            }
+            sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// Reading the tree, as registering it does for every directory, must not queue events: on a
+    /// large tree they overflow the kernel queue, and the next command starts over.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reading_the_tree_queues_no_events() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let project = tempdir.path();
+        fs::create_dir(project.join("dir")).unwrap();
+        fs::write(project.join("dir").join("file"), "x").unwrap();
+
+        let root = ProjectRoot::new(
+            fs_util::canonicalize(AbsNormPathBuf::new(project.to_owned()).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let cells = CellResolver::testing_with_name_and_path(
+            CellName::testing_new("root"),
+            CellRootPathBuf::testing_new(""),
+        );
+        let watcher = NotifyFileWatcher::new(&root, cells, StdBuckHashMap::default()).unwrap();
+
+        fs::read_dir(project.join("dir")).unwrap().for_each(drop);
+        fs::read(project.join("dir").join("file")).unwrap();
+        // inotify delivers in order, so once this change is seen, so is whatever the reads queued.
+        fs::write(project.join("sentinel"), "x").unwrap();
+        assert!(
+            wait_for(&watcher, |data| data
+                .events
+                .iter()
+                .any(|(path, _)| path.to_string().ends_with("sentinel"))),
+            "expected the sentinel to be seen"
+        );
+        let ignored = match &*watcher.data.lock().unwrap() {
+            Ok(data) => data.ignored,
+            Err(e) => panic!("the watcher failed: {e:?}"),
+        };
+        assert_eq!(0, ignored, "expected reading the tree to queue no events");
     }
 }
