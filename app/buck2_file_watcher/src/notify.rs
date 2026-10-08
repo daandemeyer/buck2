@@ -50,8 +50,12 @@ use crate::stats::FileWatcherStats;
 fn ignore_event_kind(event_kind: EventKind) -> bool {
     match event_kind {
         EventKind::Access(_) => true,
-        EventKind::Modify(ModifyKind::Metadata(MetadataKind::Ownership))
-        | EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions)) => false,
+        // inotify, FSEvents and kqueue report a chmod as `MetadataKind::Any`, never as
+        // `MetadataKind::Permissions`. Ignoring `MetadataKind::Any` would make buck keep using the
+        // old executable bit of a file after a chmod.
+        EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::Any | MetadataKind::Ownership | MetadataKind::Permissions,
+        )) => false,
         EventKind::Modify(ModifyKind::Metadata(_)) => true,
         _ => false,
     }
@@ -453,6 +457,8 @@ mod unix_tests {
     #[cfg(target_os = "linux")]
     use std::fs;
     #[cfg(target_os = "linux")]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "linux")]
     use std::thread::sleep;
     #[cfg(target_os = "linux")]
     use std::time::Duration;
@@ -482,6 +488,34 @@ mod unix_tests {
             sleep(Duration::from_millis(50));
         }
         false
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn chmod_is_seen() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let project = tempdir.path();
+        let script = project.join("script");
+        fs::write(&script, "x").unwrap();
+
+        let root = ProjectRoot::new(
+            fs_util::canonicalize(AbsNormPathBuf::new(project.to_owned()).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let cells = CellResolver::testing_with_name_and_path(
+            CellName::testing_new("root"),
+            CellRootPathBuf::testing_new(""),
+        );
+        let watcher = NotifyFileWatcher::new(&root, cells, StdBuckHashMap::default()).unwrap();
+
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            wait_for(&watcher, |data| data
+                .events
+                .iter()
+                .any(|(path, _)| path.to_string().ends_with("script"))),
+            "expected the chmod to be seen"
+        );
     }
 
     /// Reading the tree, as registering it does for every directory, must not queue events: on a
