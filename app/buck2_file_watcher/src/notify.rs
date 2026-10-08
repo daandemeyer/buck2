@@ -449,8 +449,8 @@ impl NotifyFileWatcher {
         let root = registration.root.dupe();
         let cells = registration.cells.dupe();
         let ignore_specs = registration.ignore_specs.clone();
-        let mut watcher =
-            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let mut watcher = RecommendedWatcher::new(
+            move |event: notify::Result<notify::Event>| {
                 // A path we already know we cannot watch is not news, and reacting to it again would
                 // make every command drop DICE for as long as it exists.
                 if let Err(e) = &event {
@@ -467,8 +467,13 @@ impl NotifyFileWatcher {
                         *guard = Err(e);
                     }
                 }
-            })
-            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::NotifyWatcher))?;
+            },
+            // No access events, which `ignore_event_kind` drops anyway. With inotify, every
+            // directory the registration walk reads queues some, so on a large tree the walk alone
+            // overflows the kernel queue, and the next command starts over and registers again.
+            notify::Config::default().with_event_kinds(notify::EventKindMask::CORE),
+        )
+        .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::NotifyWatcher))?;
         watcher
             .watch_filtered(
                 registration.root.root().as_path(),
@@ -797,6 +802,44 @@ mod unix_tests {
                 .any(|(path, _)| path.to_string().ends_with("file"))),
             "expected a change under the sibling of the unwatchable directory to be seen"
         );
+    }
+
+    /// Reading the tree, as registering it does for every directory, must not queue events: on a
+    /// large tree they overflow the kernel queue, and the next command starts over.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reading_the_tree_queues_no_events() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let project = tempdir.path();
+        fs::create_dir(project.join("dir")).unwrap();
+        fs::write(project.join("dir").join("file"), "x").unwrap();
+
+        let root = ProjectRoot::new(
+            fs_util::canonicalize(AbsNormPathBuf::new(project.to_owned()).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let cells = CellResolver::testing_with_name_and_path(
+            CellName::testing_new("root"),
+            CellRootPathBuf::testing_new(""),
+        );
+        let watcher = NotifyFileWatcher::new(&root, cells, StdBuckHashMap::default()).unwrap();
+
+        fs::read_dir(project.join("dir")).unwrap().for_each(drop);
+        fs::read(project.join("dir").join("file")).unwrap();
+        // inotify delivers in order, so once this change is seen, so is whatever the reads queued.
+        fs::write(project.join("sentinel"), "x").unwrap();
+        assert!(
+            wait_for(&watcher, |data| data
+                .events
+                .iter()
+                .any(|(path, _)| path.to_string().ends_with("sentinel"))),
+            "expected the sentinel to be seen"
+        );
+        let ignored = match &*watcher.data.lock().unwrap() {
+            Ok(data) => data.ignored,
+            Err(e) => panic!("the watcher failed: {e:?}"),
+        };
+        assert_eq!(0, ignored, "expected reading the tree to queue no events");
     }
 
     #[test]
