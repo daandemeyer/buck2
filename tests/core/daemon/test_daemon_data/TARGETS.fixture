@@ -1,4 +1,4 @@
-load(":defs.bzl", "generation", "long_running", "pwd_run", "tenant_value")
+load(":defs.bzl", "generation", "long_running", "nested_buck", "pwd_run", "tenant_value")
 
 trivial_build(name = "rule")
 
@@ -20,3 +20,5 @@ pwd_run(name = "pwd_run")
 platform(name = "platform")
 execution_platform(name = "exec_platform", platform = ":platform", local_enabled = True)
 execution_platforms(name = "platforms", platforms = [":exec_platform"])
+
+nested_buck(name = "nested_buck")
