@@ -2592,3 +2592,76 @@ bool_cases! { [buck, tmp_path] checkouts_share_daemon {
     #[buck_test(skip_for_os = ["darwin", "windows"], env = [("BUCK2_SHARE_DAEMON", "true")])]
     fn test_checkouts_share_daemon_True_True(true, true);
 }}
+
+#[buck_test]
+async fn test_no_buckd_invocations_serialize(buck: &Buck, tmp_path: &Path) -> anyhow::Result<()> {
+    // Two daemonless builds share a daemon directory. The second must wait while the first
+    // runs an action, then acquire the slot after the first process is killed.
+    let event_log = tmp_path.join("first.json-lines");
+    let mut first = buck
+        .build(&[
+            ":long_running",
+            "--no-buckd",
+            "--local-only",
+            "--no-remote-cache",
+            "--event-log",
+            path_str(&event_log),
+        ])
+        .spawn();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            assert!(
+                first.try_wait().is_none(),
+                "the first build died before its action ran"
+            );
+            if std::fs::read_to_string(&event_log)
+                .is_ok_and(|log| log.contains("\"ActionExecution\""))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await?;
+
+    // The waiting invocation must leave the first process running until the slot is released.
+    let second = buck
+        .build(&[":rule", "--no-buckd", "--local-only", "--no-remote-cache"])
+        .spawn();
+    let second = second.wait();
+    tokio::pin!(second);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), &mut second)
+            .await
+            .is_err()
+    );
+    assert!(
+        first.try_wait().is_none(),
+        "the second build killed the first"
+    );
+    let _outcome = first.kill().await;
+    let result = tokio::time::timeout(Duration::from_secs(120), second).await??;
+    assert!(result.stderr.contains("waiting for it to finish"));
+    Ok(())
+}
+
+#[buck_test(skip_for_os = ["windows"])]
+async fn test_no_buckd_run_frees_the_slot_for_the_target(buck: &Buck) -> anyhow::Result<()> {
+    // A daemonless run target starts a nested daemonless build. Replacing the client with
+    // the target must release the slot before the nested invocation tries to acquire it.
+    let result = buck
+        .run(&[
+            ":nested_run",
+            "--no-buckd",
+            "-c",
+            &format!("nested.buck2_path={}", buck.executable().display()),
+            "-c",
+            &format!(
+                "nested.isolation_dir={}",
+                buck.isolation_prefix().unwrap_or("v2")
+            ),
+        ])
+        .await?;
+    assert!(!result.stderr.contains("waiting for it to finish"));
+    Ok(())
+}
