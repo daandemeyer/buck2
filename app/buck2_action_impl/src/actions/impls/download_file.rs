@@ -46,6 +46,7 @@ use buck2_execute::materialize::materializer::CasDownloadInfo;
 use buck2_execute::materialize::materializer::DeclareArtifactPayload;
 use buck2_execute::materialize::materializer::DeclareMatchOutcome;
 use buck2_execute::re::presence::NegativeCache;
+use buck2_fs::fs_util;
 use buck2_hash::BuckMutInsertionSet;
 use buck2_http::HttpClient;
 use dupe::Dupe;
@@ -344,18 +345,24 @@ impl DownloadFileAction {
             None => ctx.fs().resolve_build(self.output().get_path(), None)?,
         };
 
-        // Whatever is at the path is stale or untracked; the `declare_existing` below replaces
-        // the materializer's record of it, so the disk has to be cleared to match. The lease is
-        // held until that report is in.
         let output_lease = materializer.prepare_outputs(vec![path.clone()]).await?;
-        ctx.blocking_executor()
-            .execute_io(
-                Box::new(CleanOutputPaths {
-                    paths: vec![path.clone()],
-                }),
-                ctx.cancellation_context(),
-            )
-            .await?;
+        // Another configuration may be reading a completed download at the content-based path.
+        // `http_download` replaces regular files atomically, so only clear obstructions.
+        let dest = ctx.fs().fs().resolve(&path);
+        let obstructed = match fs_util::symlink_metadata_if_exists(&dest) {
+            Ok(metadata) => metadata.is_some_and(|metadata| !metadata.is_file()),
+            Err(_) => true,
+        };
+        if obstructed {
+            ctx.blocking_executor()
+                .execute_io(
+                    Box::new(CleanOutputPaths {
+                        paths: vec![path.clone()],
+                    }),
+                    ctx.cancellation_context(),
+                )
+                .await?;
+        }
 
         let digest = http_download(
             client,
