@@ -596,6 +596,7 @@ impl BuckdServer {
             // debug commands opt out (see `triggers_idle_page_out`).
             let triggers_idle_page_out = command.triggers_idle_page_out();
             let prevents_background_cleanup = command.prevents_background_cleanup();
+            let runs_startup_cleanup = command.runs_startup_cleanup();
             if triggers_idle_page_out {
                 cancel_active_page_out();
             }
@@ -707,7 +708,11 @@ impl BuckdServer {
                 move |cancellations| {
                     async move {
                         let _background_cleanup_guard = if prevents_background_cleanup {
-                            Some(repo.materializer.prevent_background_cleanup().await)
+                            Some(
+                                repo.materializer
+                                    .prevent_background_cleanup(runs_startup_cleanup)
+                                    .await,
+                            )
                         } else {
                             None
                         };
@@ -2006,6 +2011,13 @@ trait StreamingCommandOptions<Req>: OneshotCommandOptions {
     fn prevents_background_cleanup(&self) -> bool {
         true
     }
+
+    /// Whether this command starts the `buck2.clean_stale_on_startup` cleanup when it is the
+    /// first one to prevent background cleanup. Only applies if `prevents_background_cleanup`
+    /// is true.
+    fn runs_startup_cleanup(&self) -> bool {
+        true
+    }
 }
 
 /// A streaming command with its request, result and partial result types erased.
@@ -2024,6 +2036,8 @@ trait ErasedStreamingCommand: Send + 'static {
     fn triggers_idle_page_out(&self) -> bool;
 
     fn prevents_background_cleanup(&self) -> bool;
+
+    fn runs_startup_cleanup(&self) -> bool;
 
     fn starlark_profiler_configuration(
         &self,
@@ -2079,6 +2093,10 @@ where
 
     fn prevents_background_cleanup(&self) -> bool {
         self.opts.prevents_background_cleanup()
+    }
+
+    fn runs_startup_cleanup(&self) -> bool {
+        self.opts.runs_startup_cleanup()
     }
 
     fn starlark_profiler_configuration(
@@ -2327,6 +2345,12 @@ impl OneshotCommandOptions for CleanStaleCommandOptions {}
 impl<Req> StreamingCommandOptions<Req> for CleanStaleCommandOptions {
     fn daemon_activity(&self) -> DaemonActivity {
         DaemonActivity::CleanStale
+    }
+
+    /// A startup cleanup deletes artifacts before `clean --stale --dry-run` reports them. It also
+    /// ignores `--keep-since-time` and `--tracked-only`.
+    fn runs_startup_cleanup(&self) -> bool {
+        false
     }
 }
 

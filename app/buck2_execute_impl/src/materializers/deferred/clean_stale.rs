@@ -61,6 +61,7 @@ use jiff::Timestamp;
 use tokio::sync::oneshot::Sender;
 
 use crate::materializers::deferred::ArtifactMaterializationStage;
+use crate::materializers::deferred::BackgroundCleanupRunGuard;
 use crate::materializers::deferred::DeferredMaterializerCommandProcessor;
 use crate::materializers::deferred::DeferredMaterializerStats;
 use crate::materializers::deferred::LowPriorityMaterializerCommand;
@@ -278,24 +279,30 @@ pub(crate) fn resolve_clean_stale_params(
             }),
         ),
         LowDiskCleanMode::Fixed(duration) => {
-            let Some(root_abs_path) = root_abs_path else {
-                return (default_ttl, None);
-            };
-            let disk_stats = match disk_space_stats(root_abs_path) {
-                Ok(stats) => stats,
-                Err(e) => {
-                    let _unused = soft_error!("disk_space_stats", e);
-                    return (default_ttl, None);
-                }
-            };
-            let free_pct = disk_stats.free_space as f64 / disk_stats.total_space as f64 * 100.0;
-            if free_pct > cfg.threshold_percent {
-                (default_ttl, None)
-            } else {
+            if is_low_disk(root_abs_path, cfg.threshold_percent) == Some(true) {
                 (*duration, None)
+            } else {
+                (default_ttl, None)
             }
         }
     }
+}
+
+/// Returns whether free space on `root_abs_path` is at or below `threshold_percent`, or `None` if
+/// the free space is unknown.
+pub(crate) fn is_low_disk(
+    root_abs_path: Option<&AbsPathBuf>,
+    threshold_percent: f64,
+) -> Option<bool> {
+    let disk_stats = match disk_space_stats(root_abs_path?) {
+        Ok(stats) => stats,
+        Err(e) => {
+            let _unused = soft_error!("disk_space_stats", e);
+            return None;
+        }
+    };
+    let free_pct = disk_stats.free_space as f64 / disk_stats.total_space as f64 * 100.0;
+    Some(free_pct <= threshold_percent)
 }
 
 #[derive(Derivative)]
@@ -539,6 +546,47 @@ impl<T: IoHandler> ExtensionCommand<T> for FinishUnmaterializationUpload {
     }
 }
 
+/// The first command that prevents background cleanup sends `StartupCleanStaleCommand`. Other
+/// commands wait until `run_guard` is dropped, so they don't interrupt the clean.
+#[derive(Derivative)]
+#[derivative(Debug)]
+pub(super) struct StartupCleanStaleCommand {
+    #[derivative(Debug = "ignore")]
+    pub run_guard: BackgroundCleanupRunGuard,
+}
+
+impl<T: IoHandler> ExtensionCommand<T> for StartupCleanStaleCommand {
+    fn execute(self: Box<Self>, processor: &mut DeferredMaterializerCommandProcessor<T>) {
+        let run_guard = self.run_guard;
+        if let Some(low_disk) = &processor.clean_stale_config.low_disk
+            && is_low_disk(
+                processor.root_abs_path.as_deref(),
+                low_disk.threshold_percent,
+            ) != Some(true)
+        {
+            return;
+        }
+        let dispatcher = get_dispatcher_opt().unwrap_or_else(|| processor.daemon_dispatcher.dupe());
+        let cmd = processor.configured_clean_stale_command(
+            dispatcher.dupe(),
+            false,
+            false,
+            Trigger::Startup,
+        );
+        let trace_id = dispatcher.trace_id().clone();
+        let daemon_id = dispatcher.daemon_id().clone();
+        let clean = cmd.create_uninterruptible_clean_fut(processor, Some(trace_id), daemon_id);
+        // The clean runs in its own task, so it keeps running when the command that started it
+        // is cancelled.
+        processor.spawn(&dispatcher, async move {
+            if let Err(failure) = clean.await {
+                tracing::warn!("Startup clean stale failed: {:#}", failure.into_error());
+            }
+            drop(run_guard);
+        });
+    }
+}
+
 impl CleanStaleArtifactsCommand {
     pub(super) fn create_clean_fut<T: IoHandler>(
         &self,
@@ -546,13 +594,49 @@ impl CleanStaleArtifactsCommand {
         trace_id: Option<TraceId>,
         daemon_id: DaemonId,
     ) -> BoxFuture<'static, CleanOutcome> {
+        let (liveliness_observer, liveliness_guard) = LivelinessGuard::create_sync();
+        *processor.command_sender.clean_guard.write() = Some(liveliness_guard);
+        self.create_clean_fut_with_liveliness(
+            processor,
+            trace_id,
+            daemon_id,
+            liveliness_observer,
+            None,
+        )
+    }
+
+    fn create_uninterruptible_clean_fut<T: IoHandler>(
+        &self,
+        processor: &mut DeferredMaterializerCommandProcessor<T>,
+        trace_id: Option<TraceId>,
+        daemon_id: DaemonId,
+    ) -> BoxFuture<'static, CleanOutcome> {
+        let (liveliness_observer, liveliness_guard) = LivelinessGuard::create_sync();
+        self.create_clean_fut_with_liveliness(
+            processor,
+            trace_id,
+            daemon_id,
+            liveliness_observer,
+            Some(liveliness_guard),
+        )
+    }
+
+    fn create_clean_fut_with_liveliness<T: IoHandler>(
+        &self,
+        processor: &mut DeferredMaterializerCommandProcessor<T>,
+        trace_id: Option<TraceId>,
+        daemon_id: DaemonId,
+        liveliness_observer: Arc<dyn LivelinessObserverSync>,
+        liveliness_guard: Option<LivelinessGuard>,
+    ) -> BoxFuture<'static, CleanOutcome> {
         let start_time = Instant::now();
         let trigger = self.trigger;
         let policy_mode = self.policy_mode;
         let tracked_only = self.tracked_only;
-        let pending_result = self.create_pending_clean_result(processor);
+        let pending_result = self.create_pending_clean_result(processor, liveliness_observer);
         let dispatcher_dup = self.dispatcher.dupe();
         async move {
+            let _liveliness_guard = liveliness_guard;
             let result = match pending_result {
                 Ok(res) => match res {
                     PendingCleanResult::Finished(result) => Ok(result),
@@ -578,9 +662,8 @@ impl CleanStaleArtifactsCommand {
     fn create_pending_clean_result<T: IoHandler>(
         &self,
         processor: &mut DeferredMaterializerCommandProcessor<T>,
+        liveliness_observer: Arc<dyn LivelinessObserverSync>,
     ) -> Result<PendingCleanResult, CleanFailure> {
-        let (liveliness_observer, liveliness_guard) = LivelinessGuard::create_sync();
-        *processor.command_sender.clean_guard.write() = Some(liveliness_guard);
         let cleaning_version = processor.next_version();
         let stats = initial_stats(processor.stats.sizes());
         let adaptive_outcome = if self.adaptive_low_disk.is_some() {
@@ -2227,6 +2310,8 @@ pub(crate) fn apply_adaptive_low_disk(
 #[derive(Debug, Clone)]
 pub struct CleanStaleConfig {
     pub schedule: Option<CleanStaleSchedule>,
+    /// Whether the first command that prevents background cleanup runs a cleanup first.
+    pub on_startup: bool,
     pub artifact_ttl: Duration,
     pub dry_run: bool,
     pub low_disk: Option<LowDiskCleanConfig>,
@@ -2243,6 +2328,7 @@ impl Default for CleanStaleConfig {
     fn default() -> Self {
         Self {
             schedule: None,
+            on_startup: false,
             artifact_ttl: Duration::from_secs(DEFAULT_CLEAN_STALE_TTL_DAYS * 24 * 60 * 60),
             dry_run: false,
             low_disk: None,
@@ -2330,6 +2416,12 @@ impl CleanStaleConfig {
             .parse(BuckconfigKeyRef {
                 section: "buck2",
                 property: "clean_stale_enabled",
+            })?
+            .unwrap_or(false);
+        let on_startup = root_config
+            .parse(BuckconfigKeyRef {
+                section: "buck2",
+                property: "clean_stale_on_startup",
             })?
             .unwrap_or(false);
         let clean_stale_artifact_ttl_hours = root_config
@@ -2460,6 +2552,7 @@ impl CleanStaleConfig {
         };
         Ok(Self {
             schedule,
+            on_startup,
             artifact_ttl: duration_from_config_hours(
                 clean_stale_artifact_ttl_hours,
                 "clean_stale_artifact_ttl_hours",

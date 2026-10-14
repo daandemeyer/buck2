@@ -91,6 +91,7 @@ use tokio::sync::oneshot;
 use crate::materializers::deferred::artifact_tree::ArtifactTree;
 use crate::materializers::deferred::artifact_tree::Version;
 use crate::materializers::deferred::clean_stale::CleanStaleConfig;
+use crate::materializers::deferred::clean_stale::StartupCleanStaleCommand;
 use crate::materializers::deferred::command_processor::DeferredMaterializerCommandProcessor;
 use crate::materializers::deferred::command_processor::LowPriorityMaterializerCommand;
 use crate::materializers::deferred::command_processor::MaterializerCommand;
@@ -161,6 +162,7 @@ pub(crate) struct BackgroundCleanupGate {
 struct BackgroundCleanupGateState {
     prevention_guards: usize,
     cleanup_running: bool,
+    startup_cleanup_pending: bool,
 }
 
 pub(crate) struct BackgroundCleanupPreventionGuard {
@@ -199,6 +201,16 @@ impl Drop for BackgroundCleanupRunGuard {
 }
 
 impl BackgroundCleanupGate {
+    fn new(startup_cleanup_pending: bool) -> Self {
+        Self {
+            state: Mutex::new(BackgroundCleanupGateState {
+                startup_cleanup_pending,
+                ..Default::default()
+            }),
+            cleanup_finished: Notify::new(),
+        }
+    }
+
     pub(crate) fn register_prevention(self: &Arc<Self>) -> BackgroundCleanupPreventionGuard {
         self.state.lock().prevention_guards += 1;
         BackgroundCleanupPreventionGuard { gate: self.dupe() }
@@ -209,6 +221,19 @@ impl BackgroundCleanupGate {
         if state.prevention_guards != 0 || state.cleanup_running {
             return None;
         }
+        state.cleanup_running = true;
+        Some(BackgroundCleanupRunGuard { gate: self.dupe() })
+    }
+
+    /// The command that starts the startup cleanup holds a prevention guard itself.
+    /// `try_start_startup_cleanup` therefore ignores prevention guards, unlike
+    /// `try_start_cleanup`. Only the first call returns a guard.
+    fn try_start_startup_cleanup(self: &Arc<Self>) -> Option<BackgroundCleanupRunGuard> {
+        let mut state = self.state.lock();
+        if !state.startup_cleanup_pending || state.cleanup_running {
+            return None;
+        }
+        state.startup_cleanup_pending = false;
         state.cleanup_running = true;
         Some(BackgroundCleanupRunGuard { gate: self.dupe() })
     }
@@ -439,9 +464,23 @@ impl From<MaterializeEntryError> for SharedMaterializingError {
 
 #[async_trait]
 impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T> {
-    async fn prevent_background_cleanup(&self) -> MaterializerBackgroundCleanupGuard {
+    async fn prevent_background_cleanup(
+        &self,
+        run_startup_cleanup: bool,
+    ) -> MaterializerBackgroundCleanupGuard {
         let guard = self.background_cleanup_gate.register_prevention();
         self.command_sender.interrupt_clean();
+        guard.wait_for_cleanup().await;
+        if run_startup_cleanup
+            && let Some(run_guard) = self.background_cleanup_gate.try_start_startup_cleanup()
+        {
+            let _ignored = self.command_sender.send(MaterializerCommand::Extension(
+                Box::new(StartupCleanStaleCommand { run_guard }),
+                get_dispatcher_opt(),
+            ));
+        }
+        // Another command can start the startup cleanup after the first `wait_for_cleanup`
+        // returned. This command waits for that cleanup too.
         guard.wait_for_cleanup().await;
         MaterializerBackgroundCleanupGuard::new(guard)
     }
@@ -926,7 +965,9 @@ impl<T: IoHandler + Allocative> DeferredMaterializerAccessor<T> {
 
         let tree = ArtifactTree::initialize(sqlite_state);
 
-        let background_cleanup_gate = Arc::new(BackgroundCleanupGate::default());
+        let background_cleanup_gate = Arc::new(BackgroundCleanupGate::new(
+            configs.clean_stale_config.on_startup,
+        ));
         let command_processor = {
             let command_sender = command_sender.dupe();
             let rt = Handle::current();

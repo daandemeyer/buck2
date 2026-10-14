@@ -631,7 +631,12 @@ fn duplicate(error: &MaterializationError) -> MaterializationError {
 
 #[async_trait]
 impl<T: IoHandler + Allocative> Materializer for DiskStateMaterializer<T> {
-    async fn prevent_background_cleanup(&self) -> MaterializerBackgroundCleanupGuard {
+    /// This core has no startup cleanup: `buck2.clean_stale_on_startup` applies to the deferred
+    /// core only.
+    async fn prevent_background_cleanup(
+        &self,
+        _run_startup_cleanup: bool,
+    ) -> MaterializerBackgroundCleanupGuard {
         self.cleaner.prevent().await
     }
 
