@@ -15,6 +15,8 @@ import shutil
 import time
 from datetime import datetime, timedelta, UTC
 
+import pytest
+
 from buck2.tests.e2e_util.api.buck import Buck
 from buck2.tests.e2e_util.buck_workspace import buck_test, env
 from buck2.tests.e2e_util.helper.golden import golden, sanitize_hashes
@@ -220,6 +222,109 @@ async def test_clean_stale_actions(buck: Buck) -> None:
     await buck.clean("--stale")
     for output in outputs:
         assert output.exists()
+
+
+@buck_test()
+@pytest.mark.parametrize(
+    "enabled,threshold,dry_run,removed",
+    [
+        (True, 100.0, False, True),
+        (True, 0.0, False, False),
+        (False, 100.0, False, False),
+        (True, 100.0, True, False),
+        (True, None, False, True),
+    ],
+)
+async def test_clean_stale_on_startup_without_buckd(
+    buck: Buck, enabled: bool, threshold: float | None, dry_run: bool, removed: bool
+) -> None:
+    result = await buck.build("root//:copy")
+    output = result.get_build_report().output_for_target("root//:copy")
+    assert output.exists()
+    await buck.kill()
+
+    configure_clean_stale(
+        buck,
+        f"""clean_stale_enabled = false
+clean_stale_on_startup = {str(enabled).lower()}
+clean_stale_artifact_ttl_hours = 0
+clean_stale_low_disk_artifact_ttl_hours = 0
+clean_stale_dry_run = {str(dry_run).lower()}
+"""
+        + (
+            f"clean_stale_low_disk_threshold = {threshold}\n"
+            if threshold is not None
+            else ""
+        ),
+    )
+    await buck.targets("root//:copy", "--no-buckd")
+    assert output.exists() == (not removed)
+
+
+@buck_test()
+async def test_clean_stale_on_startup_runs_once_per_daemon(buck: Buck) -> None:
+    configure_clean_stale(
+        buck,
+        """clean_stale_on_startup = true
+clean_stale_artifact_ttl_hours = 0
+""",
+    )
+    result = await buck.build("root//:copy")
+    output = result.get_build_report().output_for_target("root//:copy")
+    untracked = output.parent / "untracked"
+    untracked.mkdir()
+    (untracked / "file").write_text("content")
+
+    await buck.targets("root//:copy")
+    assert untracked.exists()
+
+    await buck.kill()
+    await buck.targets("root//:copy")
+    assert not untracked.exists()
+
+
+@buck_test()
+async def test_clean_stale_on_startup_not_run_by_clean_stale(buck: Buck) -> None:
+    result = await buck.build("root//:copy")
+    output = result.get_build_report().output_for_target("root//:copy")
+    await buck.kill()
+
+    configure_clean_stale(
+        buck,
+        """clean_stale_on_startup = true
+clean_stale_artifact_ttl_hours = 0
+""",
+    )
+    await buck.clean("--stale", "--dry-run")
+    assert output.exists()
+
+    await buck.targets("root//:copy")
+    assert not output.exists()
+
+
+@buck_test()
+async def test_clean_stale_on_startup_failure_does_not_fail_commands(
+    buck: Buck,
+) -> None:
+    result = await buck.build("root//:copy")
+    output = result.get_build_report().output_for_target("root//:copy")
+    await buck.kill()
+
+    configure_clean_stale(
+        buck,
+        """clean_stale_on_startup = true
+clean_stale_artifact_ttl_hours = 0
+""",
+    )
+    # The materializer state still lists the deleted artifact. Clean stale fails when it
+    # finds none of the artifacts from that state on disk.
+    art = next(parent for parent in output.parents if parent.name == "art")
+    for entry in art.iterdir():
+        shutil.rmtree(entry)
+
+    result = await buck.targets("root//:copy")
+    assert "Startup clean stale failed" in result.stderr
+    await buck.targets("root//:copy")
 
 
 @buck_test()
