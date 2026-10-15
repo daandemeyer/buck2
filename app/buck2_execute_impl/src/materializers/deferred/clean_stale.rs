@@ -1348,7 +1348,7 @@ fn create_clean_fut<T: IoHandler>(
                 .boxed()
                 .shared();
                 let (finish_sender, finish_receiver) = tokio::sync::oneshot::channel();
-                if let Err(error) = command_sender.send(MaterializerCommand::Extension(
+                let command = MaterializerCommand::Extension(
                     Box::new(FinishUnmaterializationUpload {
                         upload,
                         info,
@@ -1356,7 +1356,8 @@ fn create_clean_fut<T: IoHandler>(
                         sender: finish_sender,
                     }),
                     get_dispatcher_opt(),
-                )) {
+                );
+                if let Err(error) = command_sender.send_without_interrupting_clean(command) {
                     return CleanPathOutcome::Failed {
                         size,
                         error: error.into(),
