@@ -506,6 +506,20 @@ pub(crate) mod state_machine {
         )
     }
 
+    #[test]
+    fn test_send_without_interrupting_clean() {
+        let (sender, _receiver) = channel();
+        let (observer, guard) = LivelinessGuard::create_sync();
+        *sender.clean_guard.write() = Some(guard);
+        let noop = || MaterializerCommand::DeclareExisting(vec![], None, None);
+
+        sender.send_without_interrupting_clean(noop()).unwrap();
+        assert!(observer.is_alive_sync());
+
+        sender.send(noop()).unwrap();
+        assert!(!observer.is_alive_sync());
+    }
+
     fn make_path(p: &str) -> ProjectRelativePathBuf {
         ProjectRelativePath::new(p).unwrap().to_owned()
     }

@@ -368,6 +368,16 @@ impl<T> MaterializerSender<T> {
         command: MaterializerCommand<T>,
     ) -> Result<(), mpsc::error::SendError<MaterializerCommand<T>>> {
         self.interrupt_clean();
+        self.send_without_interrupting_clean(command)
+    }
+
+    /// `send` drops the liveliness guard of the running clean, and the clean then stops. A clean
+    /// that sends its own commands calls `send_without_interrupting_clean` to keep running.
+    #[allow(clippy::result_large_err)]
+    fn send_without_interrupting_clean(
+        &self,
+        command: MaterializerCommand<T>,
+    ) -> Result<(), mpsc::error::SendError<MaterializerCommand<T>>> {
         let res = self.high_priority.send(command);
         self.counters.sent.fetch_add(1, Ordering::Relaxed);
         res
