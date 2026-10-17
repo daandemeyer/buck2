@@ -8,16 +8,19 @@
 
 # pyre-strict
 
+import gzip
+import io
 import json
+import tarfile
 from pathlib import Path
 
 from buck2.tests.e2e_util.api.buck import Buck
 from buck2.tests.e2e_util.asserts import expect_failure
-from buck2.tests.e2e_util.buck_workspace import buck_test, BuckTestCase
+from buck2.tests.e2e_util.buck_workspace import buck_test, BuckTestCase, parametrize
 
 
-async def _output(buck: Buck, target: str) -> Path:
-    res = await buck.build_without_report(target, "--show-full-simple-output")
+async def _output(buck: Buck, target: str, *args: str) -> Path:
+    res = await buck.build_without_report(target, "--show-full-simple-output", *args)
     return Path(res.stdout.strip())
 
 
@@ -72,14 +75,50 @@ class PreludeRulesTest(BuckTestCase):
             stderr_regex="would both be placed at `show.sh`",
         )
 
-    # prelude/http_archive/unarchive.bzl `unarchive`
     @buck_test(inplace=False, skip_for_os=["windows", "darwin"])
-    async def test_excluded_names_are_read_by_tar_as_globs(self, buck: Buck) -> None:
-        # The exclusion list holds the member names that matched the `excludes`
-        # regexes, but tar reads every `--exclude-from` line as a glob: `[id].js`
-        # keeps the excluded file and drops `i.js` and `d.js` instead.
-        out = await _output(buck, "root//archive:unpacked")
-        assert sorted(p.name for p in (out / "pages").iterdir()) == [
-            "[id].js",
-            "keep.js",
-        ]
+    async def test_archive_extraction_rollout(self, buck: Buck) -> None:
+        # Switching the rollout key must select native extraction and then restore the legacy
+        # behavior, including each implementation's treatment of literal bracket filenames.
+        for enabled in [False, True, False]:
+            args = ["-c", "buck2.extract_archives_in_daemon=true"] if enabled else []
+            out = await _output(buck, "root//archive:unpacked", *args)
+            expected = ["d.js", "i.js", "keep.js"] if enabled else ["[id].js", "keep.js"]
+            assert sorted(p.name for p in (out / "pages").iterdir()) == expected
+
+
+    @buck_test(inplace=False, skip_for_os=["windows", "darwin"])
+    @parametrize("daemon_extraction", [False, True])
+    async def test_excluding_tar_directory_without_slash(
+        self, buck: Buck, daemon_extraction: bool
+    ) -> None:
+        # A directory listed after its child must exclude that child in either rollout mode.
+        # Give the directory a name without a trailing slash and retain an unrelated file.
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w", format=tarfile.GNU_FORMAT) as archive:
+            root = tarfile.TarInfo("top")
+            root.type = tarfile.DIRTYPE
+            archive.addfile(root)
+            child = tarfile.TarInfo("top/bin/tool")
+            child.size = 4
+            archive.addfile(child, io.BytesIO(b"data"))
+            directory = tarfile.TarInfo("top/bin")
+            directory.type = tarfile.DIRTYPE
+            offset = archive.offset
+            archive.addfile(directory)
+            keep = tarfile.TarInfo("top/keep")
+            keep.size = 4
+            archive.addfile(keep, io.BytesIO(b"keep"))
+        # Python adds a slash to directory headers, so rewrite the spelling used by the fixture.
+        data = bytearray(buf.getvalue())
+        data[offset:offset + 100] = b"top/bin".ljust(100, b"\0")
+        data[offset + 148:offset + 156] = b" " * 8
+        checksum = sum(data[offset:offset + 512])
+        data[offset + 148:offset + 156] = f"{checksum:06o}\0 ".encode()
+        (buck.cwd / "archive" / "directory.tar.gz").write_bytes(gzip.compress(data))
+        # The selected implementation must omit the excluded directory and its earlier child.
+        args = ["-c", "buck2.extract_archives_in_daemon=true"] if daemon_extraction else []
+        out = await _output(
+            buck, "root//archive:directory_exclusion", *args,
+            "-c", "test.directory_archive=directory.tar.gz",
+        )
+        assert sorted(p.name for p in out.iterdir()) == ["keep"]
