@@ -1,0 +1,51 @@
+load(":defs.bzl", "cat", "extract")
+
+extract(
+    name = "tar_gz",
+    src = "archive.tar.gz",
+    excludes = ["_test\\.txt$"],
+    strip_prefix = "pkg-1.0",
+)
+
+extract(
+    name = "tar_xz",
+    src = "archive.tar.xz",
+    strip_prefix = "pkg-1.0",
+)
+
+extract(
+    name = "zip",
+    src = "archive.zip",
+    strip_prefix = "pkg-1.0",
+)
+
+extract(
+    name = "explicit_type",
+    src = "archive.bin",
+    strip_prefix = "pkg-1.0",
+    type = "tar.gz",
+)
+
+extract(
+    name = "content_based",
+    src = "archive.tar.gz",
+    content_based = True,
+    strip_prefix = "pkg-1.0",
+)
+
+cat(
+    name = "cat_content_based",
+    dir = ":content_based",
+    path = "README",
+)
+
+extract(
+    name = "parent_dir",
+    src = "parent_dir.tar",
+)
+
+extract(
+    name = "bad_type",
+    src = "archive.tar.gz",
+    type = "rar",
+)
