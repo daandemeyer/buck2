@@ -41,34 +41,12 @@ runs:
         jq -r '.outputs | to_entries[] | "\(.key): \(.value.platforms | keys | join(" "))"' "$config"
         echo "config=$config" >> "$GITHUB_OUTPUT"
         echo "outputs=$(jq '.outputs | length' "$config")" >> "$GITHUB_OUTPUT"
-    - uses: facebook/dotslash-publish-release@v1
-      if: inputs.release_targets == ''
-      env:
-        GITHUB_TOKEN: ${{ inputs.github_token }}
-      with:
-        config: .github/dotslash-config.json
-        tag: ${{ inputs.tag }}
     # The facebook/dotslash-publish-release action reads its config from the repository
     # through the GitHub API and has no input to pass a local file. This step therefore runs
     # the action's script from the commit of its v1 tag with `--local-config`. The script
     # fails on a config without outputs.
     - name: Publish DotSlash files for the built platforms
-      if: inputs.release_targets != '' && steps.select.outputs.outputs != '0'
-      shell: bash
-      env:
-        CONFIG: ${{ steps.select.outputs.config }}
-        GITHUB_TOKEN: ${{ inputs.github_token }}
-        TAG: ${{ inputs.tag }}
-      run: |
-        python3 -m venv "$RUNNER_TEMP/dotslash-venv"
-        "$RUNNER_TEMP/dotslash-venv/bin/pip" install --quiet blake3==1.0.11
-        curl --retry 5 -fsSL -o "$RUNNER_TEMP/process_config.py" \
-          https://raw.githubusercontent.com/facebook/dotslash-publish-release/2539c4d8ae00a42773306c8731d2dd3724d979d2/process_config.py
-        "$RUNNER_TEMP/dotslash-venv/bin/python" "$RUNNER_TEMP/process_config.py" \
-          --local-config --config "$CONFIG" --tag "$TAG" --upload
-    # The script runs `gh release upload` without checking its exit status. A rejected upload
-    # leaves the release without the DotSlash file, and the steps above still pass.
-    - name: Check the DotSlash files
+      if: steps.select.outputs.outputs != '0'
       shell: bash
       env:
         CONFIG: ${{ steps.select.outputs.config || '.github/dotslash-config.json' }}
@@ -76,9 +54,19 @@ runs:
         GITHUB_TOKEN: ${{ inputs.github_token }}
         TAG: ${{ inputs.tag }}
       run: |
-        assets=$(gh release view "$TAG" --json assets --jq '[.assets[].name]')
-        missing=$(jq -r --argjson assets "$assets" '[.outputs | keys[] | select(IN($assets[]) | not)] | join(" ")' "$CONFIG")
-        if [[ -n "$missing" ]]; then
-          echo "::error::The release $TAG has no DotSlash file for: $missing"
-          exit 1
-        fi
+        python3 -m venv "$RUNNER_TEMP/dotslash-venv"
+        "$RUNNER_TEMP/dotslash-venv/bin/pip" install --quiet blake3==1.0.11
+        curl --retry 5 -fsSL -o "$RUNNER_TEMP/process_config.py" \
+          https://raw.githubusercontent.com/facebook/dotslash-publish-release/2539c4d8ae00a42773306c8731d2dd3724d979d2/process_config.py
+        output="$RUNNER_TEMP/dotslash"
+        mkdir -p "$output"
+        "$RUNNER_TEMP/dotslash-venv/bin/python" "$RUNNER_TEMP/process_config.py" \
+          --local-config --config "$CONFIG" --tag "$TAG" --output "$output"
+        # publish_tag leaves the release a draft. In a draft release, the download URL of an
+        # asset contains `untagged-<id>` instead of the tag. That URL stops working after the
+        # release is published. The script writes the download URLs into the DotSlash files,
+        # so we rewrite every URL to point at the asset under the tag.
+        sed -E -i "s#\"url\": \".*/([^/\"]+)\"#\"url\": \"$GITHUB_SERVER_URL/$GH_REPO/releases/download/$TAG/\\1\"#" "$output"/*
+        # The script runs `gh release upload` without checking its exit status, so we upload
+        # the DotSlash files ourselves.
+        gh release upload "$TAG" --clobber "$output"/*
