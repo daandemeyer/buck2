@@ -131,6 +131,7 @@ pub enum ActionCacheWriteType {
     PermissionCheck,
     RemoteDepFile,
     WriteAction,
+    DigestsOnly,
 }
 impl ActionCacheWriteType {
     fn as_str(&self) -> &'static str {
@@ -139,6 +140,7 @@ impl ActionCacheWriteType {
             ActionCacheWriteType::PermissionCheck => "permission_check",
             ActionCacheWriteType::RemoteDepFile => "remote_dep_file",
             ActionCacheWriteType::WriteAction => "write_action",
+            ActionCacheWriteType::DigestsOnly => "digests_only",
         }
     }
 }

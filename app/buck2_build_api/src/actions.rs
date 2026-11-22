@@ -290,6 +290,7 @@ pub trait ActionExecutionCtx: Send + Sync {
         re_result: Option<&mut TActionResult2>,
         dep_file_entry: Option<&mut dyn IntoRemoteDepFile>,
         allow_cache_upload: bool,
+        publish_digests_only: bool,
     ) -> buck2_error::Result<CacheUploadResults>;
 
     /// Executes a command

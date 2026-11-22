@@ -1680,6 +1680,22 @@ impl RunAction {
             }
         }
     }
+
+    fn supports_digests_only_cache(&self) -> bool {
+        // A digests-only entry contains no file contents, so a false `default_allow_cache_upload`
+        // doesn't stop it.
+        self.inner.allow_cache_upload != Some(false)
+            // The outputs of an action with `no_outputs_cleanup` or `incremental_remote_outputs`
+            // depend on the outputs of its previous run, which the action digest doesn't cover.
+            && !self.inner.no_outputs_cleanup
+            && !self.inner.incremental_remote_outputs
+            // Preparing an action with `metadata_param` writes its metadata file, but a lookup of
+            // output values must not write files.
+            && self.inner.metadata_param.is_none()
+            // The action digest of a command that runs on a worker doesn't cover the worker.
+            && self.values().worker.is_none()
+            && self.values().remote_worker.is_none()
+    }
 }
 
 #[pagable_typetag]
@@ -1897,6 +1913,9 @@ impl Action for RunAction {
         };
 
         let allow_cache_upload = allow_cache_upload || force_cache_upload()?;
+        let publish_digests_only = result.was_locally_executed()
+            && ctx.run_action_knobs().digests_only_cache
+            && self.supports_digests_only_cache();
         // If there is a dep file entry AND if dep file cache upload is enabled, upload it
         if result.was_success()
             && !result.was_served_by_remote_dep_file_cache()
@@ -1918,6 +1937,7 @@ impl Action for RunAction {
                         None
                     },
                     allow_cache_upload,
+                    publish_digests_only,
                 )
                 .await?;
 
@@ -1939,6 +1959,20 @@ impl Action for RunAction {
             if dep_file_bundle.has_dep_files() {
                 result.dep_file_cache_upload_result =
                     buck2_data::UploadResult::DepFileUploadNotAllowed;
+            }
+            if publish_digests_only {
+                // `cache_upload` only publishes the digests-only entry here, because
+                // `allow_cache_upload` is false. We discard its results, because they describe the
+                // normal upload that this branch already reports.
+                ctx.cache_upload(
+                    &action_and_blobs,
+                    &result,
+                    None,
+                    None,
+                    allow_cache_upload,
+                    publish_digests_only,
+                )
+                .await?;
             }
         }
 

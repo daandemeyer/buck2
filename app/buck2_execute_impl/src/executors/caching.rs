@@ -13,6 +13,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use buck2_action_metadata_proto::DIGESTS_ONLY_KEY;
+use buck2_action_metadata_proto::DigestsOnlyFile;
+use buck2_action_metadata_proto::DigestsOnlyFiles;
 use buck2_action_metadata_proto::REMOTE_DEP_FILE_KEY;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_core::execution_types::executor_config::RePlatformFields;
@@ -21,11 +24,14 @@ use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_error::BuckErrorContext;
 use buck2_events::dispatch::span_async;
+use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::digest::CasDigestToReExt;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::directory::ActionDirectoryMember;
 use buck2_execute::directory::directory_to_re_tree;
+use buck2_execute::execute::action_digest::ActionDigest;
 use buck2_execute::execute::action_digest_and_blobs::ActionDigestAndBlobs;
+use buck2_execute::execute::action_digest_and_blobs::ActionDigestAndBlobsBuilder;
 use buck2_execute::execute::blobs::ActionBlobs;
 use buck2_execute::execute::cache_uploader::CacheUploadInfo;
 use buck2_execute::execute::cache_uploader::CacheUploadOutcome;
@@ -43,6 +49,7 @@ use dupe::Dupe;
 use futures::future;
 use futures::future::FutureExt;
 use prost::Message;
+use remote_execution as RE;
 use remote_execution::DigestWithStatus;
 use remote_execution::NamedDigest;
 use remote_execution::TActionResult2;
@@ -333,6 +340,63 @@ impl CacheUploader {
         .await
     }
 
+    async fn upload_digests_only(
+        &self,
+        info: &CacheUploadInfo<'_>,
+        result: &CommandExecutionResult,
+        action_digest_and_blobs: &ActionDigestAndBlobs,
+    ) {
+        if !info.publish_digests_only || result.ran_locally_in_place_of_remote() {
+            return;
+        }
+        let outcome = async {
+            let action = digests_only_action(&action_digest_and_blobs.action, info.digest_config);
+            let mut blobs = action.blobs;
+            let mut outputs = Vec::new();
+            for output in result.resolve_outputs(&self.artifact_fs) {
+                let (output, _, value) = output?;
+                outputs.push((output.path().to_string(), value));
+            }
+            let Some(mut action_result) =
+                digests_only_result(outputs, &mut blobs, info.digest_config)
+            else {
+                return Ok(CacheUploadOutcome::RejectedSymlinkOutput);
+            };
+            let tree_bytes: i64 = action_result
+                .output_files
+                .iter()
+                .map(|tree| tree.digest.digest.size_in_bytes)
+                .sum();
+            if let Some(max_bytes) = self.max_bytes
+                && tree_bytes as u64 > max_bytes
+            {
+                return Ok(CacheUploadOutcome::RejectedOutputExceedsLimit { max_bytes });
+            }
+            if let Err(outcome) = self.check_upload_permission(info).await? {
+                return Ok(outcome);
+            }
+            self.re_client.upload_blobs(&blobs).await?;
+            self.re_client
+                .write_action_result(
+                    action.action,
+                    &mut action_result,
+                    &self.platform.to_re_platform(),
+                    ActionCacheWriteType::DigestsOnly,
+                )
+                .await?;
+            buck2_error::Ok(CacheUploadOutcome::Success)
+        }
+        .await
+        .unwrap_or_else(|error| CacheUploadOutcome::FailedOther { error });
+        if !outcome.uploaded() {
+            tracing::info!(
+                "No digests-only cache entry for `{}`: {}",
+                action_digest_and_blobs.action,
+                outcome.error()
+            );
+        }
+    }
+
     async fn check_upload_permission(
         &self,
         info: &CacheUploadInfo<'_>,
@@ -570,6 +634,9 @@ impl UploadCache for CacheUploader {
                 (CacheUploadOutcome::NonLocalExecution, None)
             }
         } else if !info.allow_cache_upload {
+            self.upload_digests_only(info, res, action_digest_and_blobs)
+                .boxed()
+                .await;
             (CacheUploadOutcome::ActionUploadNotAllowed, None)
         } else if res.ran_locally_in_place_of_remote() {
             (CacheUploadOutcome::LocalInPlaceOfRemote, None)
@@ -665,6 +732,83 @@ impl UploadCache for CacheUploader {
     }
 }
 
+/// A change to the key or to the content of a digests-only entry needs a new version, so that a
+/// lookup never returns an entry in an older format.
+const DIGESTS_ONLY_KEY_VERSION: u32 = 0;
+
+/// No rule runs a program named `buck2-digests-only`, so no real action has the digest of the
+/// synthetic action of a digests-only entry.
+const DIGESTS_ONLY_ACTION_MARKER: &str = "buck2-digests-only";
+
+/// Returns the synthetic action that the digests-only entry of `action` is stored under.
+fn digests_only_action(
+    action: &ActionDigest,
+    digest_config: DigestConfig,
+) -> ActionDigestAndBlobs {
+    let mut blobs = ActionDigestAndBlobsBuilder::new(digest_config);
+    let command = blobs.add_command(&RE::Command {
+        arguments: vec![
+            DIGESTS_ONLY_ACTION_MARKER.to_owned(),
+            DIGESTS_ONLY_KEY_VERSION.to_string(),
+            action.to_string(),
+        ],
+        ..Default::default()
+    });
+    blobs.build(&RE::Action {
+        command_digest: Some(command.to_grpc()),
+        ..Default::default()
+    })
+}
+
+/// Returns `None` for a symlink output, because the normal upload rejects symlink outputs as well.
+/// A cache can treat an entry as missing when the CAS lacks a file of the entry, including a file
+/// that the Tree of an output directory lists. The entry therefore lists the Tree of each output
+/// directory as an output file, under the path of the directory. The caller uploads the Trees.
+fn digests_only_result<'a>(
+    outputs: impl IntoIterator<Item = (String, &'a ArtifactValue)>,
+    blobs: &mut ActionBlobs,
+    digest_config: DigestConfig,
+) -> Option<TActionResult2> {
+    let mut files = Vec::new();
+    let mut trees = Vec::new();
+    for (path, value) in outputs {
+        match value.entry().as_ref() {
+            DirectoryEntry::Leaf(ActionDirectoryMember::File(f)) => {
+                let digest = f.digest.to_re();
+                files.push(DigestsOnlyFile {
+                    path,
+                    hash: digest.hash,
+                    size_in_bytes: digest.size_in_bytes,
+                    is_executable: f.is_executable,
+                });
+            }
+            DirectoryEntry::Dir(d) => trees.push(TFile {
+                digest: DigestWithStatus {
+                    digest: blobs
+                        .add_protobuf_message(&directory_to_re_tree(d), digest_config)
+                        .to_re(),
+                    ..Default::default()
+                },
+                name: path,
+                ..Default::default()
+            }),
+            DirectoryEntry::Leaf(_) => return None,
+        }
+    }
+    Some(TActionResult2 {
+        output_files: trees,
+        execution_metadata: Box::new(TExecutedActionMetadata {
+            auxiliary_metadata: vec![TAny {
+                type_url: DIGESTS_ONLY_KEY.to_owned(),
+                value: DigestsOnlyFiles { files }.encode_to_vec(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
 fn systemtime_to_ttimestamp(time: SystemTime) -> buck2_error::Result<TTimestamp> {
     let duration = time.duration_since(SystemTime::UNIX_EPOCH)?;
     Ok(TTimestamp {
@@ -680,6 +824,8 @@ fn systemtime_to_ttimestamp(time: SystemTime) -> buck2_error::Result<TTimestamp>
 
 #[cfg(test)]
 mod tests {
+    use buck2_common::file_ops::metadata::FileMetadata;
+
     use super::*;
 
     #[test]
@@ -733,5 +879,61 @@ mod tests {
             buck2_data::UploadResult::NotAttempted,
             DepFileCacheUploadOutcome::UnsupportedExecutionKind.to_proto(),
         );
+    }
+
+    #[test]
+    fn test_digests_only_action() {
+        // The key of a digests-only entry must be the same on every host. The key must differ
+        // from the digest of the action, so that the entry never replaces the normal entry.
+        // Derive the key of a fixed action digest, and expect a known digest that differs from
+        // the action digest.
+        let digest_config = DigestConfig::testing_default();
+        let action = ActionDigest::from_content(b"action", digest_config.cas_digest_config());
+        let key = digests_only_action(&action, digest_config).action;
+        assert_eq!(
+            "6b6c725dc8a6c341eb5592c0e1f414f73bb14a81:46",
+            key.to_string()
+        );
+    }
+
+    #[test]
+    fn test_digests_only_result() {
+        // The output files of the digests-only entry of a local result are the Trees of the output
+        // directories. The auxiliary metadata of the entry records the output files of the local
+        // result. Build the entry of an executable file and an empty directory. Expect the Tree of
+        // the directory as the only output file of the entry, and expect `blobs` to hold the Tree.
+        // Expect the digest and the executable bit of the file in the auxiliary metadata.
+        let digest_config = DigestConfig::testing_default();
+        let file = FileMetadata {
+            digest: TrackedFileDigest::from_content(b"file", digest_config.cas_digest_config()),
+            is_executable: true,
+        };
+        let dir = ArtifactValue::dir(digest_config.empty_directory());
+        let mut blobs = ActionBlobs::new(digest_config);
+        let result = digests_only_result(
+            [
+                ("out/file".to_owned(), &ArtifactValue::file(file.dupe())),
+                ("out/dir".to_owned(), &dir),
+            ],
+            &mut blobs,
+            digest_config,
+        )
+        .unwrap();
+
+        assert_eq!(1, result.output_files.len());
+        let tree = &result.output_files[0];
+        assert_eq!("out/dir", tree.name);
+        assert!(
+            blobs
+                .keys()
+                .any(|digest| digest.to_re() == tree.digest.digest)
+        );
+        let metadata = &result.execution_metadata.auxiliary_metadata[0];
+        assert_eq!(DIGESTS_ONLY_KEY, metadata.type_url);
+        let files = DigestsOnlyFiles::decode(metadata.value.as_slice())
+            .unwrap()
+            .files;
+        assert_eq!(file.digest.to_re().hash, files[0].hash);
+        assert!(files[0].is_executable);
     }
 }

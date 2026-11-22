@@ -531,6 +531,7 @@ impl<'a> ServerCommandContext<'a> {
                 .use_network_action_output_cache,
             eager_dep_files,
             default_allow_cache_upload: false,
+            digests_only_cache: false,
             action_paths_interner: DashMapDirectoryInterner::new(),
             write_cas_probe: false,
             defer_write_actions: false,
@@ -1117,6 +1118,9 @@ impl DiceCommandUpdater<'_, '_> {
         run_action_knobs.default_allow_cache_upload |= invocation_settings
             .action_cache
             .default_allow_upload(&mut buckconfig)?;
+        run_action_knobs.digests_only_cache = invocation_settings
+            .action_cache
+            .digests_only_entries(&mut buckconfig)?;
 
         // A write whose content the CAS already has is declared as a CAS download, so its bytes
         // then exist nowhere but the CAS. That pays only when the content would not have gone to

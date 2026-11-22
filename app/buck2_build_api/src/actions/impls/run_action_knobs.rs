@@ -30,6 +30,9 @@ pub struct RunActionKnobs {
     /// Default for per-action `allow_cache_upload`, to make it opt-out instead of opt-in.
     pub default_allow_cache_upload: bool,
 
+    /// `action_cache.digests_only_entries`.
+    pub digests_only_cache: bool,
+
     /// Shares equal input directories between the actions of a command.
     pub action_paths_interner: DashMapDirectoryInterner<ActionDirectoryMember, TrackedFileDigest>,
 

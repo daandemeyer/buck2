@@ -31,3 +31,16 @@ message RemoteDepFile {
   bytes untagged_inputs_digest = 3;
   repeated DepFileInputs dep_file_inputs = 4;
 }
+
+// A digests-only cache entry lists the output files of its action here instead
+// of in the `output_files` of its result, because the CAS may lack their blobs.
+message DigestsOnlyFiles {
+  repeated DigestsOnlyFile files = 1;
+}
+
+message DigestsOnlyFile {
+  string path = 1;
+  string hash = 2;
+  int64 size_in_bytes = 3;
+  bool is_executable = 4;
+}
