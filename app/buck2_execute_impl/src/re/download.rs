@@ -649,7 +649,7 @@ fn re_forward_path(re_path: &str) -> buck2_error::Result<&ForwardRelativePath> {
 }
 
 pub(crate) struct ExtractedArtifacts {
-    to_declare: Vec<DeclareArtifactPayload>,
+    pub(crate) to_declare: Vec<DeclareArtifactPayload>,
     pub(crate) mapped_outputs: BuckMutInsertionMap<CommandExecutionOutput, ArtifactValue>,
 }
 

@@ -174,6 +174,12 @@ pub trait Action: PagableTagged + Allocative + Debug + Send + Sync + 'static {
         false
     }
 
+    /// Returns `true` when buck2 looks up the normal entry of the action with the input values
+    /// from `OutputValuesKey` before it builds the inputs.
+    fn is_lookup_first(&self, _knobs: &RunActionKnobs) -> bool {
+        false
+    }
+
     /// A machine-readable category for this action, intended to be used when analyzing actions outside of buck2 itself.
     ///
     /// A category provides a namespace for identifiers within the rule that produced this action. Examples of
@@ -272,6 +278,7 @@ pub trait Action: PagableTagged + Allocative + Debug + Send + Sync + 'static {
 pub struct PreparedLookup {
     pub request: CommandExecutionRequest,
     pub prepared_action: PreparedAction,
+    pub allow_dep_file_cache_upload: bool,
 }
 
 /// The context for actions to use when executing

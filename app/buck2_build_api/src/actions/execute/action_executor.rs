@@ -30,7 +30,10 @@ use buck2_core::execution_types::executor_config::CommandExecutorConfig;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::buck_out_path::BuildArtifactPath;
+use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_data::SchedulingMode;
+use buck2_directory::directory::directory::Directory;
+use buck2_directory::directory::directory_iterator::DirectoryIterator;
 use buck2_error::BuckErrorContext;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_execute::artifact::fs::ExecutorFs;
@@ -49,9 +52,11 @@ use buck2_execute::execute::claim::MutexClaimManager;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
 use buck2_execute::execute::command_executor::CommandExecutor;
 use buck2_execute::execute::dep_file_digest::DepFileDigest;
+use buck2_execute::execute::executor_stage_async;
 use buck2_execute::execute::kind::CommandExecutionKind;
 use buck2_execute::execute::low_pass_filter::LowPassFilter;
 use buck2_execute::execute::manager::CommandExecutionManager;
+use buck2_execute::execute::prepared::ActionCacheHit;
 use buck2_execute::execute::prepared::PreparedAction;
 use buck2_execute::execute::prepared::PreparedCommand;
 use buck2_execute::execute::request::CommandExecutionRequest;
@@ -942,6 +947,7 @@ impl<'d> BuckActionExecutor<'d> {
         waiting_data: WaitingData,
         inputs: BuckMutInsertionMap<ArtifactGroup, ArtifactGroupValues>,
         action: &RegisteredAction,
+        hit: Option<Box<ActionCacheHit>>,
         cancellations: &CancellationContext,
     ) -> (
         Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError>,
@@ -960,7 +966,36 @@ impl<'d> BuckActionExecutor<'d> {
                 cancellations,
             };
 
-            let (result, metadata) = action.execute(&mut ctx, waiting_data).await?;
+            let (result, metadata) = match hit {
+                None => action.execute(&mut ctx, waiting_data).await?,
+                Some(hit) => {
+                    // `ctx.inputs` contains values from `OutputValuesKey`. A file digest in a
+                    // value from `OutputValuesKey` can name a blob that neither the disk nor the
+                    // CAS holds, so `ctx` gets no input values for the hit.
+                    ctx.inputs = Default::default();
+                    let mut result = hit.result;
+                    executor_stage_async(
+                        hit.stage,
+                        self.materializer
+                            .declare_cas_many(Arc::new(hit.info), hit.to_declare),
+                    )
+                    .await?;
+                    // buck2 uploads no result for the hit, like for a normal cache hit. It uploads
+                    // no dep file entry either, because it didn't build the inputs that the entry
+                    // would name.
+                    result.cache_upload_result = buck2_data::UploadResult::NonLocalExecution;
+                    result.dep_file_cache_upload_result = buck2_data::UploadResult::NotAttempted;
+                    // `allow_cache_upload` of a lookup-first action resolves to true.
+                    ctx.unpack_command_execution_result(
+                        hit.executor_preference,
+                        result,
+                        true,
+                        hit.allow_dep_file_cache_upload,
+                        Some(hit.input_files_bytes),
+                        buck2_data::IncrementalKind::NonIncremental,
+                    )?
+                }
+            };
 
             // Check that all the outputs are the right output_type
             for x in outputs.iter() {
@@ -1089,6 +1124,54 @@ impl<'d> BuckActionExecutor<'d> {
         }))
     }
 
+    pub(crate) async fn look_up_normal(
+        &self,
+        inputs: BuckMutInsertionMap<ArtifactGroup, ArtifactGroupValues>,
+        action: &RegisteredAction,
+    ) -> buck2_error::Result<
+        Option<(
+            BuckMutInsertionMap<ArtifactGroup, ArtifactGroupValues>,
+            Box<ActionCacheHit>,
+        )>,
+    > {
+        let mut ctx = BuckActionExecutionContext {
+            executor: self,
+            action,
+            inputs,
+            command_reports: &mut Vec::new(),
+            cancellations: CancellationContext::never_cancelled(),
+        };
+        let Some(lookup) = action.prepare_lookup(&mut ctx).await? else {
+            return Ok(None);
+        };
+        let Some(mut hit) = self
+            .command_executor
+            .action_cache_checker()
+            .look_up_normal(
+                &PreparedCommand {
+                    request: &lookup.request,
+                    target: &ActionExecutionTarget::new(action),
+                    prepared_action: &lookup.prepared_action,
+                    digest_config: self.digest_config,
+                },
+                ctx.command_execution_manager(WaitingData::new()),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        // A hit counts as a miss when an output depends on a path outside the outputs of
+        // `action`, because the materializer may hold nothing at that path.
+        if depends_outside(
+            hit.result.outputs.values(),
+            lookup.request.paths().output_paths(),
+        ) {
+            return Ok(None);
+        }
+        hit.allow_dep_file_cache_upload = lookup.allow_dep_file_cache_upload;
+        Ok(Some((ctx.inputs, Box::new(hit))))
+    }
+
     pub(crate) fn may_skip_builds(&self) -> bool {
         // `use_network_action_output_cache` and the offline cache that trace-io records need the
         // outputs of every action on disk.
@@ -1104,6 +1187,25 @@ impl<'d> BuckActionExecutor<'d> {
     pub fn invalidation_tracking_enabled(&self) -> bool {
         self.invalidation_tracking_enabled
     }
+}
+
+fn depends_outside<'a>(
+    values: impl IntoIterator<Item = &'a ArtifactValue>,
+    outputs: &[(ProjectRelativePathBuf, OutputType)],
+) -> bool {
+    values
+        .into_iter()
+        .filter_map(|value| value.deps())
+        .any(|deps| {
+            // The paths of `unordered_walk` also include the directories above each dependency.
+            // A directory above an output counts as inside the outputs.
+            deps.unordered_walk().paths().any(|path| {
+                !outputs.iter().any(|(output, _)| {
+                    let output = output.as_forward_relative_path();
+                    path.starts_with(output) || output.starts_with(&path)
+                })
+            })
+        })
 }
 
 #[cfg(test)]

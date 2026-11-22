@@ -26,9 +26,12 @@ use buck2_execute::execute::kind::CommandExecutionKind;
 use buck2_execute::execute::kind::RemoteCommandExecutionDetails;
 use buck2_execute::execute::manager::CommandExecutionManager;
 use buck2_execute::execute::manager::CommandExecutionManagerExt;
+use buck2_execute::execute::output::CommandStdStreams;
+use buck2_execute::execute::prepared::ActionCacheHit;
 use buck2_execute::execute::prepared::PreparedCommand;
 use buck2_execute::execute::prepared::PreparedCommandOptionalExecutor;
 use buck2_execute::execute::request::CommandExecutionOutput;
+use buck2_execute::execute::result::CommandExecutionMetadata;
 use buck2_execute::execute::result::CommandExecutionResult;
 use buck2_execute::knobs::ExecutorGlobalKnobs;
 use buck2_execute::materialize::materializer::CasDownloadInfo;
@@ -39,6 +42,7 @@ use buck2_execute::re::manager::ManagedRemoteExecutionClient;
 use buck2_execute::re::output_trees_download_config::OutputTreesDownloadConfig;
 use buck2_execute::re::remote_action_result::ActionCacheResult;
 use buck2_execute::re::remote_action_result::RemoteActionResult;
+use buck2_execute::re::ttl::re_expiration_from_ttl;
 use buck2_hash::BuckMutInsertionMap;
 use buck2_util::time_span::TimeSpan;
 use dice_futures::cancellation::CancellationContext;
@@ -46,6 +50,8 @@ use dupe::Dupe;
 use jiff::SignedDuration;
 use jiff::Timestamp;
 use prost::Message;
+use remote_execution as RE;
+use remote_execution::ActionResultResponse;
 
 use crate::executors::caching::digests_only_action;
 use crate::executors::caching::digests_only_outputs;
@@ -84,6 +90,43 @@ impl CacheType {
     }
 }
 
+async fn query_action_cache(
+    re_client: &ManagedRemoteExecutionClient,
+    cache_type: &CacheType,
+    digest: &ActionDigest,
+    platform: &RE::Platform,
+) -> buck2_error::Result<Option<ActionResultResponse>> {
+    span_async(
+        buck2_data::ExecutorStageStart {
+            stage: Some(
+                buck2_data::CacheQuery {
+                    action_digest: digest.to_string(),
+                    cache_type: cache_type.to_proto().into(),
+                }
+                .into(),
+            ),
+        },
+        async {
+            let mut timings = buck2_data::CacheQueryTimings::default();
+            let result = re_client
+                .action_cache(digest.dupe(), platform, &mut timings)
+                .await;
+            let end = buck2_data::ExecutorStageEnd {
+                cache_query_error: result.as_ref().err().map(|e| buck2_data::CacheQueryError {
+                    error: format!("{e:#}"),
+                    re_error_code: e
+                        .find_typed_context::<RemoteExecutionError>()
+                        .map(|re_err| re_err.code.to_string()),
+                }),
+                cache_query: Some(timings),
+                ..Default::default()
+            };
+            (result, end)
+        },
+    )
+    .await
+}
+
 async fn query_action_cache_and_download_result(
     // Differentiate between regular action cache look up and remote dep file based look up
     cache_type: CacheType,
@@ -110,37 +153,11 @@ async fn query_action_cache_and_download_result(
         CacheType::ActionCache => action_digest.dupe(),
     };
 
-    let action_cache_response = span_async(
-        buck2_data::ExecutorStageStart {
-            stage: Some(
-                buck2_data::CacheQuery {
-                    action_digest: digest.to_string(),
-                    cache_type: cache_type.to_proto().into(),
-                }
-                .into(),
-            ),
-        },
-        async {
-            let mut timings = buck2_data::CacheQueryTimings::default();
-            let result = re_client
-                .action_cache(
-                    digest.dupe(),
-                    &command.prepared_action.platform,
-                    &mut timings,
-                )
-                .await;
-            let end = buck2_data::ExecutorStageEnd {
-                cache_query_error: result.as_ref().err().map(|e| buck2_data::CacheQueryError {
-                    error: format!("{e:#}"),
-                    re_error_code: e
-                        .find_typed_context::<RemoteExecutionError>()
-                        .map(|re_err| re_err.code.to_string()),
-                }),
-                cache_query: Some(timings),
-                ..Default::default()
-            };
-            (result, end)
-        },
+    let action_cache_response = query_action_cache(
+        re_client,
+        &cache_type,
+        &digest,
+        &command.prepared_action.platform,
     )
     .await;
 
@@ -267,7 +284,7 @@ impl ActionCacheChecker {
         digest: ActionDigest,
         response: &dyn RemoteActionResult,
         expires: Timestamp,
-    ) -> buck2_error::Result<ExtractedArtifacts> {
+    ) -> buck2_error::Result<(ExtractedArtifacts, CasDownloadInfo)> {
         let identity = ReActionIdentity::new(
             command.target,
             self.re_action_key.as_deref(),
@@ -280,7 +297,7 @@ impl ActionCacheChecker {
             now,
             expires.duration_since(now).max(SignedDuration::ZERO),
         );
-        CasDownloader {
+        let artifacts = CasDownloader {
             materializer: self.materializer.as_ref(),
             re_client: &self.re_client,
             digest_config: command.digest_config,
@@ -297,7 +314,8 @@ impl ActionCacheChecker {
             &info,
             &mut DownloadPhases::default(),
         )
-        .await
+        .await?;
+        Ok((artifacts, info))
     }
 }
 
@@ -375,7 +393,7 @@ impl PreparedCommandOptionalExecutor for ActionCacheChecker {
         response.action_result = outputs;
         // The CAS may not hold the output files of the action. An expiration would make a later
         // upload skip a file that the CAS lacks.
-        let artifacts = self
+        let (artifacts, _) = self
             .extract_outputs(
                 command,
                 key,
@@ -384,6 +402,71 @@ impl PreparedCommandOptionalExecutor for ActionCacheChecker {
             )
             .await?;
         Ok(Some(artifacts.mapped_outputs))
+    }
+
+    async fn look_up_normal(
+        &self,
+        command: &PreparedCommand<'_, '_>,
+        manager: CommandExecutionManager,
+    ) -> buck2_error::Result<Option<ActionCacheHit>> {
+        let execution_time = TimeSpan::start_now_with_wall_time();
+        let action_digest = &command.prepared_action.action_and_blobs.action;
+        let platform = &command.prepared_action.platform;
+        // For a failed result, the build of the action reads the result again and reports the
+        // failure.
+        let Some(response) = query_action_cache(
+            &self.re_client,
+            &CacheType::ActionCache,
+            action_digest,
+            platform,
+        )
+        .await?
+        .filter(|response| response.action_result.exit_code == 0) else {
+            return Ok(None);
+        };
+        let response = ActionCacheResult(response, buck2_data::CacheType::ActionCache);
+        let expires = re_expiration_from_ttl(Timestamp::now(), response.ttl(), action_digest);
+        let (artifacts, info) = self
+            .extract_outputs(command, action_digest.dupe(), &response, expires)
+            .await?;
+        let details = RemoteCommandExecutionDetails::new(
+            action_digest.dupe(),
+            *command.request.remote_dep_file_key(),
+            self.re_client.get_session_id().await.ok(),
+            self.re_client.use_case,
+            platform,
+            false,
+        );
+        let result = manager.claim().await.success(
+            response.execution_kind(details),
+            artifacts.mapped_outputs,
+            CommandStdStreams::Remote(response.std_streams(&self.re_client, command.digest_config)),
+            CommandExecutionMetadata::from_re_timing(
+                response.timing(),
+                Some(execution_time.start_time()),
+                execution_time.end_now(),
+            ),
+        );
+        Ok(Some(ActionCacheHit {
+            result,
+            stage: buck2_data::CacheHit {
+                action_digest: action_digest.to_string(),
+                action_key: Some(
+                    ReActionIdentity::new(
+                        command.target,
+                        self.re_action_key.as_deref(),
+                        command.request.paths(),
+                    )
+                    .action_key,
+                ),
+                cache_type: buck2_data::CacheType::ActionCache.into(),
+            },
+            info,
+            to_declare: artifacts.to_declare,
+            executor_preference: command.request.executor_preference,
+            input_files_bytes: command.request.paths().input_files_bytes(),
+            allow_dep_file_cache_upload: false,
+        }))
     }
 }
 

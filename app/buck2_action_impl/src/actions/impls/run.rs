@@ -35,6 +35,7 @@ use buck2_build_api::actions::execute::action_executor::ActionOutputs;
 use buck2_build_api::actions::impls::expanded_command_line::ExpandedCommandLine;
 use buck2_build_api::actions::impls::expanded_command_line::ExpandedCommandLineDigest;
 use buck2_build_api::actions::impls::expanded_command_line::ExpandedCommandLineFingerprinter;
+use buck2_build_api::actions::impls::run_action_knobs::RunActionKnobs;
 use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_api::artifact_groups::ArtifactGroupValues;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
@@ -2034,11 +2035,27 @@ impl Action for RunAction {
         Ok(Some(PreparedLookup {
             request,
             prepared_action,
+            allow_dep_file_cache_upload: self.inner.allow_dep_file_cache_upload,
         }))
     }
 
     fn supports_output_values(&self) -> bool {
         self.supports_digests_only_cache()
+    }
+
+    fn is_lookup_first(&self, knobs: &RunActionKnobs) -> bool {
+        // A local run publishes the normal entry only when `allow_cache_upload` resolves to true.
+        // Without the normal entry, a lookup always misses. RE stores the result of every remote
+        // run, but the check treats every action as a local run. Builders resolve
+        // `allow_cache_upload` with their own `default_allow_cache_upload`. When their value
+        // differs from `knobs.default_allow_cache_upload`, buck2 looks up the entry that builders
+        // don't publish for an action without `allow_cache_upload`.
+        knobs.digests_only_cache
+            && self
+                .inner
+                .allow_cache_upload
+                .unwrap_or(knobs.default_allow_cache_upload)
+            && self.supports_digests_only_cache()
     }
 }
 

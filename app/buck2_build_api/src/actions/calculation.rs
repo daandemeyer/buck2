@@ -38,6 +38,7 @@ use buck2_events::dispatch::get_dispatcher;
 use buck2_events::dispatch::span_async;
 use buck2_events::span::SpanId;
 use buck2_execute::artifact_value::ArtifactValue;
+use buck2_execute::execute::prepared::ActionCacheHit;
 use buck2_execute::execute::result::CommandExecutionReport;
 use buck2_execute::execute::result::CommandExecutionStatus;
 use buck2_execute::execute::result::command_execution_error_proto;
@@ -133,7 +134,14 @@ async fn build_action_no_redirect(
     let inputs = action.inputs()?;
     let waiting_data = WaitingData::new();
 
-    let ensured_inputs = if inputs.is_empty() {
+    let mut hit = None;
+    let ensured_inputs = if action
+        .is_lookup_first(ctx.per_transaction_data().get_run_action_knobs())
+        && let Some((values, lookup_hit)) = look_up_before_building(ctx, &action).boxed().await
+    {
+        hit = Some(lookup_hit);
+        values
+    } else if inputs.is_empty() {
         BuckMutInsertionMap::default()
     } else {
         let ready_inputs: Vec<_> =
@@ -181,6 +189,7 @@ async fn build_action_no_redirect(
         &executor,
         waiting_data,
         ensured_inputs,
+        hit,
         &action,
         target_rule_type_name,
         producers,
@@ -248,6 +257,7 @@ async fn build_action_inner(
     executor: &BuckActionExecutor<'_>,
     waiting_data: WaitingData,
     ensured_inputs: BuckMutInsertionMap<ArtifactGroup, ArtifactGroupValues>,
+    hit: Option<Box<ActionCacheHit>>,
     action: &Arc<RegisteredAction>,
     target_rule_type_name: Option<String>,
     producers: Option<Box<DirectProducers>>,
@@ -264,7 +274,7 @@ async fn build_action_inner(
         None => buck2_data::ExpectedEligibleForDedupe::UnknownEligibility,
     };
     let (execute_result, command_reports) = executor
-        .execute(waiting_data, ensured_inputs, action, cancellation)
+        .execute(waiting_data, ensured_inputs, action, hit, cancellation)
         .await;
 
     // Consumers look this up only after DICE gives them this action's value, which happens after
@@ -915,12 +925,38 @@ async fn look_up_output_values(
     if !action.supports_output_values() {
         return Ok(None);
     }
+    // Builders upload the normal entry of a lookup-first action and publish no digests-only entry
+    // for it. `BuildKey` looks up the normal entry before it builds the inputs.
+    if action.is_lookup_first(ctx.per_transaction_data().get_run_action_knobs()) {
+        return Ok(None);
+    }
     let executor = ctx.get_action_executor(action.execution_config()).await?;
     if !executor.may_skip_builds() {
         return Ok(None);
     }
     let inputs = look_up_inputs(ctx, action).await?;
     executor.output_values(inputs, action).await
+}
+
+async fn look_up_before_building(
+    ctx: &mut DiceComputations<'_>,
+    action: &RegisteredAction,
+) -> Option<(
+    BuckMutInsertionMap<ArtifactGroup, ArtifactGroupValues>,
+    Box<ActionCacheHit>,
+)> {
+    let lookup = async {
+        let executor = ctx.get_action_executor(action.execution_config()).await?;
+        if !executor.may_skip_builds() {
+            return Ok(None);
+        }
+        let inputs = look_up_inputs(ctx, action).await?;
+        executor.look_up_normal(inputs, action).await
+    };
+    lookup.await.unwrap_or_else(|e| {
+        tracing::debug!("Lookup of `{action}` failed, building its inputs: {e:#}");
+        None
+    })
 }
 
 async fn look_up_inputs(
