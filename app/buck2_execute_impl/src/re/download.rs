@@ -318,7 +318,7 @@ pub struct CasDownloader<'a> {
 /// Where a download's time went. Measured for every download; reported for cache hits. A phase
 /// the download did not reach, because it failed earlier, stays `None`.
 #[derive(Default)]
-struct DownloadPhases {
+pub(crate) struct DownloadPhases {
     tree_admission: Option<Duration>,
     tree_fetch: Option<Duration>,
     local_bookkeeping: Option<Duration>,
@@ -493,7 +493,7 @@ impl CasDownloader<'_> {
         ControlFlow::Continue((manager, outputs))
     }
 
-    async fn extract_artifacts<'a>(
+    pub(crate) async fn extract_artifacts<'a>(
         &self,
         artifact_fs: &ArtifactFs,
         identity: &ReActionIdentity<'_>,
@@ -648,9 +648,9 @@ fn re_forward_path(re_path: &str) -> buck2_error::Result<&ForwardRelativePath> {
         .buck_error_context("Path received from RE is not normalized.")
 }
 
-struct ExtractedArtifacts {
+pub(crate) struct ExtractedArtifacts {
     to_declare: Vec<DeclareArtifactPayload>,
-    mapped_outputs: BuckMutInsertionMap<CommandExecutionOutput, ArtifactValue>,
+    pub(crate) mapped_outputs: BuckMutInsertionMap<CommandExecutionOutput, ArtifactValue>,
 }
 
 /// Did this download work out?

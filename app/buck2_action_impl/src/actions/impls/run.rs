@@ -23,6 +23,7 @@ use buck2_artifact::artifact::artifact_type::OutputArtifact;
 use buck2_artifact::artifact::build_artifact::BuildArtifact;
 use buck2_build_api::actions::Action;
 use buck2_build_api::actions::ActionExecutionCtx;
+use buck2_build_api::actions::PreparedLookup;
 use buck2_build_api::actions::UnregisteredAction;
 use buck2_build_api::actions::box_slice_set::BoxSliceSet;
 use buck2_build_api::actions::errors::error_handler::OutputArtifacts;
@@ -2012,6 +2013,32 @@ impl Action for RunAction {
         metadata.timing.finish_action = Some(Instant::now() - finish_start);
 
         Ok((outputs, metadata))
+    }
+
+    async fn prepare_lookup(
+        &self,
+        ctx: &mut dyn ActionExecutionCtx,
+    ) -> buck2_error::Result<Option<PreparedLookup>> {
+        if !self.supports_digests_only_cache() {
+            return Ok(None);
+        }
+        let mut visitor = RunActionVisitor::new(&self.inner.dep_files, None);
+        let (prepared_run_action, _, host_sharing_requirements) =
+            self.prepare(&mut visitor, ctx).await?;
+        let request =
+            self.command_execution_request(ctx, prepared_run_action, host_sharing_requirements)?;
+        let prepared_action = ctx.prepare_action(&request, true)?;
+        if is_induced_cache_miss(&prepared_action.action_and_blobs.action) {
+            return Ok(None);
+        }
+        Ok(Some(PreparedLookup {
+            request,
+            prepared_action,
+        }))
+    }
+
+    fn supports_output_values(&self) -> bool {
+        self.supports_digests_only_cache()
     }
 }
 

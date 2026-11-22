@@ -25,6 +25,7 @@ use buck2_build_api::actions::calculation::ActionExtraData;
 use buck2_build_api::actions::calculation::ActionWithExtraData;
 use buck2_build_api::actions::calculation::BuildKey;
 use buck2_build_api::actions::calculation::BuildKeyActivationData;
+use buck2_build_api::actions::calculation::OutputValuesKey;
 use buck2_build_api::analysis::AnalysisKeyActivationData;
 use buck2_build_api::analysis::AnalysisWithExtraData;
 use buck2_build_api::artifact_groups::ArtifactGroup;
@@ -97,6 +98,7 @@ mod test_signals;
 enum NodeKey {
     // Those are DICE keys.
     BuildKey(BuildKey),
+    OutputValuesKey(OutputValuesKey),
     AnalysisKey(AnalysisKey),
     EnsureProjectedArtifactKey(EnsureProjectedArtifactKey),
     EnsureTransitiveSetProjectionKey(EnsureTransitiveSetProjectionKey),
@@ -129,6 +131,7 @@ enum NodeKey {
 // graph implementation).
 
 size_assert::words_of_type!(BuildKey, 4);
+size_assert::words_of_type!(OutputValuesKey, 4);
 size_assert::words_of_type!(AnalysisKey, 2);
 size_assert::words_of_type!(EnsureTransitiveSetProjectionKey, 5);
 size_assert::words_of_type!(EnsureProjectedArtifactKey, 7);
@@ -153,6 +156,8 @@ impl NodeKey {
     fn from_dyn_key(key: &DynKey) -> Option<Self> {
         let key = if let Some(key) = key.downcast_ref::<BuildKey>() {
             Self::BuildKey(key.dupe())
+        } else if let Some(key) = key.downcast_ref::<OutputValuesKey>() {
+            Self::OutputValuesKey(key.dupe())
         } else if let Some(key) = key.downcast_ref::<AnalysisKey>() {
             Self::AnalysisKey(key.dupe())
         } else if let Some(key) = key.downcast_ref::<EnsureProjectedArtifactKey>() {
@@ -237,7 +242,9 @@ impl NodeKey {
             }
             .into(),
 
-            NodeKey::EnsureProjectedArtifactKey(..) => self.into_generic_entry(),
+            NodeKey::OutputValuesKey(..) | NodeKey::EnsureProjectedArtifactKey(..) => {
+                self.into_generic_entry()
+            }
             NodeKey::EnsureTransitiveSetProjectionKey(_key) => {
                 buck2_data::critical_path_entry2::EnsureTransitiveSetProjection {}.into()
             }
@@ -313,6 +320,7 @@ impl fmt::Display for NodeKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BuildKey(k) => write!(f, "BuildKey({k})"),
+            Self::OutputValuesKey(k) => write!(f, "OutputValuesKey({k})"),
             Self::AnalysisKey(k) => write!(f, "AnalysisKey({k})"),
             Self::EnsureProjectedArtifactKey(k) => write!(f, "EnsureProjectedArtifactKey({k})"),
             Self::EnsureTransitiveSetProjectionKey(k) => {

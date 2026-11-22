@@ -55,6 +55,7 @@ use remote_execution::NamedDigest;
 use remote_execution::TActionResult2;
 use remote_execution::TAny;
 use remote_execution::TCode;
+use remote_execution::TDigest;
 use remote_execution::TDirectory2;
 use remote_execution::TExecutedActionMetadata;
 use remote_execution::TFile;
@@ -741,7 +742,7 @@ const DIGESTS_ONLY_KEY_VERSION: u32 = 0;
 const DIGESTS_ONLY_ACTION_MARKER: &str = "buck2-digests-only";
 
 /// Returns the synthetic action that the digests-only entry of `action` is stored under.
-fn digests_only_action(
+pub(crate) fn digests_only_action(
     action: &ActionDigest,
     digest_config: DigestConfig,
 ) -> ActionDigestAndBlobs {
@@ -807,6 +808,48 @@ fn digests_only_result<'a>(
         }),
         ..Default::default()
     })
+}
+
+pub(crate) fn digests_only_outputs(
+    entry: &TActionResult2,
+) -> buck2_error::Result<Option<TActionResult2>> {
+    let Some(metadata) = entry
+        .execution_metadata
+        .auxiliary_metadata
+        .iter()
+        .find(|metadata| metadata.type_url == DIGESTS_ONLY_KEY)
+    else {
+        return Ok(None);
+    };
+    let files = DigestsOnlyFiles::decode(metadata.value.as_slice())?.files;
+    Ok(Some(TActionResult2 {
+        output_files: files
+            .into_iter()
+            .map(|file| TFile {
+                digest: DigestWithStatus {
+                    digest: TDigest {
+                        hash: file.hash,
+                        size_in_bytes: file.size_in_bytes,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                name: file.path,
+                executable: file.is_executable,
+                ..Default::default()
+            })
+            .collect(),
+        output_directories: entry
+            .output_files
+            .iter()
+            .map(|tree| TDirectory2 {
+                path: tree.name.clone(),
+                tree_digest: tree.digest.digest.clone(),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }))
 }
 
 fn systemtime_to_ttimestamp(time: SystemTime) -> buck2_error::Result<TTimestamp> {
@@ -935,5 +978,22 @@ mod tests {
             .files;
         assert_eq!(file.digest.to_re().hash, files[0].hash);
         assert!(files[0].is_executable);
+
+        // A lookup reads the entry with `digests_only_outputs`. Expect the file and the directory
+        // in its result, and no result for an entry without the auxiliary metadata.
+        let outputs = digests_only_outputs(&result).unwrap().unwrap();
+        assert_eq!("out/file", outputs.output_files[0].name);
+        assert_eq!(file.digest.to_re(), outputs.output_files[0].digest.digest);
+        assert!(outputs.output_files[0].executable);
+        assert_eq!("out/dir", outputs.output_directories[0].path);
+        assert_eq!(
+            tree.digest.digest,
+            outputs.output_directories[0].tree_digest
+        );
+        assert!(
+            digests_only_outputs(&TActionResult2::default())
+                .unwrap()
+                .is_none()
+        );
     }
 }

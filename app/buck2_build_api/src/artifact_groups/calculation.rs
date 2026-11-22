@@ -498,7 +498,7 @@ impl Key for EnsureProjectedArtifactKey {
     }
 }
 
-async fn project_artifact(
+pub(crate) async fn project_artifact(
     ctx: &mut DiceComputations<'_>,
     artifact: &ArtifactKind,
     base_value: &ArtifactValue,

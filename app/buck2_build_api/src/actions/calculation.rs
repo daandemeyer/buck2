@@ -15,6 +15,7 @@ use std::sync::Arc;
 use allocative::Allocative;
 use async_trait::async_trait;
 use buck2_artifact::actions::key::ActionKey;
+use buck2_artifact::artifact::artifact_type::BaseArtifactKind;
 use buck2_artifact::artifact::build_artifact::BuildArtifact;
 use buck2_build_signals::env::NodeDuration;
 use buck2_build_signals::env::WaitingData;
@@ -22,18 +23,21 @@ use buck2_common::events::HasEvents;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::execution_types::execution_group::ExecutionGroup;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
+use buck2_core::fs::buck_out_path::BuildArtifactPath;
 use buck2_data::ActionErrorDiagnostics;
 use buck2_data::ActionSubErrors;
 use buck2_data::ToProtoMessage;
 use buck2_data::get_action_digest;
 use buck2_data::timing::Micros;
 use buck2_error::BuckErrorContext;
+use buck2_error::BuckErrorOptionContext;
 use buck2_event_observer::action_util::get_execution_time_ms;
 use buck2_events::dispatch::async_record_root_spans;
 use buck2_events::dispatch::current_span;
 use buck2_events::dispatch::get_dispatcher;
 use buck2_events::dispatch::span_async;
 use buck2_events::span::SpanId;
+use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::execute::result::CommandExecutionReport;
 use buck2_execute::execute::result::CommandExecutionStatus;
 use buck2_execute::execute::result::command_execution_error_proto;
@@ -82,7 +86,9 @@ use crate::actions::graph_recorder::HasGraphRecorder;
 use crate::actions::impls::run_action_knobs::HasRunActionKnobs;
 use crate::artifact_groups::ArtifactGroup;
 use crate::artifact_groups::ArtifactGroupValues;
+use crate::artifact_groups::ResolvedArtifactGroup;
 use crate::artifact_groups::calculation::ensure_artifact_group_staged;
+use crate::artifact_groups::calculation::project_artifact;
 use crate::build::detailed_aggregated_metrics::dice::HasDetailedAggregatedMetrics;
 use crate::build::detailed_aggregated_metrics::types::ActionExecutionMetrics;
 use crate::deferred::calculation::ActionLookup;
@@ -789,6 +795,14 @@ impl ActionCalculation {
     ) -> impl Future<Output = buck2_error::Result<&'d ActionOutputs>> + use<'a, 'd> {
         Self::build_action(ctx, artifact.key())
     }
+
+    pub fn output_values<'a, 'd>(
+        ctx: &'a mut DiceComputations<'d>,
+        action_key: &ActionKey,
+    ) -> impl Future<Output = buck2_error::Result<&'d PredictedOutputs>> + use<'a, 'd> {
+        ctx.compute(OutputValuesKey::ref_cast(action_key))
+            .map(|v| v?.as_ref().duped_err())
+    }
 }
 
 #[derive(
@@ -830,6 +844,114 @@ impl Key for BuildKey {
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
         OkPagableValueSerialize::<Self::Value>::new()
     }
+}
+
+/// Callers must use a `PredictedOutputs` only to compute action digests, because a file digest in
+/// it can name a blob that neither the disk nor the CAS holds.
+#[derive(Debug, Allocative, Pagable)]
+pub struct PredictedOutputs(DiceActionOutputs);
+
+impl PredictedOutputs {
+    pub fn get(&self, artifact: &BuildArtifactPath) -> buck2_error::Result<Option<&ArtifactValue>> {
+        Ok(self.0.outputs()?.get(artifact))
+    }
+}
+
+#[derive(
+    Clone, Dupe, Display, Debug, Eq, PartialEq, Hash, Allocative, RefCast, Pagable
+)]
+#[repr(transparent)]
+#[pagable_typetag(dice::DiceKeyDyn)]
+pub struct OutputValuesKey(ActionKey);
+
+#[async_trait]
+impl Key for OutputValuesKey {
+    type Value = buck2_error::Result<PredictedOutputs>;
+
+    async fn compute(
+        &self,
+        ctx: &mut DiceComputations,
+        _cancellation: &CancellationContext,
+    ) -> Self::Value {
+        let action = ActionCalculation::get_action(ctx, &self.0).await?;
+        if action.key() != &self.0 {
+            // Like `build_action_impl`, compute the action under its own key, so that DICE
+            // computes it once.
+            let outputs = ActionCalculation::output_values(ctx, action.key()).await?;
+            return Ok(PredictedOutputs(outputs.0.outputs()?.dupe().into()));
+        }
+        match look_up_output_values(ctx, &action).await {
+            Ok(Some(outputs)) => return Ok(PredictedOutputs(outputs.into())),
+            Ok(None) => {}
+            Err(e) => tracing::debug!("Lookup of the output values of `{action}` failed: {e:#}"),
+        }
+        let outputs = ActionCalculation::build_action(ctx, action.key()).await?;
+        Ok(PredictedOutputs(outputs.dupe().into()))
+    }
+
+    fn equality_behavior() -> EqualityBehavior<Self::Value> {
+        EqualityBehavior::Compare(|x, y| match (x, y) {
+            (Ok(x), Ok(y)) => x.0.fingerprint() == y.0.fingerprint(),
+            _ => false,
+        })
+    }
+
+    fn validity(x: &Self::Value) -> bool {
+        // DICE makes every dependent of a transient value transient. A transient fallback to
+        // `BuildKey` would make DICE recompute the dependents of the fallback on each command. The
+        // value of a fallback therefore stays valid, even when a digests-only entry appears later.
+        x.is_ok()
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        OkPagableValueSerialize::<Self::Value>::new()
+    }
+}
+
+async fn look_up_output_values(
+    ctx: &mut DiceComputations<'_>,
+    action: &RegisteredAction,
+) -> buck2_error::Result<Option<ActionOutputs>> {
+    if !action.supports_output_values() {
+        return Ok(None);
+    }
+    let executor = ctx.get_action_executor(action.execution_config()).await?;
+    if !executor.may_skip_builds() {
+        return Ok(None);
+    }
+    let inputs = look_up_inputs(ctx, action).await?;
+    executor.output_values(inputs, action).await
+}
+
+async fn look_up_inputs(
+    ctx: &mut DiceComputations<'_>,
+    action: &RegisteredAction,
+) -> buck2_error::Result<BuckMutInsertionMap<ArtifactGroup, ArtifactGroupValues>> {
+    let inputs = action.inputs()?;
+    let values = ctx
+        .try_compute_join(inputs.iter(), async |ctx, input| {
+            let resolved = input.resolved_artifact(ctx).await?;
+            if let ResolvedArtifactGroup::Artifact(artifact) = resolved
+                && let (BaseArtifactKind::Build(built), path) = artifact.as_parts()
+            {
+                let value = ActionCalculation::output_values(ctx, built.key())
+                    .await?
+                    .get(built.get_path())?
+                    .internal_error("The outputs of the action lack the artifact")?
+                    .dupe();
+                let value = if path.is_empty() {
+                    value
+                } else {
+                    project_artifact(ctx, artifact.data(), &value).await?
+                };
+                return Ok(ArtifactGroupValues::from_artifact(artifact.dupe(), value));
+            }
+            ensure_artifact_group_staged(ctx, resolved)
+                .await?
+                .into_group_values(resolved)
+        })
+        .await?;
+    Ok(zip(inputs.iter().cloned(), values).collect())
 }
 
 async fn command_execution_report_to_proto(

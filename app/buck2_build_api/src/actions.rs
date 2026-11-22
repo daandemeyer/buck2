@@ -159,7 +159,17 @@ pub trait Action: PagableTagged + Allocative + Debug + Send + Sync + 'static {
         Ok(None)
     }
 
-    /// Returns `false` when `output_values` always returns `None`.
+    /// Prepares the command of the action for a cache lookup with the input values in `ctx`, or
+    /// returns `None` when buck2 must not look up the action in the cache. It runs nothing and
+    /// writes no files.
+    async fn prepare_lookup(
+        &self,
+        _ctx: &mut dyn ActionExecutionCtx,
+    ) -> buck2_error::Result<Option<PreparedLookup>> {
+        Ok(None)
+    }
+
+    /// Returns `false` when `output_values` and `prepare_lookup` always return `None`.
     fn supports_output_values(&self) -> bool {
         false
     }
@@ -257,6 +267,11 @@ pub trait Action: PagableTagged + Allocative + Debug + Send + Sync + 'static {
     }
 
     // TODO this probably wants more data for execution, like printing a short_name and the target
+}
+
+pub struct PreparedLookup {
+    pub request: CommandExecutionRequest,
+    pub prepared_action: PreparedAction,
 }
 
 /// The context for actions to use when executing

@@ -8,11 +8,16 @@
  * above-listed licenses.
  */
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
+use async_trait::async_trait;
 use buck2_analysis::analysis::calculation::AnalysisKey;
 use buck2_build_api::actions::RegisteredAction;
+use buck2_build_api::actions::artifact::get_artifact_fs::GetArtifactFs;
 use buck2_build_api::actions::calculation::ActionCalculation;
 use buck2_build_api::actions::execute::action_executor::HasActionExecutor;
 use buck2_build_api::actions::impls::run_action_knobs::RunActionKnobs;
@@ -23,6 +28,8 @@ use buck2_build_api::interpreter::rule_defs::context::AnalysisContext;
 use buck2_build_api::interpreter::rule_defs::provider::collection::ProviderCollection;
 use buck2_build_api::interpreter::rule_defs::register_rule_defs;
 use buck2_common::cas_digest::DigestAlgorithm;
+use buck2_common::file_ops::metadata::FileMetadata;
+use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_core::configuration::compatibility::ResultMaybeCompatible;
 use buck2_core::configuration::pair::ConfigurationNoExec;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
@@ -32,8 +39,16 @@ use buck2_core::execution_types::executor_config::CommandExecutorConfig;
 use buck2_core::fs::project::ProjectRootTemp;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_events::dispatch::with_dispatcher_async;
+use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::digest_config::SetDigestConfig;
+use buck2_execute::execute::manager::CommandExecutionManager;
+use buck2_execute::execute::prepared::PreparedCommand;
+use buck2_execute::execute::prepared::PreparedCommandOptionalExecutor;
+use buck2_execute::execute::request::CommandExecutionOutput;
+use buck2_execute::execute::result::CommandExecutionResult;
+use buck2_execute::execute::testing_dry_run::DryRunEntry;
+use buck2_execute::materialize::materializer::HasMaterializer;
 use buck2_hash::BuckFixedSortedMap;
 use buck2_hash::BuckMutInsertionMap;
 use buck2_interpreter::file_type::StarlarkFileType;
@@ -41,6 +56,7 @@ use buck2_interpreter::from_freeze::from_freeze_error;
 use buck2_interpreter::testing::Buck2TestHeapName;
 use buck2_node::nodes::configured::ConfiguredTargetNode;
 use dice::DiceTransaction;
+use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
 use httptest::Expectation;
 use httptest::matchers::request;
@@ -59,20 +75,80 @@ const CONTENT: &str = "hello world";
 const CONTENT_SHA1: &str = "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed";
 const CONTENT_SHA256: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
 
-/// Runs the function `test` in `content` as the analysis of `cell//pkg:foo`. The returned DICE
-/// state has `action_cache.digests_only_entries` set.
+#[derive(Default)]
+struct FakeActionCache {
+    /// When `entry` is set, `look_up_digests_only` returns it as the value of each output.
+    entry: Option<ArtifactValue>,
+    /// `lookups` counts the calls of `look_up_digests_only`.
+    lookups: AtomicUsize,
+}
+
+#[async_trait]
+impl PreparedCommandOptionalExecutor for FakeActionCache {
+    async fn maybe_execute(
+        &self,
+        _command: &PreparedCommand<'_, '_>,
+        manager: CommandExecutionManager,
+        _cancellations: &CancellationContext,
+    ) -> ControlFlow<CommandExecutionResult, CommandExecutionManager> {
+        ControlFlow::Continue(manager)
+    }
+
+    fn lookups_can_hit(&self) -> bool {
+        true
+    }
+
+    async fn look_up_digests_only(
+        &self,
+        command: &PreparedCommand<'_, '_>,
+    ) -> buck2_error::Result<Option<BuckMutInsertionMap<CommandExecutionOutput, ArtifactValue>>>
+    {
+        self.lookups.fetch_add(1, Ordering::Relaxed);
+        Ok(self.entry.as_ref().map(|value| {
+            command
+                .request
+                .outputs()
+                .map(|output| (output.cloned(), value.dupe()))
+                .collect()
+        }))
+    }
+}
+
+fn file_value(content: &str) -> ArtifactValue {
+    ArtifactValue::file(FileMetadata {
+        digest: TrackedFileDigest::from_content(
+            content.as_bytes(),
+            DigestConfig::testing_default().cas_digest_config(),
+        ),
+        is_executable: false,
+    })
+}
+
+/// Runs the function `test` in `content` as the analysis of `cell//pkg:foo`, with `cache` as the
+/// action cache of the executors. The returned DICE state has `action_cache.digests_only_entries`
+/// set, and the returned list records the commands that the executors run.
 async fn analyze(
     content: &str,
     temp_fs: &ProjectRootTemp,
-) -> buck2_error::Result<(DiceTransaction, Vec<Arc<RegisteredAction>>)> {
-    analyze_with_digest_config(content, temp_fs, DigestConfig::testing_default()).await
+    cache: Arc<FakeActionCache>,
+) -> buck2_error::Result<(
+    DiceTransaction,
+    Vec<Arc<RegisteredAction>>,
+    Arc<Mutex<Vec<DryRunEntry>>>,
+)> {
+    analyze_with_digest_config(content, temp_fs, DigestConfig::testing_default(), cache).await
 }
 
 async fn analyze_with_digest_config(
     content: &str,
     temp_fs: &ProjectRootTemp,
     digest_config: DigestConfig,
-) -> buck2_error::Result<(DiceTransaction, Vec<Arc<RegisteredAction>>)> {
+    cache: Arc<FakeActionCache>,
+) -> buck2_error::Result<(
+    DiceTransaction,
+    Vec<Arc<RegisteredAction>>,
+    Arc<Mutex<Vec<DryRunEntry>>>,
+)> {
     let label = create_test_configured_target_label();
     let values = Module::with_temp_heap(|env| {
         let globals = GlobalsBuilder::standard().with(register_rule_defs).build();
@@ -139,9 +215,11 @@ async fn analyze_with_digest_config(
         Vec::new(),
         node.rule_type().dupe(),
     )?;
+    let commands = Arc::new(Mutex::new(Vec::new()));
     let dice = make_dice_state(
-        Arc::new(Mutex::new(Vec::new())),
+        commands.dupe(),
         temp_fs,
+        cache,
         RunActionKnobs {
             digests_only_cache: true,
             ..Default::default()
@@ -158,7 +236,7 @@ async fn analyze_with_digest_config(
         })],
     )
     .await?;
-    Ok((dice, actions))
+    Ok((dice, actions, commands))
 }
 
 /// Checks that the output values of each action in `actions` equal the outputs of a build of the
@@ -179,7 +257,7 @@ async fn check_output_values(
             .await?;
         // The output values are computed before the build of the action, so they can't depend on
         // anything that `execute` writes.
-        if let Some(outputs) = executor.output_values(inputs, action)? {
+        if let Some(outputs) = executor.output_values(inputs, action).await? {
             assert!(
                 action.supports_output_values(),
                 "`{}` has output values",
@@ -220,7 +298,7 @@ async fn test_output_values_write_and_copy() -> buck2_error::Result<()> {
     );
 
     with_dispatcher_async(EventDispatcher::null(), async {
-        let (dice, actions) = analyze(content, &temp_fs).await?;
+        let (dice, actions, _) = analyze(content, &temp_fs, Arc::default()).await?;
         assert_eq!(
             check_output_values(&dice, &actions).await?,
             [
@@ -281,10 +359,176 @@ async fn test_output_values_download_file() -> buck2_error::Result<()> {
             (sha256_only, "download_file sha256"),
         ] {
             let temp_fs = ProjectRootTemp::new()?;
-            let (dice, actions) =
-                analyze_with_digest_config(&content, &temp_fs, digest_config).await?;
+            let (dice, actions, _) =
+                analyze_with_digest_config(&content, &temp_fs, digest_config, Arc::default())
+                    .await?;
             assert_eq!(check_output_values(&dice, &actions).await?, [downloaded]);
         }
+        Ok(())
+    })
+    .await
+}
+
+const PRODUCER_AND_CONSUMER: &str = indoc!(
+    r#"
+    def test(ctx):
+        produced = ctx.actions.declare_output("produced", has_content_based_path = False)
+        ctx.actions.run(["produce", produced.as_output()], category = "produce")
+        consumed = ctx.actions.declare_output("consumed", has_content_based_path = False)
+        ctx.actions.run(["consume", produced, consumed.as_output()], category = "consume")
+        return [DefaultInfo()]
+    "#
+);
+
+#[tokio::test]
+async fn test_output_values_of_run_actions() -> buck2_error::Result<()> {
+    // `OutputValuesKey` takes the outputs of run actions from their digests-only entries, so it
+    // runs no command and declares nothing in the materializer. Declare the run actions of
+    // `PRODUCER_AND_CONSUMER`, and give every action a digests-only entry with the same file for
+    // each output. Expect the file of the entry as the output of the consumer, a lookup for each
+    // action, no command and no artifact in the materializer at the output paths.
+    buck2_certs::certs::maybe_setup_cryptography();
+    let temp_fs = ProjectRootTemp::new()?;
+
+    with_dispatcher_async(EventDispatcher::null(), async {
+        let entry = file_value("entry");
+        let cache = Arc::new(FakeActionCache {
+            entry: Some(entry.dupe()),
+            ..Default::default()
+        });
+        let (dice, actions, commands) =
+            analyze(PRODUCER_AND_CONSUMER, &temp_fs, cache.dupe()).await?;
+        let consumer = &actions[1];
+        let mut ctx = dice.ctx();
+        assert_eq!(
+            ActionCalculation::output_values(&mut ctx, consumer.key())
+                .await?
+                .get(consumer.first_output().get_path())?,
+            Some(&entry),
+        );
+        assert_eq!(cache.lookups.load(Ordering::Relaxed), 2);
+        assert!(commands.lock().unwrap().is_empty());
+        let artifact_fs = ctx.get_artifact_fs().await?;
+        let materializer = ctx.per_transaction_data().get_materializer();
+        for action in &actions {
+            let path = artifact_fs.resolve_build(action.first_output().get_path(), None)?;
+            assert!(!materializer.has_artifact_at(path).await?);
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn test_output_values_projects_looked_up_values() -> buck2_error::Result<()> {
+    // `OutputValuesKey` projects the looked-up value of a directory like a build projects the
+    // built value, with the content-based path hash of the directory. Declare a copied directory
+    // with a content-based path and a symlink to a file in the directory. The value of the symlink
+    // contains the value and the path of the file, and the path contains the hash. Expect that
+    // `OutputValuesKey` of the symlink doesn't build the symlink, and that the looked-up value of
+    // the symlink equals its value after a build.
+    buck2_certs::certs::maybe_setup_cryptography();
+    let temp_fs = ProjectRootTemp::new()?;
+    let content = indoc!(
+        r#"
+        def test(ctx):
+            src = ctx.actions.write("src.txt", "src")
+            dir = ctx.actions.copied_dir("dir", {"sub/file": src})
+            ctx.actions.symlink_file(
+                "link",
+                dir.project("sub/file"),
+                has_content_based_path = False,
+            )
+            return [DefaultInfo()]
+        "#
+    );
+
+    with_dispatcher_async(EventDispatcher::null(), async {
+        let (dice, actions, _) = analyze(content, &temp_fs, Arc::default()).await?;
+        let link = &actions[2];
+        let output = link.first_output().get_path();
+        let mut ctx = dice.ctx();
+        let looked_up = ActionCalculation::output_values(&mut ctx, link.key())
+            .await?
+            .get(output)?;
+        let path = ctx.get_artifact_fs().await?.resolve_build(output, None)?;
+        let materializer = ctx.per_transaction_data().get_materializer();
+        assert!(!materializer.has_artifact_at(path.clone()).await?);
+        assert_eq!(
+            looked_up,
+            ActionCalculation::build_action(&mut ctx, link.key())
+                .await?
+                .get(output)
+        );
+        assert!(materializer.has_artifact_at(path).await?);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn test_output_values_falls_back_to_build() -> buck2_error::Result<()> {
+    // Without a digests-only entry, `OutputValuesKey` of a run action builds the action. Declare
+    // the run actions of `PRODUCER_AND_CONSUMER` and give the executors an action cache without
+    // entries. Expect a lookup, a command, and the outputs of the build for the producer.
+    buck2_certs::certs::maybe_setup_cryptography();
+    let temp_fs = ProjectRootTemp::new()?;
+
+    with_dispatcher_async(EventDispatcher::null(), async {
+        let cache = Arc::new(FakeActionCache::default());
+        let (dice, actions, commands) =
+            analyze(PRODUCER_AND_CONSUMER, &temp_fs, cache.dupe()).await?;
+        let key = actions[0].key();
+        let output = actions[0].first_output().get_path();
+        let mut ctx = dice.ctx();
+        let looked_up = ActionCalculation::output_values(&mut ctx, key)
+            .await?
+            .get(output)?;
+        assert_eq!(cache.lookups.load(Ordering::Relaxed), 1);
+        assert_eq!(commands.lock().unwrap().len(), 1);
+        assert_eq!(
+            looked_up,
+            ActionCalculation::build_action(&mut ctx, key)
+                .await?
+                .get(output)
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn test_run_actions_without_output_values() -> buck2_error::Result<()> {
+    // `supports_output_values` of a run action is false when the action digest doesn't determine
+    // the outputs, when preparing the action writes a file, and with `allow_cache_upload = False`.
+    // Declare a plain run action and run actions with `no_outputs_cleanup`, a worker,
+    // `metadata_param` and `allow_cache_upload = False`. Expect it to be true only for the plain
+    // run action.
+    buck2_certs::certs::maybe_setup_cryptography();
+    let temp_fs = ProjectRootTemp::new()?;
+    let content = indoc!(
+        r#"
+        def test(ctx):
+            def run(category, **kwargs):
+                out = ctx.actions.declare_output(category)
+                ctx.actions.run(["run", out.as_output()], category = category, **kwargs)
+            run("plain")
+            run("incremental", no_outputs_cleanup = True)
+            run("worker", exe = WorkerRunInfo(worker = WorkerInfo(exe = ["worker"])))
+            run("metadata", metadata_env_var = "METADATA", metadata_path = "metadata.json")
+            run("not_uploaded", allow_cache_upload = False)
+            return [DefaultInfo()]
+        "#
+    );
+
+    with_dispatcher_async(EventDispatcher::null(), async {
+        let (_, actions, _) = analyze(content, &temp_fs, Arc::default()).await?;
+        let supported: Vec<_> = actions
+            .iter()
+            .filter(|action| action.supports_output_values())
+            .map(|action| action.name())
+            .collect();
+        assert_eq!(supported, ["plain"]);
         Ok(())
     })
     .await

@@ -18,6 +18,7 @@ use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_events::dispatch::span_async;
+use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::execute::action_digest::ActionDigest;
 use buck2_execute::execute::action_digest::ActionDigestKind;
 use buck2_execute::execute::dep_file_digest::DepFileDigest;
@@ -27,20 +28,31 @@ use buck2_execute::execute::manager::CommandExecutionManager;
 use buck2_execute::execute::manager::CommandExecutionManagerExt;
 use buck2_execute::execute::prepared::PreparedCommand;
 use buck2_execute::execute::prepared::PreparedCommandOptionalExecutor;
+use buck2_execute::execute::request::CommandExecutionOutput;
 use buck2_execute::execute::result::CommandExecutionResult;
 use buck2_execute::knobs::ExecutorGlobalKnobs;
+use buck2_execute::materialize::materializer::CasDownloadInfo;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::re::action_identity::ReActionIdentity;
 use buck2_execute::re::error::RemoteExecutionError;
 use buck2_execute::re::manager::ManagedRemoteExecutionClient;
 use buck2_execute::re::output_trees_download_config::OutputTreesDownloadConfig;
 use buck2_execute::re::remote_action_result::ActionCacheResult;
+use buck2_execute::re::remote_action_result::RemoteActionResult;
+use buck2_hash::BuckMutInsertionMap;
 use buck2_util::time_span::TimeSpan;
 use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
+use jiff::SignedDuration;
+use jiff::Timestamp;
 use prost::Message;
 
+use crate::executors::caching::digests_only_action;
+use crate::executors::caching::digests_only_outputs;
+use crate::re::download::CasDownloader;
+use crate::re::download::DownloadPhases;
 use crate::re::download::DownloadResult;
+use crate::re::download::ExtractedArtifacts;
 use crate::re::download::download_action_results;
 use crate::re::paranoid_download::ParanoidDownloader;
 
@@ -246,6 +258,49 @@ async fn query_action_cache_and_download_result(
     ControlFlow::Break(res)
 }
 
+impl ActionCacheChecker {
+    /// Computes the output values of `command` from `response` without declaring them in the
+    /// materializer.
+    async fn extract_outputs(
+        &self,
+        command: &PreparedCommand<'_, '_>,
+        digest: ActionDigest,
+        response: &dyn RemoteActionResult,
+        expires: Timestamp,
+    ) -> buck2_error::Result<ExtractedArtifacts> {
+        let identity = ReActionIdentity::new(
+            command.target,
+            self.re_action_key.as_deref(),
+            command.request.paths(),
+        );
+        let now = Timestamp::now();
+        let info = CasDownloadInfo::new_execution(
+            digest,
+            self.re_client.use_case,
+            now,
+            expires.duration_since(now).max(SignedDuration::ZERO),
+        );
+        CasDownloader {
+            materializer: self.materializer.as_ref(),
+            re_client: &self.re_client,
+            digest_config: command.digest_config,
+            paranoid: None,
+            output_trees_download_config: &self.output_trees_download_config,
+        }
+        .extract_artifacts(
+            &self.artifact_fs,
+            &identity,
+            command.request.paths(),
+            command.request.outputs(),
+            response,
+            expires,
+            &info,
+            &mut DownloadPhases::default(),
+        )
+        .await
+    }
+}
+
 #[async_trait]
 impl PreparedCommandOptionalExecutor for ActionCacheChecker {
     async fn maybe_execute(
@@ -288,6 +343,47 @@ impl PreparedCommandOptionalExecutor for ActionCacheChecker {
             &self.output_trees_download_config,
         )
         .await
+    }
+
+    fn lookups_can_hit(&self) -> bool {
+        // On a hit, buck2 doesn't build the inputs of the action, so `upload_all_actions` can't
+        // upload them.
+        !self.upload_all_actions
+    }
+
+    async fn look_up_digests_only(
+        &self,
+        command: &PreparedCommand<'_, '_>,
+    ) -> buck2_error::Result<Option<BuckMutInsertionMap<CommandExecutionOutput, ArtifactValue>>>
+    {
+        let platform = &command.prepared_action.platform;
+        let key = digests_only_action(
+            &command.prepared_action.action_and_blobs.action,
+            command.digest_config,
+        )
+        .action;
+        let Some(mut response) = self
+            .re_client
+            .action_cache(key.dupe(), platform, &mut Default::default())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(outputs) = digests_only_outputs(&response.action_result)? else {
+            return Ok(None);
+        };
+        response.action_result = outputs;
+        // The CAS may not hold the output files of the action. An expiration would make a later
+        // upload skip a file that the CAS lacks.
+        let artifacts = self
+            .extract_outputs(
+                command,
+                key,
+                &ActionCacheResult(response, buck2_data::CacheType::ActionCache),
+                Timestamp::UNIX_EPOCH,
+            )
+            .await?;
+        Ok(Some(artifacts.mapped_outputs))
     }
 }
 

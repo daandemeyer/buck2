@@ -23,6 +23,7 @@ use buck2_common::dice::data::HasIoProvider;
 use buck2_common::events::HasEvents;
 use buck2_common::http::HasHttpClient;
 use buck2_common::io::IoProvider;
+use buck2_common::io::trace::TracingIoProvider;
 use buck2_common::liveliness_observer::NoopLivelinessObserver;
 use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_core::execution_types::executor_config::CommandExecutorConfig;
@@ -1048,18 +1049,56 @@ impl<'d> BuckActionExecutor<'d> {
         (res, command_reports)
     }
 
-    pub fn output_values(
+    pub async fn output_values(
         &self,
         inputs: BuckMutInsertionMap<ArtifactGroup, ArtifactGroupValues>,
         action: &RegisteredAction,
     ) -> buck2_error::Result<Option<ActionOutputs>> {
-        action.output_values(&BuckActionExecutionContext {
+        let mut ctx = BuckActionExecutionContext {
             executor: self,
             action,
             inputs,
             command_reports: &mut Vec::new(),
             cancellations: CancellationContext::never_cancelled(),
-        })
+        };
+        if let Some(outputs) = action.output_values(&ctx)? {
+            return Ok(Some(outputs));
+        }
+        let Some(lookup) = action.prepare_lookup(&mut ctx).await? else {
+            return Ok(None);
+        };
+        let values = self
+            .command_executor
+            .action_cache_checker()
+            .look_up_digests_only(&PreparedCommand {
+                request: &lookup.request,
+                target: &ActionExecutionTarget::new(action),
+                prepared_action: &lookup.prepared_action,
+                digest_config: self.digest_config,
+            })
+            .await?;
+        Ok(values.map(|values| {
+            ActionOutputs::new(
+                values
+                    .into_iter()
+                    .filter_map(|(output, value)| {
+                        Some((output.build_artifact_path()?.dupe(), value))
+                    })
+                    .collect(),
+            )
+        }))
+    }
+
+    pub(crate) fn may_skip_builds(&self) -> bool {
+        // `use_network_action_output_cache` and the offline cache that trace-io records need the
+        // outputs of every action on disk.
+        self.run_action_knobs.digests_only_cache
+            && !self.run_action_knobs.use_network_action_output_cache
+            && TracingIoProvider::from_io(self.io_provider).is_none()
+            && self
+                .command_executor
+                .action_cache_checker()
+                .lookups_can_hit()
     }
 
     pub fn invalidation_tracking_enabled(&self) -> bool {
