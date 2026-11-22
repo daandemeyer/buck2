@@ -119,7 +119,7 @@ use maplit::btreemap;
 
 use crate::actions::testings::SimpleAction;
 
-fn create_test_configured_target_label() -> ConfiguredTargetLabel {
+pub(crate) fn create_test_configured_target_label() -> ConfiguredTargetLabel {
     TargetLabel::testing_parse("cell//pkg:foo").configure(ConfigurationData::testing_new())
 }
 
@@ -196,6 +196,15 @@ async fn make_default_dice_state(
     temp_fs: &ProjectRootTemp,
     mocks: Vec<Box<dyn FnOnce(DiceBuilder) -> DiceBuilder>>,
 ) -> buck2_error::Result<DiceTransaction> {
+    make_dice_state(dry_run_tracker, temp_fs, RunActionKnobs::default(), mocks).await
+}
+
+pub(crate) async fn make_dice_state(
+    dry_run_tracker: Arc<Mutex<Vec<DryRunEntry>>>,
+    temp_fs: &ProjectRootTemp,
+    run_action_knobs: RunActionKnobs,
+    mocks: Vec<Box<dyn FnOnce(DiceBuilder) -> DiceBuilder>>,
+) -> buck2_error::Result<DiceTransaction> {
     let fs = temp_fs.path().dupe();
 
     let cell_resolver = CellResolver::testing_with_name_and_path(
@@ -263,7 +272,7 @@ async fn make_default_dice_state(
     extra.set_dep_file_cache(create_dep_file_cache());
     extra.set_mergebase(Default::default());
     extra.data.set(EventDispatcher::null());
-    extra.data.set(RunActionKnobs::default());
+    extra.data.set(run_action_knobs);
     extra.set_low_pass_filter(Arc::new(LowPassFilter::new(1)));
     extra.spawner = Arc::new(BuckSpawner::current_runtime().unwrap());
 

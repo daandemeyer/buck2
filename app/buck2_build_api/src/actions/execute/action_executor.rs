@@ -1048,6 +1048,20 @@ impl<'d> BuckActionExecutor<'d> {
         (res, command_reports)
     }
 
+    pub fn output_values(
+        &self,
+        inputs: BuckMutInsertionMap<ArtifactGroup, ArtifactGroupValues>,
+        action: &RegisteredAction,
+    ) -> buck2_error::Result<Option<ActionOutputs>> {
+        action.output_values(&BuckActionExecutionContext {
+            executor: self,
+            action,
+            inputs,
+            command_reports: &mut Vec::new(),
+            cancellations: CancellationContext::never_cancelled(),
+        })
+    }
+
     pub fn invalidation_tracking_enabled(&self) -> bool {
         self.invalidation_tracking_enabled
     }

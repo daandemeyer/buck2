@@ -33,11 +33,13 @@ use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineBuilder;
 use buck2_build_api::interpreter::rule_defs::cmd_args::WriteToFileMacroVisitor;
 use buck2_build_api::interpreter::rule_defs::cmd_args::cmd_args_like::StarlarkCmdArgsLike;
 use buck2_build_signals::env::WaitingData;
+use buck2_common::file_ops::metadata::FileMetadata;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_core::category::CategoryRef;
 use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_error::BuckErrorOptionContext;
 use buck2_execute::artifact::fs::ExecutorFs;
+use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
 use buck2_execute::materialize::materializer::WriteRequest;
 use buck2_hash::BuckMutInsertionMap;
@@ -165,6 +167,17 @@ impl WriteJsonAction {
         })?;
         Ok(writer)
     }
+
+    fn content(&self, ctx: &dyn ActionExecutionCtx) -> buck2_error::Result<Vec<u8>> {
+        if self.inner.use_dep_files_placeholder_for_content_based_paths {
+            self.get_contents(
+                &ctx.executor_fs(),
+                &DepFilesPlaceholderArtifactPathMapper {},
+            )
+        } else {
+            self.get_contents(&ctx.executor_fs(), &ctx.artifact_path_mapping(None))
+        }
+    }
 }
 
 #[pagable_typetag]
@@ -227,14 +240,7 @@ impl Action for WriteJsonAction {
             ctx,
             Box::new(|| {
                 execution_start = Some(Instant::now());
-                let content = if self.inner.use_dep_files_placeholder_for_content_based_paths {
-                    self.get_contents(
-                        &ctx.executor_fs(),
-                        &DepFilesPlaceholderArtifactPathMapper {},
-                    )?
-                } else {
-                    self.get_contents(&ctx.executor_fs(), &ctx.artifact_path_mapping(None))?
-                };
+                let content = self.content(ctx)?;
                 let path = fs.resolve_build(
                     self.output.get_path(),
                     if self.output.get_path().is_content_based_path() {
@@ -278,6 +284,27 @@ impl Action for WriteJsonAction {
                 waiting_data,
             },
         ))
+    }
+
+    fn output_values(
+        &self,
+        ctx: &dyn ActionExecutionCtx,
+    ) -> buck2_error::Result<Option<ActionOutputs>> {
+        let digest = TrackedFileDigest::from_content(
+            &self.content(ctx)?,
+            ctx.digest_config().cas_digest_config(),
+        );
+        Ok(Some(ActionOutputs::from_single(
+            self.output.get_path().dupe(),
+            ArtifactValue::file(FileMetadata {
+                digest,
+                is_executable: false,
+            }),
+        )))
+    }
+
+    fn supports_output_values(&self) -> bool {
+        true
     }
 }
 

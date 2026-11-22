@@ -149,6 +149,21 @@ pub trait Action: PagableTagged + Allocative + Debug + Send + Sync + 'static {
         waiting_data: WaitingData,
     ) -> Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError>;
 
+    /// Returns the outputs that `execute` returns for the input values in `ctx`, or `None` when
+    /// only `execute` can compute them. It writes no files, declares nothing in the materializer
+    /// and sends no requests to the network or the CAS.
+    fn output_values(
+        &self,
+        _ctx: &dyn ActionExecutionCtx,
+    ) -> buck2_error::Result<Option<ActionOutputs>> {
+        Ok(None)
+    }
+
+    /// Returns `false` when `output_values` always returns `None`.
+    fn supports_output_values(&self) -> bool {
+        false
+    }
+
     /// A machine-readable category for this action, intended to be used when analyzing actions outside of buck2 itself.
     ///
     /// A category provides a namespace for identifiers within the rule that produced this action. Examples of

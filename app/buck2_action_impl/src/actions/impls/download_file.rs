@@ -151,13 +151,8 @@ impl DownloadFileAction {
         }
     }
 
-    /// Works out what the downloaded file's metadata will be without downloading it.
-    async fn declared_metadata(
-        &self,
-        client: &HttpClient,
-        digest_config: DigestConfig,
-    ) -> DeclaredMetadata {
-        let digest = if digest_config.cas_digest_config().allows_sha1() {
+    fn declared_digest(&self, digest_config: DigestConfig) -> Option<RawDigest> {
+        if digest_config.cas_digest_config().allows_sha1() {
             self.inner
                 .checksum
                 .sha1()
@@ -169,9 +164,16 @@ impl DownloadFileAction {
                 .and_then(|sha256| RawDigest::parse_sha256(sha256.as_bytes()).ok())
         } else {
             None
-        };
+        }
+    }
 
-        let digest = match digest {
+    /// Works out what the downloaded file's metadata will be without downloading it.
+    async fn declared_metadata(
+        &self,
+        client: &HttpClient,
+        digest_config: DigestConfig,
+    ) -> DeclaredMetadata {
+        let digest = match self.declared_digest(digest_config) {
             Some(digest) => digest,
             None => return DeclaredMetadata::Unknown,
         };
@@ -527,6 +529,32 @@ impl Action for DownloadFileAction {
                 waiting_data,
             },
         ))
+    }
+
+    fn output_values(
+        &self,
+        ctx: &dyn ActionExecutionCtx,
+    ) -> buck2_error::Result<Option<ActionOutputs>> {
+        let digest_config = ctx.digest_config();
+        let (Some(digest), Some(size)) =
+            (self.declared_digest(digest_config), self.inner.size_bytes)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ActionOutputs::from_single(
+            self.output().get_path().dupe(),
+            ArtifactValue::file(FileMetadata {
+                digest: TrackedFileDigest::new(
+                    FileDigest::new(digest, size),
+                    digest_config.cas_digest_config(),
+                ),
+                is_executable: self.inner.is_executable,
+            }),
+        )))
+    }
+
+    fn supports_output_values(&self) -> bool {
+        true
     }
 }
 
