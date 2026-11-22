@@ -483,36 +483,7 @@ impl Key for EnsureProjectedArtifactKey {
         let base_value = ensure_base_artifact_staged(ctx, base)
             .await?
             .unpack_single()?;
-        let base_content_based_path_hash = base_value.content_based_path_hash();
-
-        let artifact_fs = ctx.get_artifact_fs().await?;
-        let digest_config = ctx.global_data().get_digest_config();
-
-        let base_path = match base {
-            BaseArtifactKind::Build(built) => {
-                artifact_fs.resolve_build(built.get_path(), Some(&base_content_based_path_hash))?
-            }
-            BaseArtifactKind::Source(source) => artifact_fs.resolve_source(source.get_path())?,
-        };
-
-        let projected_path = base_path.join(path);
-
-        let mut builder = ActionDirectoryBuilder::empty_non_exhaustive();
-        insert_artifact(&mut builder, base_path, &base_value)?;
-
-        let value = extract_artifact_value(&builder, &projected_path, digest_config)
-            .with_buck_error_context(|| {
-                format!("The path `{path}` cannot be projected in the artifact `{base}`. Are you calling project() on a symlink?")
-            })?
-            .ok_or_else(|| {
-                ProjectedArtifactError::MissingInProjectedArtifact(path.to_buf(), base.dupe())
-            })?;
-
-        // Projected artifacts are located in the same directory as the base artifact, so we
-        // need to store the same content based path hash in order to find them in the correct place.
-        let value = value.with_content_based_path_hash(base_content_based_path_hash);
-
-        Ok(value)
+        project_artifact(ctx, &self.0, &base_value).await
     }
 
     fn equality_behavior() -> EqualityBehavior<Self::Value> {
@@ -525,6 +496,44 @@ impl Key for EnsureProjectedArtifactKey {
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
         OkPagableValueSerialize::<Self::Value>::new()
     }
+}
+
+async fn project_artifact(
+    ctx: &mut DiceComputations<'_>,
+    artifact: &ArtifactKind,
+    base_value: &ArtifactValue,
+) -> buck2_error::Result<ArtifactValue> {
+    let ArtifactKind { base, path } = artifact;
+    let base_content_based_path_hash = base_value.content_based_path_hash();
+
+    let artifact_fs = ctx.get_artifact_fs().await?;
+    let digest_config = ctx.global_data().get_digest_config();
+
+    let base_path = match base {
+        BaseArtifactKind::Build(built) => {
+            artifact_fs.resolve_build(built.get_path(), Some(&base_content_based_path_hash))?
+        }
+        BaseArtifactKind::Source(source) => artifact_fs.resolve_source(source.get_path())?,
+    };
+
+    let projected_path = base_path.join(path);
+
+    let mut builder = ActionDirectoryBuilder::empty_non_exhaustive();
+    insert_artifact(&mut builder, base_path, base_value)?;
+
+    let value = extract_artifact_value(&builder, &projected_path, digest_config)
+        .with_buck_error_context(|| {
+            format!("The path `{path}` cannot be projected in the artifact `{base}`. Are you calling project() on a symlink?")
+        })?
+        .ok_or_else(|| {
+            ProjectedArtifactError::MissingInProjectedArtifact(path.to_buf(), base.dupe())
+        })?;
+
+    // Projected artifacts are located in the same directory as the base artifact, so we
+    // need to store the same content based path hash in order to find them in the correct place.
+    let value = value.with_content_based_path_hash(base_content_based_path_hash);
+
+    Ok(value)
 }
 
 /// Activation data for [`EnsureTransitiveSetProjectionKey`] DICE evaluations,
