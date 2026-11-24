@@ -18,6 +18,9 @@
 //! build's content on disk rather than make it again, or for a write under
 //! `defer_write_actions`, the BlobStore's memory, where the content waits, compressed, for
 //! something to ask for the file.
+//!
+//! A build with cache uploads disabled must not write to the CAS. Its writes and source copies
+//! are therefore made here even when no permit is free (`upload_cache`).
 
 use std::sync::Arc;
 
@@ -48,6 +51,7 @@ use buck2_execute::directory::ActionSharedDirectory;
 use buck2_execute::execute::blobs::ActionBlobs;
 use buck2_execute::execute::clean_output_paths::cleanup_path;
 use buck2_execute::execute::low_pass_filter::LowPassFilterGuard;
+use buck2_execute::execute::write_action_cache::WriteActionCache;
 use buck2_execute::materialize::materializer::CasDownloadInfo;
 use buck2_execute::materialize::materializer::DeclareArtifactPayload;
 use buck2_execute::materialize::materializer::WriteRequest;
@@ -68,6 +72,12 @@ const LOCAL_WEIGHT: usize = 1;
 /// decides between making content here and sending it.
 fn room(ctx: &dyn ActionExecutionCtx) -> Option<LowPassFilterGuard<'_>> {
     ctx.low_pass_filter().try_access(LOCAL_WEIGHT)
+}
+
+/// The write action cache exists wherever the remote cache can be read, including under an
+/// executor configuration with cache uploads disabled.
+fn upload_cache(ctx: &dyn ActionExecutionCtx) -> Option<&dyn WriteActionCache> {
+    ctx.write_action_cache().filter(|cache| cache.populates())
 }
 
 /// `Simple` for content made here, `Deferred` for content the CAS or the disk held already.
@@ -160,14 +170,14 @@ fn defer_write(
 }
 
 /// Uploads a write's content and returns its value with the download info to declare it under.
-/// `None` where the executor configuration has no CAS to upload to, or where the upload failed,
-/// which is reported once: making the write here is the right fallback, but a CAS that refuses
-/// uploads would silently turn every busy write into a local one.
+/// Returns `None` when the executor configuration publishes no results (`upload_cache`) or when
+/// the upload fails. A failed upload is reported as a soft error before the write is made here.
+/// Without the report, nothing would show that a CAS refuses every upload.
 async fn upload_write(
     ctx: &dyn ActionExecutionCtx,
     request: &WriteRequest,
 ) -> Option<(ArtifactValue, Arc<CasDownloadInfo>)> {
-    let cache = ctx.write_action_cache()?;
+    let cache = upload_cache(ctx)?;
     let digest_config = ctx.digest_config();
     let digest =
         TrackedFileDigest::from_content(&request.content, digest_config.cas_digest_config());
@@ -199,13 +209,16 @@ pub(crate) struct SourceCopy {
 
 /// Copies of sources the CAS lacks, under the disk-state core: each made here under a permit
 /// while there is room for local work, the rest uploaded in one go, and what the CAS would not
-/// take made here after all. With `uploadable` false, where the CAS cannot be asked, everything
-/// is made here. Returns `Simple` where anything was made here, `Deferred` otherwise.
+/// take made here after all. Callers pass `uploadable` false when the CAS presence check did not
+/// run or failed. Everything is made here when `uploadable` is false or when the executor
+/// configuration publishes no results (`upload_cache`). Returns `Simple` where anything was made
+/// here, `Deferred` otherwise.
 pub(crate) async fn produce_copies(
     ctx: &dyn ActionExecutionCtx,
     copies: Vec<SourceCopy>,
     uploadable: bool,
 ) -> buck2_error::Result<ActionExecutionKind> {
+    let uploadable = uploadable && upload_cache(ctx).is_some();
     let mut here = Vec::new();
     let mut permits = Vec::new();
     let mut busy = Vec::new();
@@ -365,3 +378,6 @@ async fn upload_sources(ctx: &dyn ActionExecutionCtx, files: Vec<SourceFile>) ->
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

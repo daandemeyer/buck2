@@ -884,6 +884,7 @@ dependencies = [
  "buck2_artifact",
  "buck2_build_api",
  "buck2_build_signals",
+ "buck2_cli_proto",
  "buck2_common",
  "buck2_core",
  "buck2_data",
@@ -903,6 +904,7 @@ dependencies = [
  "dice_futures",
  "dupe",
  "either",
+ "futures 0.3.34",
  "hex",
  "hmap",
  "host_sharing",
@@ -918,6 +920,7 @@ dependencies = [
  "starlark",
  "starlark_map",
  "strong_hash",
+ "tokio",
  "tracing",
 ]
 
