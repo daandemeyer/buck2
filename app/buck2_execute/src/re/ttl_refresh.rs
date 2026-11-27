@@ -23,6 +23,8 @@ use buck2_common::cas_digest::SweepStats;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_error::BuckErrorContext;
+use buck2_error::ErrorTag;
+use buck2_error::buck2_error;
 use dupe::Dupe;
 use itertools::Itertools;
 use jiff::Timestamp;
@@ -65,6 +67,9 @@ impl ReChecker {
 
 impl PresenceChecker for ReChecker {
     fn begin_pass(&self) -> Box<dyn PassPresenceChecker> {
+        if !self.re_manager.cas_configured() {
+            return Box::new(NoCasPassChecker);
+        }
         // A connection per pass rather than one held for the daemon's lifetime: an idle daemon
         // should still let its RE connection go between passes.
         Box::new(RePassChecker {
@@ -87,6 +92,21 @@ impl PassPresenceChecker for RePassChecker {
         client
             .check_presence(digests, NegativeCache::Bypassed, &info)
             .await
+    }
+}
+
+/// Fails every check without connecting to RE. Without a CAS address, every attempt to create an
+/// RE client fails, and the daemon's 10 connection retries sleep 45 seconds in total before the
+/// last attempt fails too.
+struct NoCasPassChecker;
+
+#[async_trait]
+impl PassPresenceChecker for NoCasPassChecker {
+    async fn check(&self, _digests: Vec<TrackedFileDigest>) -> buck2_error::Result<Vec<Presence>> {
+        Err(buck2_error!(
+            ErrorTag::Tier0,
+            "No CAS is configured to check the presence of blobs in"
+        ))
     }
 }
 

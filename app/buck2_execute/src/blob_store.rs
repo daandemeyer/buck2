@@ -1666,6 +1666,65 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(fbcode_build))]
+    #[tokio::test]
+    async fn test_find_without_a_cas_takes_the_tracked_path_at_once() -> buck2_error::Result<()> {
+        // Without a CAS address, `find` must take content out of a tracked path without trying
+        // to connect to RE. A daemon restarted with `--no-buckd` does this for every output of a
+        // reloaded dep-file entry. Give the store the daemon's presence checker over an RE
+        // configuration without a CAS address, and check that `find` returns the content of the
+        // tracked path long before the 45 seconds of RE connection retries are over.
+        use buck2_common::fbinit::get_or_init_fbcode_globals;
+        use buck2_common::legacy_configs::configs::LegacyBuckConfig;
+        use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
+        use buck2_re_configuration::RemoteExecutionStaticMetadata;
+        use buck2_re_configuration::RemoteExecutionStaticMetadataImpl;
+
+        use crate::re::manager::ReConnectionManager;
+        use crate::re::ttl_refresh::ReChecker;
+
+        let temp = ProjectRootTemp::new()?;
+        let (store, _table) = store(temp.path());
+        let re_manager = Arc::new(ReConnectionManager::new(
+            get_or_init_fbcode_globals(),
+            false,
+            10,
+            Arc::new(RemoteExecutionStaticMetadata::from_legacy_config(
+                &LegacyBuckConfig::empty(),
+            )?),
+            None,
+            temp.path().root().to_buf(),
+            false,
+        ));
+        assert!(!re_manager.cas_configured());
+        assert!(
+            store
+                .refresh
+                .set(TtlRefresher::new(Arc::new(ReChecker::new(
+                    re_manager,
+                    RemoteExecutorUseCase::buck2_default(),
+                ))))
+                .is_ok()
+        );
+        let on_disk = digest(b"blob_store test: find without a CAS");
+        let path = scratch(temp.path(), "on_disk");
+        fs_util::write(&path, b"blob_store test: find without a CAS")?;
+        let paths = PathOf {
+            path,
+            digest: on_disk.dupe(),
+        };
+
+        let found = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            store.find(&on_disk, false, &paths),
+        )
+        .await
+        .expect("`find` waited on RE connection retries")?
+        .expect("a tracked path has it");
+        assert!(found.stash().is_some());
+        Ok(())
+    }
+
     fn refreshing_store(
         stub: Stub,
         chunk_size: usize,
